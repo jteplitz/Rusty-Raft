@@ -1,0 +1,6 @@
+[package]
+name = "rusty_raft"
+version = "0.1.0"
+authors = ["Jason Teplitz <jteplitz602@gmail.com>", "Sydney Li <sydli@stanford.edu>"]
+
+[dependencies]
