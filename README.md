@@ -9,8 +9,9 @@ An implemention of the [Raft consensus algorithim](https://raft.github.io) in ru
 `cargo test`
 
 ## Module Structure
-
-|-- rusty\_raft
-|   `-- rpc
-|       |-- client
-|       |-- server
+```
+rusty_raft
+  |-- rpc
+  |-- client
+  |-- server
+```
