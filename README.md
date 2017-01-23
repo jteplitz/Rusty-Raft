@@ -3,6 +3,7 @@
 An implemention of the [Raft consensus algorithim](https://raft.github.io) in rust. 
 
 ## Building
+NB: You must have the capnp compiler installed on your system. See the [installation instructions here](https://capnproto.org/install.html) for details.
 `cargo build`
 
 ## Testing
@@ -12,6 +13,7 @@ An implemention of the [Raft consensus algorithim](https://raft.github.io) in ru
 ```
 rusty_raft
   |-- rpc
-  |-- client
-  |-- server
+    |-- client
+    |-- server
+  |-- protocol
 ```

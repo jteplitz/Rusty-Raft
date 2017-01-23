@@ -2,5 +2,10 @@
 name = "rusty_raft"
 version = "0.1.0"
 authors = ["Jason Teplitz <jteplitz602@gmail.com>", "Sydney Li <sydli@stanford.edu>"]
+build = "src/build.rs"
 
 [dependencies]
+capnp = "0.8.0"
+
+[build-dependencies]
+capnpc = "*"
