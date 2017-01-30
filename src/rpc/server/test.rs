@@ -4,7 +4,8 @@ use std::thread; use std::sync::{mpsc, atomic, Arc};
 use std::net::{TcpStream, Shutdown, ToSocketAddrs};
 use std::io::{Read, Write, BufWriter, BufReader};
 use std::time::Duration;
-use super::{RpcServer, RpcError, RpcClientError, RpcClientErrorKind, RpcObject};
+use super::{RpcServer, RpcObject};
+use super::super::{RpcError, RpcClientError, RpcClientErrorKind};
 use rpc_capnp::{rpc_request, rpc_response, math_params};
 use capnp::{serialize_packed, message};
 use std::vec;
@@ -127,5 +128,3 @@ fn it_sends_back_the_result() {
     assert_eq!(math_result.get_num(), RESULT);
     //server.shutdown();
 }
-
-// TODO: More integration tests
