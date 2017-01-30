@@ -1,5 +1,8 @@
 @0xa742417d176a08bb;
 
+# TODO: Wrap RpcRequest and RpcResponse in a parent struct, so we can support proper bi-directional rpc
+# streams.
+# TODO: Use AnyPointer instead of explicit unions for params and return types
 struct SortParams {
   nums @0 :List(Int32);
 }
@@ -35,6 +38,7 @@ struct RpcResponse {
   result :union {
     sort @2 :SortResult;
     math @3 :MathResult;
+    # TODO: Errors should not just be a string
     errorText @4 :Text;
   }
 }

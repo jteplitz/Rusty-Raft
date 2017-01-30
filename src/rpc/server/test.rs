@@ -1,12 +1,12 @@
 extern crate capnp;
 
-//use super::start_echo_server;
-use std::sync::{mpsc, atomic, Arc};
-use std::net::{TcpStream, Shutdown};
-use std::io::{Read, Write};
+use std::thread; use std::sync::{mpsc, atomic, Arc};
+use std::net::{TcpStream, Shutdown, ToSocketAddrs};
+use std::io::{Read, Write, BufWriter, BufReader};
 use std::time::Duration;
 use super::{RpcServer, RpcError, RpcClientError, RpcClientErrorKind, RpcObject};
 use rpc_capnp::{rpc_request, rpc_response, math_params};
+use capnp::{serialize_packed, message};
 use std::vec;
 
 // handy Rpc structs for simple tests
@@ -50,37 +50,82 @@ impl RpcObject for TestRpcHandler {
     }
 }
 
+/******************************/
+/*  BEGIN INTEGRATION TESTS  */
+/******************************/
+
 #[test]
 fn it_can_register_services() {
     let addition_rpc_handler: Box<RpcObject> = Box::new(AdditionRpcHandler {});
     let services = vec![
-        (0i16, addition_rpc_handler) // Not sure why rust needs a hint here
+        (0i16, addition_rpc_handler) 
     ];
     let server = RpcServer::new_with_services(services);
 }
 
-// TODO: More integration tests
+/// Starts a local test rpc server on port 8080
+fn start_test_rpc_server<A: ToSocketAddrs> (addr: A) -> RpcServer {
+    let addition_rpc_handler: Box<RpcObject> = Box::new(AdditionRpcHandler {});
+    let services = vec![
+        (0i16, addition_rpc_handler)
+    ];
+    
+    let mut server = RpcServer::new_with_services(services);
+    server.bind(addr).unwrap();
+    
+    server.repl();
+    server
+}
 
-/*
+pub fn create_test_addition_rpc (counter: i64, opcode: i16, num1: i32, num2: i32) 
+    -> message::Builder<message::HeapAllocator> 
+{
+    let mut message = message::Builder::new_default();
+    {
+        let mut rpc_request = message.init_root::<rpc_request::Builder>();
+        rpc_request.set_counter(counter);
+        rpc_request.set_opcode(opcode);
+        rpc_request.set_version(1i16);
+        let mut math_builder = rpc_request.init_params().init_math();
+        math_builder.set_num1(num1);
+        math_builder.set_num2(num2);
+    }
+    message
+}
+
 #[test]
-fn it_echos() {
-    // constants
-    let port = 8080;
-    let message = "Hello from\n test land!";
+fn it_sends_back_the_result() {
+    const COUNTER: i64 = 231267i64;
+    const OPCODE: i16  = 0i16;
+    const NUM1: i32    = 14;
+    const NUM2: i32    = 789;
+    const RESULT: i32  = NUM1 + NUM2;
 
-    // start the echo server and connect to it
-    let _ = start_echo_server(port).unwrap();
-    let mut client = TcpStream::connect(("localhost", port)).unwrap();
+    let mut server = start_test_rpc_server(("localhost", 8080));
 
-    // write to the server, send a fin, and wait for the response
-    let mut result = String::new();
-    let num_bytes_read = client.write_all(message.as_bytes())
-    .and_then(|()| client.shutdown(Shutdown::Write))
-    .and_then(|()| {
-        client.read_to_string(&mut result)
-    }).unwrap();
+    // connect to the server and send the rpc
+    let rpc_message = create_test_addition_rpc(COUNTER, OPCODE, NUM1, NUM2);
+    let mut client = TcpStream::connect(("localhost", 8080)).unwrap();
+    let mut writer = BufWriter::new(client.try_clone().unwrap());
+    serialize_packed::write_message(&mut writer, &rpc_message).unwrap();
+    writer.flush();
 
-    // check that the response is correct
-    assert!(num_bytes_read == message.len());
-    assert!(result == message);
-}*/
+    // create a response message to store the response value and metadata
+    let mut reader = BufReader::new(client);
+    // create a message reader from the stream
+    let mut response_msg = serialize_packed::read_message(&mut reader, capnp::message::ReaderOptions::new())
+                           .unwrap();
+    let mut response = response_msg.get_root::<rpc_response::Reader>().unwrap();
+    assert_eq!(response.get_counter(), COUNTER);
+    assert_eq!(response.get_error(), false);
+    let mut result_reader = response.get_result();
+    assert_eq!(result_reader.has_math(), true);
+    let math_result = match result_reader.which() {
+        Ok(rpc_response::result::Which::Math(v)) => v.unwrap(),
+        _ => panic!("Invalid RPC response")
+    };
+    assert_eq!(math_result.get_num(), RESULT);
+    //server.shutdown();
+}
+
+// TODO: More integration tests

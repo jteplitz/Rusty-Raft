@@ -1,19 +1,20 @@
-extern crate capnp;
-
+extern crate capnp; 
 #[cfg(test)]
 mod test;
 
-use std::sync::{Arc, atomic};
+use std::sync::{Arc, atomic, mpsc, Mutex};
 use std::any::Any;
 use std::error::Error;
 
 use std::fmt;
+use std::mem;
 use capnp::{serialize_packed, message};
 use capnp::serialize::OwnedSegments;
 use rpc_capnp::{rpc_request, rpc_response};
 use std::net::{TcpListener, TcpStream, ToSocketAddrs};
-use std::io::{Read, Write, Error as IoError, ErrorKind, BufReader};
+use std::io::{Read, Write, Error as IoError, ErrorKind, BufReader, BufWriter};
 use std::thread;
+use std::thread::JoinHandle;
 use std::iter::Iterator;
 use std::collections::HashMap;
 use std::vec;
@@ -25,79 +26,195 @@ macro_rules! println_stderr(
     } }
 );
 
-// TODO: Move error types into their own file
-#[derive(Debug, PartialEq, Eq)]
-pub enum RpcClientErrorKind {
-    UnkownVersion,
-    UnkownOpcode,
-    InvalidParameters
-}
-
-#[derive(Debug)]
-pub struct RpcClientError {
-    pub kind: RpcClientErrorKind
-}
-
-impl RpcClientError {
-    fn new(kind: RpcClientErrorKind) -> RpcClientError {
-        RpcClientError {kind: kind}
-    }
-}
-
-impl fmt::Display for RpcClientError {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        let s = match self.kind {
-            RpcClientErrorKind::UnkownVersion => "Unkown RPC Version Number",
-            RpcClientErrorKind::UnkownOpcode => "Unkown RPC Opcode",
-            RpcClientErrorKind::InvalidParameters => "Invalid Parameters for Opcode",
-        };
-        write!(f, "{}", s)
-    }
-}
-
-impl Error for RpcClientError {
-    fn description(&self) -> &str { 
-        // TODO: Don't repeat this code
-        match self.kind {
-            RpcClientErrorKind::UnkownVersion => "Unkown RPC Version Number",
-            RpcClientErrorKind::UnkownOpcode => "Unkown RPC Opcode",
-            RpcClientErrorKind::InvalidParameters => "Invalid Parameters for Opcode",
-        }
-    }
-    fn cause (&self) -> Option<&Error> {
-        None
-    }
-}
-
-#[derive(Debug)]
-pub enum RpcError {
-    Io(IoError),
-    Capnp(capnp::Error),
-    RpcClientError(RpcClientError)
-}
-
-pub type RpcFunction = fn(rpc_request::params::Reader, rpc_response::result::Builder) 
-    -> Result<(), RpcError>;
-
 pub trait RpcObject: Sync + Send {
     fn handle_rpc (&self, rpc_request::params::Reader, rpc_response::result::Builder) -> Result<(), RpcError>;
 }
 
+type ServicesMap = HashMap<i16, Box<RpcObject>>;
+
 pub struct RpcServer {
-    services: Arc<HashMap<i16, Box<RpcObject>>>,
-    listener: Option<TcpListener>
+    services: Arc<ServicesMap>,
+    listener: Option<TcpListener>,
+    /* TODO shutdown
+    shutting_down: Arc<Mutex<bool>>,
+    repl_thread: Option<JoinHandle<()>>
+    */
 }
 
-// TODO: Do we register a function or an object with a service?
-// It might be cleaner to register a (sendable) object that 
+impl RpcServer {
+    ///
+    /// Constructs a new RPC server with the given services, but does not start the server.
+    /// To start the server call bind
+    /// To block and process requests call repl.
+    ///
+    /// #Example
+    /// ```rust,ignore TODO: Don't ignore this
+    /// let services = vec!([(0, example_service)])
+    /// let server = RpcServer::new_with_services(services);
+    /// server.bind(("localhost", port_num)).unwrap();
+    /// server.repl();
+    /// ```
+    // TODO: It'd be nice if this took a generic iterator over
+    // (i16, RpcObject) tuples
+    // Also I think this needs to take a Box, but i could be convinced otherwise
+    pub fn new_with_services (iter: Vec<(i16, Box<RpcObject>)>) -> RpcServer {
+        let mut map = HashMap::new();
+        for (opcode, rpc_object) in iter {
+            map.insert(opcode.clone(), rpc_object);
+        }
 
-//struct 
+        RpcServer {services: Arc::new(map), listener: None}
+    }
+
+    ///
+    /// Binds this server to the given address(es)
+    /// NB: At this point the server is accepting requests but you MUST call repl to run them
+    ///
+    pub fn bind<A: ToSocketAddrs> (&mut self, addr: A) -> Result<(), IoError>{
+        self.listener = Some(try!(TcpListener::bind(addr)));
+        Ok(())
+    }
+
+    ///
+    /// Blocking repl loop for the server
+    /// The server will block and handle repl requests 
+    ///
+    pub fn repl (&mut self) -> Result<(), IoError> {
+        // TODO: Is there a cleaner way to unwrap this?
+        let l = match self.listener {
+            Some(ref listener) => listener,
+            None => return Err(IoError::new(ErrorKind::NotConnected, "You must call bind before repl."))
+        };
+        let listener = try!(l.try_clone());
+
+        /*
+        let (shutdown_tx, shutdown_rx) = mpsc::channel();
+        self.shutdown_tx = Some(shutdown_tx);
+        */
+        
+        // TODO: Thread pool
+        let services = self.services.clone();
+        let t = thread::spawn(move || {
+            //for stream in l.incoming() {
+            //let mut threads = vec![];
+            loop {
+
+                let stream = listener.accept();
+                let opcode_map = services.clone();
+
+                match stream {
+                    Ok((stream, _)) => {
+                        let join_handle = handle_incoming_connection(opcode_map, stream);
+                        //threads.push(join_handle);
+                    }
+                    Err(e) => {
+                        // TODO: Error handling?
+                        println_stderr!("Error on incoming TCP stream. {}", e)
+                    }
+                }
+            }
+
+            // TODO: Clean up threads
+            ()
+        });
+
+        self.repl_thread = Some(t);
+
+        Ok(())
+    }
+
+    // TODO
+	fn shutdown (&mut self) {
+        /*let l = match self.listener {
+            Some(ref listener) => listener,
+            None => return // server isn't running
+        };
+
+        { // shutting_down
+            let mut shutting_down = self.shutting_down.lock().unwrap();
+            *shutting_down = true;
+        }
+
+        l.set_nonblocking(true);
+        println!("Set to nonblocking");
+
+        let repl_thread = match mem::replace(&mut self.repl_thread, None) {
+            Some(t) => t,
+            None => return
+        };
+
+        repl_thread.join().unwrap();*/
+        unimplemented!();
+	}
+}
+
+///
+/// Spawns a new thread to run the function
+/// and sends the result (or error) back to the caller
+///
+fn handle_incoming_connection (opcode_map: Arc<ServicesMap>, mut stream: TcpStream) -> JoinHandle<()> {
+    thread::spawn(move || {
+        let mut response_msg = message::Builder::new_default();
+        let mut rpc_result = Ok(());
+        
+        { // response_msg_ref scope
+            let response_msg_ref = &mut response_msg;
+            // TODO(jason): Handle multiple RPCs on the same stream
+            rpc_result = wait_for_rpc(&mut stream)
+            .and_then(move |reader| {
+                do_rpc(opcode_map, reader, response_msg_ref)
+            });
+        }
+
+        match rpc_result {
+            Ok(_) => send_message(&mut stream, &response_msg),
+            Err(e) => send_error(e, &mut stream, &mut response_msg)
+        };
+    })
+}
+
+fn send_message<A: message::Allocator> (stream: &mut TcpStream, msg: &message::Builder<A>)
+    -> Result<(), IoError>
+{
+    // use a buffered writer to avoid extra syscalls.
+    let mut writer = BufWriter::new(stream);
+    try!(serialize_packed::write_message(&mut writer, msg));
+    writer.flush()
+}
+
+fn send_error<A: message::Allocator> (err: RpcError, stream: &mut TcpStream, msg: &mut message::Builder<A>)
+        -> Result<(), IoError>
+{
+    // The message should already have the counter set, so we get the root and set the error flag
+    // and error value
+
+	{ // response scope
+		// We assume an rpc_response::Builder was passed in. If not panic
+		let mut response = msg.get_root::<rpc_response::Builder>().unwrap();
+		response.set_error(true);
+
+		let mut result_builder= response.init_result();
+		// TODO: Errors shuold be more than just text
+		result_builder.set_error_text(err.description());
+	}
+    send_message(stream, msg)
+}
+
+///
+/// Waits for an RPC message on the given TCP stream and returns a message reader
+///
+fn wait_for_rpc(stream: &mut TcpStream) -> Result<message::Reader<OwnedSegments>, RpcError> {
+    let mut reader = BufReader::new(stream);
+    // create a message reader from the stream
+    serialize_packed::read_message(&mut reader, capnp::message::ReaderOptions::new())
+    .map_err(RpcError::Capnp)
+}
+
 
 /// Attempts to parse the given rpc and the opcode, counter value, and parameters.
 /// Can return an error due to an invalid message or unkown version number.
 fn parse_rpc<'a> (message_reader: &'a message::Reader<OwnedSegments>) -> 
     Result<(i16, i64, rpc_request::params::Reader<'a>), RpcError> {
-    // HEY SYD, THE REFERENCES HERE ARE INTERESTING.
     // I feel like there's a better way to do this...
     // now convert that reader to an rpc_request_reader
     // NB: We can't do this in an and_then closure because we need to keep the original message_reader alive
@@ -117,101 +234,6 @@ fn parse_rpc<'a> (message_reader: &'a message::Reader<OwnedSegments>) ->
     let counter = rpc_request_reader.get_counter();
     let params = rpc_request_reader.get_params();
     Ok((opcode, counter, params))
-}
-
-impl RpcServer {
-    ///
-    /// Constructs a new RPC server with the given services, but does not start the server.
-    /// To start the server call bind
-    /// To block and process requests call repl.
-    ///
-    /// #Example
-    /// ```rust,ignore TODO: Don't ignore this
-    /// let services = vec!([(0, example_service)])
-    /// let server = RpcServer::new_with_services(services);
-    /// server.bind(("localhost", port_num)).unwrap();
-    /// server.repl();
-    /// ```
-    // TODO: It'd be nice if this took a generic iterator over
-    // (i16, RpcFunction) tuples
-    // Also I think this needs to take a Box, but i could be convinced otherwise
-    pub fn new_with_services (iter: Vec<(i16, Box<RpcObject>)>) -> RpcServer {
-        let mut map = HashMap::new();
-        for (opcode, rpc_object) in iter {
-            map.insert(opcode.clone(), rpc_object);
-        }
-        RpcServer {services: Arc::new(map), listener: None}
-    }
-
-    ///
-    /// Binds this server to the given address(es)
-    /// NB: At this point the server is accepting requests but you MUST call repl to run them
-    ///
-    pub fn bind<A: ToSocketAddrs> (&mut self, addr: A) -> Result<(), IoError>{
-        self.listener = Some(try!(TcpListener::bind(addr)));
-        Ok(())
-    }
-
-    ///
-    /// Blocking repl loop for the server
-    /// The server will block and handle repl requests 
-    /// TODO: How do we shut down...?
-    /// Ideally there would be a flag in the struct that represents if shutdown has been called
-    /// but I don't think we can have a mutable ref to self in another thread.
-    ///
-    pub fn repl (&self) -> Result<(), IoError> {
-        // TODO: Is there a cleaner way to unwrap this?
-        let l = match self.listener {
-            Some(ref listener) => listener,
-            None => return Err(IoError::new(ErrorKind::NotConnected, "You must call bind before repl."))
-        };
-
-        for stream in l.incoming() {
-            match stream {
-                Ok(stream) => {
-                    self.handle_incoming_connection(stream)
-                }
-                Err(e) => {
-                    // TODO: Error handling?
-                    println_stderr!("Error on incoming TCP stream. {}", e)
-                }
-            }
-        }
-
-        // never reached...
-        Ok(())
-    }
-
-    ///
-    /// Spawns a new thread to run the function
-    /// and sends the result (or error) back to the caller
-    ///
-    fn handle_incoming_connection(&self, mut stream: TcpStream) {
-        let opcode_map = self.services.clone();
-        thread::spawn(move || {
-            let mut response_msg = message::Builder::new_default();
-            
-            let response_msg_ref = &mut response_msg;
-            // TODO(jason): Handle multiple RPCs on the same stream
-            wait_for_rpc(&mut stream)
-            .and_then(move |reader| {
-                do_rpc(opcode_map, reader, response_msg_ref)
-            });
-            unimplemented!();
-            // TODO: Make sure to use a buffered writer to send the response
-            // Unless capnproto already uses one...
-        });
-    }
-}
-
-///
-/// Waits for an RPC message on the given TCP stream and returns a message reader
-///
-fn wait_for_rpc(stream: &mut TcpStream) -> Result<message::Reader<OwnedSegments>, RpcError> {
-    let mut reader = BufReader::new(stream);
-    // create a message reader from the stream
-    serialize_packed::read_message(&mut reader, capnp::message::ReaderOptions::new())
-    .map_err(RpcError::Capnp)
 }
 
 ///
@@ -245,7 +267,11 @@ fn do_rpc<A: message::Allocator> (opcode_map: Arc<HashMap<i16, Box<RpcObject>>>,
     })
 }
 
+/************************/
+/*   BEGIN UNIT TESTS   */
+/************************/
 // TODO: These tests share a lot of code
+
 #[test]
 fn it_calls_the_registered_method() {
     let counter = Arc::new(atomic::AtomicUsize::new(0));
@@ -335,19 +361,8 @@ fn it_returns_the_response() {
     // need an Arc pointer to the map for the call signature of do_rpc
     let opcode_map_ref = Arc::new(opcode_map);
 
-    //let server = RpcServer::new_with_services(services);
-
     // create an addition rpc test message
-    let mut message = capnp::message::Builder::new_default();
-    {
-        let mut rpc_request = message.init_root::<rpc_request::Builder>();
-        rpc_request.set_counter(COUNTER_VAL);
-        rpc_request.set_opcode(ADDITION_OPCODE);
-        rpc_request.set_version(1i16);
-        let mut math_builder = rpc_request.init_params().init_math();
-        math_builder.set_num1(ADDITION_PARAM_1);
-        math_builder.set_num2(ADDITION_PARAM_2);
-    }
+	let message = test::create_test_addition_rpc(COUNTER_VAL, ADDITION_OPCODE, ADDITION_PARAM_1, ADDITION_PARAM_2);
 
     // create a response buffer
     let mut response_msg = message::Builder::new_default();
@@ -375,33 +390,82 @@ fn it_returns_the_response() {
     assert_eq!(math_reader.get_num(), ADDITION_RESULT);
 }
 
-
-///
-/// Starts a new echo server that listens for connections in a background thread
-/// responds to connections one at a time
-/// function returns once echo server has been started and is listening
-///
-pub fn start_echo_server (port: u16) -> Result<(), IoError>{
-    let listener = try!(TcpListener::bind(("localhost", port)));
-    thread::spawn(move || {
-        for stream in listener.incoming() {
-            match stream {
-                Ok(mut stream) => {
-                    let _ = do_echo(&mut stream);
-                }
-                Err(e) => {
-                    println_stderr!("{}", e);
-                } 
-            }
-        }
-    });
-    Ok(())
+// TODO: Move error types into their own file
+#[derive(Debug, PartialEq, Eq)]
+pub enum RpcClientErrorKind {
+    UnkownVersion,
+    UnkownOpcode,
+    InvalidParameters
 }
 
-fn do_echo(stream: &mut TcpStream) -> Result<(), IoError>{
-    let mut buf: String = String::new();
-    stream.read_to_string(&mut buf)
-          .and_then(|_| {
-            stream.write_all(buf.as_bytes())
-          })
+#[derive(Debug)]
+pub struct RpcClientError {
+    pub kind: RpcClientErrorKind
+}
+
+impl RpcClientError {
+    fn new(kind: RpcClientErrorKind) -> RpcClientError {
+        RpcClientError {kind: kind}
+    }
+}
+
+impl fmt::Display for RpcClientError {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        let s = match self.kind {
+            RpcClientErrorKind::UnkownVersion => "Unkown RPC Version Number",
+            RpcClientErrorKind::UnkownOpcode => "Unkown RPC Opcode",
+            RpcClientErrorKind::InvalidParameters => "Invalid Parameters for Opcode",
+        };
+        write!(f, "{}", s)
+    }
+}
+
+impl Error for RpcClientError {
+    fn description(&self) -> &str { 
+        // TODO: Don't repeat this code
+        match self.kind {
+            RpcClientErrorKind::UnkownVersion => "Unkown RPC Version Number",
+            RpcClientErrorKind::UnkownOpcode => "Unkown RPC Opcode",
+            RpcClientErrorKind::InvalidParameters => "Invalid Parameters for Opcode",
+        }
+    }
+    fn cause (&self) -> Option<&Error> {
+        None
+    }
+}
+
+#[derive(Debug)]
+pub enum RpcError {
+    Io(IoError),
+    Capnp(capnp::Error),
+    RpcClientError(RpcClientError)
+}
+
+impl fmt::Display for RpcError {
+	fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+		match *self {
+			RpcError::Io(ref err) => write!(f, "IO error: {}", err),
+			RpcError::Capnp(ref err) => write!(f, "Parse error: {}", err),
+			RpcError::RpcClientError(ref err) => write!(f, "RPC client error: {}", err)
+		}
+	}
+}
+
+
+impl Error for RpcError {
+    fn description(&self) -> &str {
+        match *self {
+            RpcError::Io(ref err) => err.description(),
+            RpcError::Capnp(ref err) => err.description(),
+            RpcError::RpcClientError(ref err) => err.description()
+        }
+    }
+
+    fn cause(&self) -> Option<&Error> {
+        match *self {
+            RpcError::Io(ref err) => Some(err),
+            RpcError::Capnp(ref err) => Some(err),
+			RpcError::RpcClientError(ref err) => Some(err)
+        }
+    }
 }
