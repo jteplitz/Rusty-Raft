@@ -2,23 +2,17 @@ extern crate capnp;
 #[cfg(test)]
 mod test;
 
-use std::sync::{Arc, atomic, mpsc, Mutex};
-use std::any::Any;
+use std::sync::{Arc};
 use std::error::Error;
 use super::{RpcError, RpcClientError, RpcClientErrorKind};
 
-use std::fmt;
-use std::mem;
 use capnp::{serialize_packed, message};
 use capnp::serialize::OwnedSegments;
 use rpc_capnp::{rpc_request, rpc_response};
 use std::net::{TcpListener, TcpStream, ToSocketAddrs};
-use std::io::{Read, Write, Error as IoError, ErrorKind, BufReader, BufWriter};
+use std::io::{Write, Error as IoError, ErrorKind, BufReader, BufWriter};
 use std::thread;
-use std::thread::JoinHandle;
-use std::iter::Iterator;
 use std::collections::HashMap;
-use std::vec;
 
 macro_rules! println_stderr(
     ($($arg:tt)*) => { {
@@ -36,10 +30,6 @@ type ServicesMap = HashMap<i16, Box<RpcObject>>;
 pub struct RpcServer {
     services: Arc<ServicesMap>,
     listener: Option<TcpListener>,
-    /* TODO shutdown
-    shutting_down: Arc<Mutex<bool>>,
-    repl_thread: Option<JoinHandle<()>>
-    */
 }
 
 impl RpcServer {
@@ -57,7 +47,6 @@ impl RpcServer {
     /// ```
     // TODO: It'd be nice if this took a generic iterator over
     // (i16, RpcObject) tuples
-    // Also I think this needs to take a Box, but i could be convinced otherwise
     pub fn new_with_services (iter: Vec<(i16, Box<RpcObject>)>) -> RpcServer {
         let mut map = HashMap::new();
         for (opcode, rpc_object) in iter {
@@ -69,35 +58,32 @@ impl RpcServer {
 
     ///
     /// Binds this server to the given address(es)
-    /// NB: At this point the server is accepting requests but you MUST call repl to run them
+    /// At this point the server is accepting requests but you MUST call repl to execute them
     ///
     pub fn bind<A: ToSocketAddrs> (&mut self, addr: A) -> Result<(), IoError>{
+        if self.listener.is_some() {
+            return Err(IoError::new(ErrorKind::AlreadyExists, "Server is already bound"));
+        }
+
         self.listener = Some(try!(TcpListener::bind(addr)));
         Ok(())
     }
 
     ///
-    /// Blocking repl loop for the server
-    /// The server will block and handle repl requests 
+    /// Spawns a background thread to run a repl loop for this server
+    /// This MUST be called to handle incoming requests
+    /// In theory it should be fine to call this multiple times, but there's no to do so
     ///
     pub fn repl (&mut self) -> Result<(), IoError> {
-        // TODO: Is there a cleaner way to unwrap this?
         let l = match self.listener {
             Some(ref listener) => listener,
             None => return Err(IoError::new(ErrorKind::NotConnected, "You must call bind before repl."))
         };
         let listener = try!(l.try_clone());
 
-        /*
-        let (shutdown_tx, shutdown_rx) = mpsc::channel();
-        self.shutdown_tx = Some(shutdown_tx);
-        */
-        
-        // TODO: Thread pool
+        // TODO #1: Thread pool
         let services = self.services.clone();
-        let t = thread::spawn(move || {
-            //for stream in l.incoming() {
-            //let mut threads = vec![];
+        thread::spawn(move || {
             loop {
 
                 let stream = listener.accept();
@@ -105,165 +91,144 @@ impl RpcServer {
 
                 match stream {
                     Ok((stream, _)) => {
-                        let join_handle = handle_incoming_connection(opcode_map, stream);
-                        //threads.push(join_handle);
+                        RpcServer::handle_incoming_connection(opcode_map, stream);
                     }
                     Err(e) => {
-                        // TODO: Error handling?
+                        // TODO: Handle TCP errors. Though that may end up meaning being better logging
                         println_stderr!("Error on incoming TCP stream. {}", e)
                     }
                 }
             }
-
-            // TODO: Clean up threads
-            ()
         });
 
         Ok(())
     }
 
-    // TODO
+    // TODO #2: Handle shutdown
+    #[allow(dead_code)]
 	fn shutdown (&mut self) {
-        /*let l = match self.listener {
-            Some(ref listener) => listener,
-            None => return // server isn't running
-        };
-
-        { // shutting_down
-            let mut shutting_down = self.shutting_down.lock().unwrap();
-            *shutting_down = true;
-        }
-
-        l.set_nonblocking(true);
-        println!("Set to nonblocking");
-
-        let repl_thread = match mem::replace(&mut self.repl_thread, None) {
-            Some(t) => t,
-            None => return
-        };
-
-        repl_thread.join().unwrap();*/
         unimplemented!();
 	}
-}
+    
+    ///
+    /// Spawns a new thread to run the function
+    /// and sends the result (or error) back to the caller
+    ///
+    fn handle_incoming_connection (opcode_map: Arc<ServicesMap>, mut stream: TcpStream) {
+        thread::spawn(move || {
+            let mut response_msg = message::Builder::new_default();
+            let rpc_result;
+            
+            { // response_msg_ref scope
+                let response_msg_ref = &mut response_msg;
+                // TODO(jason) #5: Handle multiple RPCs on the same stream
+                rpc_result = RpcServer::wait_for_rpc(&mut stream)
+                .and_then(move |reader| {
+                    RpcServer::do_rpc(opcode_map, reader, response_msg_ref)
+                });
+            }
 
-///
-/// Spawns a new thread to run the function
-/// and sends the result (or error) back to the caller
-///
-fn handle_incoming_connection (opcode_map: Arc<ServicesMap>, mut stream: TcpStream) -> JoinHandle<()> {
-    thread::spawn(move || {
-        let mut response_msg = message::Builder::new_default();
-        let mut rpc_result = Ok(());
-        
-        { // response_msg_ref scope
-            let response_msg_ref = &mut response_msg;
-            // TODO(jason): Handle multiple RPCs on the same stream
-            rpc_result = wait_for_rpc(&mut stream)
-            .and_then(move |reader| {
-                do_rpc(opcode_map, reader, response_msg_ref)
-            });
-        }
-
-        match rpc_result {
-            Ok(_) => send_message(&mut stream, &response_msg),
-            Err(e) => send_error(e, &mut stream, &mut response_msg)
-        };
-    })
-}
-
-fn send_message<A: message::Allocator> (stream: &mut TcpStream, msg: &message::Builder<A>)
-    -> Result<(), IoError>
-{
-    // use a buffered writer to avoid extra syscalls.
-    let mut writer = BufWriter::new(stream);
-    try!(serialize_packed::write_message(&mut writer, msg));
-    writer.flush()
-}
-
-fn send_error<A: message::Allocator> (err: RpcError, stream: &mut TcpStream, msg: &mut message::Builder<A>)
-        -> Result<(), IoError>
-{
-    // The message should already have the counter set, so we get the root and set the error flag
-    // and error value
-
-	{ // response scope
-		// We assume an rpc_response::Builder was passed in. If not panic
-		let mut response = msg.get_root::<rpc_response::Builder>().unwrap();
-		response.set_error(true);
-
-		let mut result_builder= response.init_result();
-		// TODO: Errors shuold be more than just text
-		result_builder.set_error_text(err.description());
-	}
-    send_message(stream, msg)
-}
-
-///
-/// Waits for an RPC message on the given TCP stream and returns a message reader
-///
-fn wait_for_rpc(stream: &mut TcpStream) -> Result<message::Reader<OwnedSegments>, RpcError> {
-    let mut reader = BufReader::new(stream);
-    // create a message reader from the stream
-    serialize_packed::read_message(&mut reader, capnp::message::ReaderOptions::new())
-    .map_err(RpcError::Capnp)
-}
-
-
-/// Attempts to parse the given rpc and the opcode, counter value, and parameters.
-/// Can return an error due to an invalid message or unkown version number.
-fn parse_rpc<'a> (message_reader: &'a message::Reader<OwnedSegments>) -> 
-    Result<(i16, i64, rpc_request::params::Reader<'a>), RpcError> {
-    // I feel like there's a better way to do this...
-    // now convert that reader to an rpc_request_reader
-    // NB: We can't do this in an and_then closure because we need to keep the original message_reader alive
-    // since it shares a lifetime with the rpc_request_reader
-    let rpc_request_reader = try!(message_reader.get_root::<rpc_request::Reader>()
-            .map_err(RpcError::Capnp));
-
-    // Version should always be 1 for now
-    let version = rpc_request_reader.get_version();
-    if version != 1 {
-        let err = Err(RpcClientError {kind: RpcClientErrorKind::UnkownVersion});
-        return err.map_err(RpcError::RpcClientError);
+            match rpc_result {
+                Ok(_) => RpcServer::send_message(&mut stream, &response_msg),
+                Err(e) => RpcServer::send_error(e, &mut stream, &mut response_msg)
+            }.unwrap_or_else(|e| {
+                // TODO: Handle TCP errors. Though that may end up meaning being better logging
+                println_stderr!("Error sending Rpc response: {}", e);
+            })
+        });
     }
 
-    // extract the opcode and params
-    let opcode = rpc_request_reader.get_opcode();
-    let counter = rpc_request_reader.get_counter();
-    let params = rpc_request_reader.get_params();
-    Ok((opcode, counter, params))
-}
+    fn send_message<A: message::Allocator> (stream: &mut TcpStream, msg: &message::Builder<A>)
+        -> Result<(), IoError>
+    {
+        // use a buffered writer to avoid extra syscalls.
+        let mut writer = BufWriter::new(stream);
+        try!(serialize_packed::write_message(&mut writer, msg));
+        writer.flush()
+    }
 
-///
-/// Performs the rpc request from the given stream and places the result into
-/// the given message.
-/// It is the caller's responsiblity to set the error bool and errorText in the rpc response
-/// if this function errors out.
-///
-// HI SYD. The ownership stuff gets interesting in this function
-fn do_rpc<A: message::Allocator> (opcode_map: Arc<HashMap<i16, Box<RpcObject>>>,
-                                  reader: message::Reader<OwnedSegments>,
-                                  response_msg: &mut message::Builder<A>) 
-    -> Result<(), RpcError>
-{
-    // create a response message to store the response value and metadata
-    let mut response = response_msg.init_root::<rpc_response::Builder>();
+    fn send_error<A: message::Allocator> (err: RpcError, stream: &mut TcpStream, msg: &mut message::Builder<A>)
+            -> Result<(), IoError>
+    {
+        // The message should already have the counter set, so we get the root and set the error flag
+        // and error value
 
-    parse_rpc(&reader)
-    .and_then(|(opcode, counter, params)| {
-        response.set_counter(counter);
-        response.set_error(false);
+        { // response scope
+            // We assume an rpc_response::Builder was passed in. If not panic
+            let mut response = msg.get_root::<rpc_response::Builder>().unwrap();
+            response.set_error(true);
 
-        let unkown_opcode_err = RpcClientError::new(RpcClientErrorKind::UnkownOpcode);
+            let mut result_builder= response.init_result();
+            // TODO #3: Errors shuold be more than just text
+            result_builder.set_error_text(err.description());
+        }
+        RpcServer::send_message(stream, msg)
+    }
 
-        let mut result = response.init_result();
-        opcode_map.get(&opcode)
-        .ok_or(RpcError::RpcClientError(unkown_opcode_err))
-        .and_then(move |obj| {
-            obj.handle_rpc(params, result.borrow())
+    ///
+    /// Waits for an RPC message on the given TCP stream and returns a message reader
+    ///
+    fn wait_for_rpc(stream: &mut TcpStream) -> Result<message::Reader<OwnedSegments>, RpcError> {
+        let mut reader = BufReader::new(stream);
+        // create a message reader from the stream
+        serialize_packed::read_message(&mut reader, capnp::message::ReaderOptions::new())
+        .map_err(RpcError::Capnp)
+    }
+
+
+    /// Attempts to parse the given rpc and the opcode, counter value, and parameters.
+    /// Can return an error due to an invalid message or unkown version number.
+    fn parse_rpc<'a> (message_reader: &'a message::Reader<OwnedSegments>) -> 
+        Result<(i16, i64, rpc_request::params::Reader<'a>), RpcError> {
+        // Convert that reader to an rpc_request_reader. Returning an RpcError on failure
+        let rpc_request_reader = try!(message_reader.get_root::<rpc_request::Reader>()
+                .map_err(RpcError::Capnp));
+
+        // Version should always be 1 for now
+        let version = rpc_request_reader.get_version();
+        if version != 1 {
+            let err = Err(RpcClientError {kind: RpcClientErrorKind::UnkownVersion});
+            return err.map_err(RpcError::RpcClientError);
+        }
+
+        // extract the opcode and params
+        let opcode = rpc_request_reader.get_opcode();
+        let counter = rpc_request_reader.get_counter();
+        let params = rpc_request_reader.get_params();
+        Ok((opcode, counter, params))
+    }
+
+    ///
+    /// Performs the rpc request from the given stream and places the result into
+    /// the given message.
+    /// It is the caller's responsiblity to set the error bool and errorText in the rpc response
+    /// if this function errors out.
+    ///
+    // HI SYD. The ownership stuff gets interesting in this function
+    fn do_rpc<A: message::Allocator> (opcode_map: Arc<HashMap<i16, Box<RpcObject>>>,
+                                      reader: message::Reader<OwnedSegments>,
+                                      response_msg: &mut message::Builder<A>) 
+        -> Result<(), RpcError>
+    {
+        // create a response message to store the response value and metadata
+        let mut response = response_msg.init_root::<rpc_response::Builder>();
+
+        RpcServer::parse_rpc(&reader)
+        .and_then(|(opcode, counter, params)| {
+            response.set_counter(counter);
+            response.set_error(false);
+
+            let unkown_opcode_err = RpcClientError::new(RpcClientErrorKind::UnkownOpcode);
+
+            let mut result = response.init_result();
+            opcode_map.get(&opcode)
+            .ok_or(RpcError::RpcClientError(unkown_opcode_err))
+            .and_then(move |obj| {
+                obj.handle_rpc(params, result.borrow())
+            })
         })
-    })
+    }
+
 }
 
 /************************/
@@ -271,6 +236,9 @@ fn do_rpc<A: message::Allocator> (opcode_map: Arc<HashMap<i16, Box<RpcObject>>>,
 /************************/
 // TODO: These tests share a lot of code
 
+#[cfg(test)]
+use std::sync::atomic;
+#[cfg(test)]
 #[test]
 fn it_calls_the_registered_method() {
     let counter = Arc::new(atomic::AtomicUsize::new(0));
@@ -304,13 +272,14 @@ fn it_calls_the_registered_method() {
     let mut buf_reader = &mut BufReader::new(&message_buffer[..]);
     let reader = serialize_packed::read_message(buf_reader, message::ReaderOptions::new()).unwrap();
 
-    do_rpc(opcode_map_ref, reader, &mut response_msg).unwrap();
+    RpcServer::do_rpc(opcode_map_ref, reader, &mut response_msg).unwrap();
     assert_eq!(counter.load(atomic::Ordering::SeqCst), 1);
 }
 
+#[cfg(test)]
 #[test]
 fn it_rejects_invalid_version_rpcs() {
-    let mut opcode_map = HashMap::new();
+    let opcode_map = HashMap::new();
 
     // need an Arc pointer to the map for the call signature of do_rpc
     let opcode_map_ref = Arc::new(opcode_map);
@@ -337,13 +306,14 @@ fn it_rejects_invalid_version_rpcs() {
     let mut buf_reader = &mut BufReader::new(&message_buffer[..]);
     let reader = serialize_packed::read_message(buf_reader, message::ReaderOptions::new()).unwrap();
 
-    let err = match do_rpc(opcode_map_ref, reader, &mut response_msg).unwrap_err() {
+    let err = match RpcServer::do_rpc(opcode_map_ref, reader, &mut response_msg).unwrap_err() {
         RpcError::RpcClientError(e) => e,
         _ => panic!("Incorrect error type")
     };
     assert_eq!(err.kind, RpcClientErrorKind::UnkownVersion);
 }
 
+#[cfg(test)]
 #[test]
 fn it_returns_the_response() {
     const ADDITION_OPCODE: i16  = 5i16;
@@ -373,7 +343,7 @@ fn it_returns_the_response() {
     let mut buf_reader = &mut BufReader::new(&message_buffer[..]);
     let reader = serialize_packed::read_message(buf_reader, message::ReaderOptions::new()).unwrap();
 
-    do_rpc(opcode_map_ref, reader, &mut response_msg).unwrap();
+    RpcServer::do_rpc(opcode_map_ref, reader, &mut response_msg).unwrap();
 
     let response_reader = response_msg.get_root_as_reader::<rpc_response::Reader>().unwrap();
     assert_eq!(response_reader.get_counter(), COUNTER_VAL);

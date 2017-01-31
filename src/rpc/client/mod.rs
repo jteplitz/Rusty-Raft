@@ -1,7 +1,7 @@
 extern crate capnp;
 
 use std::net::{TcpStream, ToSocketAddrs};
-use std::io::{Error as IoError, BufWriter, BufReader, Write, Read};
+use std::io::{BufWriter, BufReader, Write};
 use rpc_capnp::{rpc_request, rpc_response};
 use capnp::{serialize_packed, message};
 use capnp::serialize::{OwnedSegments};
@@ -26,10 +26,10 @@ use super::RpcError;
 ///         // handle result here
 ///     })
 /// });
+/// ```
 ///
 pub struct Rpc {
     msg: message::Builder<message::HeapAllocator>,
-    opcode: i16,
 }
 
 impl Rpc {
@@ -41,7 +41,7 @@ impl Rpc {
             rpc_request.set_opcode(opcode);
             rpc_request.set_version(1i16);
         }
-        Rpc {msg: msg, opcode: opcode}
+        Rpc {msg: msg}
     }
 
     ///
@@ -85,12 +85,5 @@ impl Rpc {
             response.get_result()
         })
         .map_err(RpcError::Capnp)
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    #[test]
-    fn it_works() {
     }
 }

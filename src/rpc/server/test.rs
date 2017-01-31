@@ -1,14 +1,12 @@
 extern crate capnp;
 
-use std::thread; use std::sync::{mpsc, atomic, Arc};
-use std::net::{TcpStream, Shutdown, ToSocketAddrs};
-use std::io::{Read, Write, BufWriter, BufReader};
-use std::time::Duration;
+use std::sync::{atomic, Arc};
+use std::net::{TcpStream, ToSocketAddrs};
+use std::io::{Write, BufWriter, BufReader};
 use super::{RpcServer, RpcObject};
 use super::super::{RpcError, RpcClientError, RpcClientErrorKind};
-use rpc_capnp::{rpc_request, rpc_response, math_params};
+use rpc_capnp::{rpc_request, rpc_response};
 use capnp::{serialize_packed, message};
-use std::vec;
 
 // handy Rpc structs for simple tests
 pub struct AdditionRpcHandler {
@@ -43,7 +41,7 @@ impl TestRpcHandler {
 }
 
 impl RpcObject for TestRpcHandler {
-    fn handle_rpc (&self, params: rpc_request::params::Reader, result: rpc_response::result::Builder) 
+    fn handle_rpc (&self, _: rpc_request::params::Reader, _: rpc_response::result::Builder) 
         -> Result<(), RpcError>
     {
         self.counter.fetch_add(1, atomic::Ordering::SeqCst);
@@ -61,7 +59,7 @@ fn it_can_register_services() {
     let services = vec![
         (0i16, addition_rpc_handler) 
     ];
-    let server = RpcServer::new_with_services(services);
+    RpcServer::new_with_services(services);
 }
 
 /// Starts a local test rpc server on port 8080
@@ -74,7 +72,7 @@ fn start_test_rpc_server<A: ToSocketAddrs> (addr: A) -> RpcServer {
     let mut server = RpcServer::new_with_services(services);
     server.bind(addr).unwrap();
     
-    server.repl();
+    server.repl().unwrap();
     server
 }
 
@@ -102,29 +100,28 @@ fn it_sends_back_the_result() {
     const NUM2: i32    = 789;
     const RESULT: i32  = NUM1 + NUM2;
 
-    let mut server = start_test_rpc_server(("localhost", 8080));
+    start_test_rpc_server(("localhost", 8080));
 
     // connect to the server and send the rpc
     let rpc_message = create_test_addition_rpc(COUNTER, OPCODE, NUM1, NUM2);
-    let mut client = TcpStream::connect(("localhost", 8080)).unwrap();
+    let client = TcpStream::connect(("localhost", 8080)).unwrap();
     let mut writer = BufWriter::new(client.try_clone().unwrap());
     serialize_packed::write_message(&mut writer, &rpc_message).unwrap();
-    writer.flush();
+    writer.flush().unwrap();
 
     // create a response message to store the response value and metadata
     let mut reader = BufReader::new(client);
     // create a message reader from the stream
-    let mut response_msg = serialize_packed::read_message(&mut reader, capnp::message::ReaderOptions::new())
+    let response_msg = serialize_packed::read_message(&mut reader, capnp::message::ReaderOptions::new())
                            .unwrap();
-    let mut response = response_msg.get_root::<rpc_response::Reader>().unwrap();
+    let response = response_msg.get_root::<rpc_response::Reader>().unwrap();
     assert_eq!(response.get_counter(), COUNTER);
     assert_eq!(response.get_error(), false);
-    let mut result_reader = response.get_result();
+    let result_reader = response.get_result();
     assert_eq!(result_reader.has_math(), true);
     let math_result = match result_reader.which() {
         Ok(rpc_response::result::Which::Math(v)) => v.unwrap(),
         _ => panic!("Invalid RPC response")
     };
     assert_eq!(math_result.get_num(), RESULT);
-    //server.shutdown();
 }

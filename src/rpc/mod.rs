@@ -54,8 +54,7 @@ impl Error for RpcClientError {
 pub enum RpcError {
     Io(IoError),
     Capnp(capnp::Error),
-    RpcClientError(RpcClientError),
-    Text(String)
+    RpcClientError(RpcClientError)
 }
 
 impl fmt::Display for RpcError {
@@ -63,8 +62,7 @@ impl fmt::Display for RpcError {
 		match *self {
 			RpcError::Io(ref err) => write!(f, "IO error: {}", err),
 			RpcError::Capnp(ref err) => write!(f, "Parse error: {}", err),
-			RpcError::RpcClientError(ref err) => write!(f, "RPC client error: {}", err),
-            RpcError::Text(ref s) => write!(f, "{}", s)
+			RpcError::RpcClientError(ref err) => write!(f, "RPC client error: {}", err)
 		}
 	}
 }
@@ -75,8 +73,7 @@ impl Error for RpcError {
         match *self {
             RpcError::Io(ref err) => err.description(),
             RpcError::Capnp(ref err) => err.description(),
-            RpcError::RpcClientError(ref err) => err.description(),
-            RpcError::Text(ref s) => s
+            RpcError::RpcClientError(ref err) => err.description()
         }
     }
 
@@ -84,8 +81,7 @@ impl Error for RpcError {
         match *self {
             RpcError::Io(ref err) => Some(err),
             RpcError::Capnp(ref err) => Some(err),
-			RpcError::RpcClientError(ref err) => Some(err),
-            RpcError::Text(ref s) => None
+			RpcError::RpcClientError(ref err) => Some(err)
         }
     }
 }

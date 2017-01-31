@@ -1,4 +1,4 @@
-mod rpc;
+pub mod rpc;
 extern crate capnp;
 
 // DO NOT MOVE THIS OR RENAME THIS
