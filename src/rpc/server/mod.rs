@@ -8,8 +8,8 @@ use super::{RpcError, RpcClientError, RpcClientErrorKind};
 
 use capnp::{serialize_packed, message};
 use capnp::serialize::OwnedSegments;
-use rpc_capnp::{rpc_request, rpc_response};
-use std::net::{TcpListener, TcpStream, ToSocketAddrs};
+use rpc_capnp::{rpc_request, rpc_response, rpc_error};
+use std::net::{TcpListener, TcpStream, ToSocketAddrs, SocketAddr};
 use std::io::{Write, Error as IoError, ErrorKind, BufReader, BufWriter};
 use std::thread;
 use std::collections::HashMap;
@@ -22,7 +22,7 @@ macro_rules! println_stderr(
 );
 
 pub trait RpcObject: Sync + Send {
-    fn handle_rpc (&self, rpc_request::params::Reader, rpc_response::result::Builder) -> Result<(), RpcError>;
+    fn handle_rpc (&self, capnp::any_pointer::Reader, capnp::any_pointer::Builder) -> Result<(), RpcError>;
 }
 
 type ServicesMap = HashMap<i16, Box<RpcObject>>;
@@ -104,6 +104,17 @@ impl RpcServer {
         Ok(())
     }
 
+    /// 
+    /// Returns the local address of the given server
+    /// 
+    pub fn get_local_addr (&self) -> Result<SocketAddr, IoError> {
+        match self.listener {
+            Some(ref listener) => listener.local_addr(),
+            None => return Err(IoError::new(ErrorKind::NotConnected, "Server has not been bound."))
+        }
+    }
+
+
     // TODO #2: Handle shutdown
     #[allow(dead_code)]
 	fn shutdown (&mut self) {
@@ -158,9 +169,9 @@ impl RpcServer {
             let mut response = msg.get_root::<rpc_response::Builder>().unwrap();
             response.set_error(true);
 
-            let mut result_builder= response.init_result();
+            let mut result_builder = response.get_result().init_as::<rpc_error::Builder>();
             // TODO #3: Errors shuold be more than just text
-            result_builder.set_error_text(err.description());
+            result_builder.set_msg(err.description());
         }
         RpcServer::send_message(stream, msg)
     }
@@ -179,7 +190,7 @@ impl RpcServer {
     /// Attempts to parse the given rpc and the opcode, counter value, and parameters.
     /// Can return an error due to an invalid message or unkown version number.
     fn parse_rpc<'a> (message_reader: &'a message::Reader<OwnedSegments>) -> 
-        Result<(i16, i64, rpc_request::params::Reader<'a>), RpcError> {
+        Result<(i16, i64, capnp::any_pointer::Reader<'a>), RpcError> {
         // Convert that reader to an rpc_request_reader. Returning an RpcError on failure
         let rpc_request_reader = try!(message_reader.get_root::<rpc_request::Reader>()
                 .map_err(RpcError::Capnp));
@@ -239,6 +250,8 @@ impl RpcServer {
 #[cfg(test)]
 use std::sync::atomic;
 #[cfg(test)]
+use rpc_capnp::{math_result, math_params};
+#[cfg(test)]
 #[test]
 fn it_calls_the_registered_method() {
     let counter = Arc::new(atomic::AtomicUsize::new(0));
@@ -250,8 +263,6 @@ fn it_calls_the_registered_method() {
     // need an Arc pointer to the map for the call signature of do_rpc
     let opcode_map_ref = Arc::new(opcode_map);
 
-    //let server = RpcServer::new_with_services(services);
-
     // create an addition rpc test message
     let mut message = capnp::message::Builder::new_default();
     {
@@ -259,7 +270,7 @@ fn it_calls_the_registered_method() {
         rpc_request.set_counter(0i64);
         rpc_request.set_opcode(0i16);
         rpc_request.set_version(1i16);
-        rpc_request.init_params().init_math();
+        rpc_request.get_params().init_as::<math_params::Builder>();
     }
 
     // create a response buffer
@@ -293,7 +304,7 @@ fn it_rejects_invalid_version_rpcs() {
         rpc_request.set_counter(0i64);
         rpc_request.set_opcode(0i16);
         rpc_request.set_version(0i16);
-        rpc_request.init_params().init_math();
+        rpc_request.get_params().init_as::<math_params::Builder>();
     }
 
     // create a response buffer
@@ -349,12 +360,7 @@ fn it_returns_the_response() {
     assert_eq!(response_reader.get_counter(), COUNTER_VAL);
     assert_eq!(response_reader.get_error(), false);
 
-    let result_reader = response_reader.get_result();
-    assert!(result_reader.has_math());
+    let math_reader = response_reader.get_result().get_as::<math_result::Reader>().unwrap();
 
-    let math_reader = match result_reader.which() {
-        Ok(rpc_response::result::Which::Math(m)) => m,
-        _ => panic!("Invalid result type")
-    }.unwrap();
     assert_eq!(math_reader.get_num(), ADDITION_RESULT);
 }

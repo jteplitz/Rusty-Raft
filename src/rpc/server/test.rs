@@ -4,8 +4,8 @@ use std::sync::{atomic, Arc};
 use std::net::{TcpStream, ToSocketAddrs};
 use std::io::{Write, BufWriter, BufReader};
 use super::{RpcServer, RpcObject};
-use super::super::{RpcError, RpcClientError, RpcClientErrorKind};
-use rpc_capnp::{rpc_request, rpc_response};
+use super::super::{RpcError};
+use rpc_capnp::{rpc_request, rpc_response, math_result, math_params};
 use capnp::{serialize_packed, message};
 
 // handy Rpc structs for simple tests
@@ -13,20 +13,16 @@ pub struct AdditionRpcHandler {
 }
 
 impl RpcObject for AdditionRpcHandler {
-    fn handle_rpc (&self, params: rpc_request::params::Reader, result: rpc_response::result::Builder) 
+    fn handle_rpc (&self, params: capnp::any_pointer::Reader, result: capnp::any_pointer::Builder) 
         -> Result<(), RpcError>
     {
-        let val = try!(match params.which() {
-            Ok(rpc_request::params::Which::Math(params)) => params.map_err(RpcError::Capnp),
-            //Err(capnp::NotInSchema(e)) => RpcError::Capnp(capnp::NotInSchema(e)),
-            _ => Err(RpcError::RpcClientError(RpcClientError::new(RpcClientErrorKind::InvalidParameters)))
-        }
+        
+        params.get_as::<math_params::Reader>()
         .map(|math_params| {
-            math_params.get_num1() + math_params.get_num2()
-        }));
-
-        result.init_math().set_num(val);
-        Ok(())
+            let v = math_params.get_num1() + math_params.get_num2();
+            result.init_as::<math_result::Builder>().set_num(v);
+        })
+        .map_err(RpcError::Capnp)
     }
 }
 
@@ -41,7 +37,7 @@ impl TestRpcHandler {
 }
 
 impl RpcObject for TestRpcHandler {
-    fn handle_rpc (&self, _: rpc_request::params::Reader, _: rpc_response::result::Builder) 
+    fn handle_rpc (&self, _: capnp::any_pointer::Reader, _: capnp::any_pointer::Builder) 
         -> Result<(), RpcError>
     {
         self.counter.fetch_add(1, atomic::Ordering::SeqCst);
@@ -62,8 +58,8 @@ fn it_can_register_services() {
     RpcServer::new_with_services(services);
 }
 
-/// Starts a local test rpc server on port 8080
-fn start_test_rpc_server<A: ToSocketAddrs> (addr: A) -> RpcServer {
+/// Starts a local test rpc server
+pub fn start_test_rpc_server<A: ToSocketAddrs> (addr: A) -> RpcServer {
     let addition_rpc_handler: Box<RpcObject> = Box::new(AdditionRpcHandler {});
     let services = vec![
         (0i16, addition_rpc_handler)
@@ -85,7 +81,7 @@ pub fn create_test_addition_rpc (counter: i64, opcode: i16, num1: i32, num2: i32
         rpc_request.set_counter(counter);
         rpc_request.set_opcode(opcode);
         rpc_request.set_version(1i16);
-        let mut math_builder = rpc_request.init_params().init_math();
+        let mut math_builder = rpc_request.get_params().init_as::<math_params::Builder>();
         math_builder.set_num1(num1);
         math_builder.set_num2(num2);
     }
@@ -117,11 +113,6 @@ fn it_sends_back_the_result() {
     let response = response_msg.get_root::<rpc_response::Reader>().unwrap();
     assert_eq!(response.get_counter(), COUNTER);
     assert_eq!(response.get_error(), false);
-    let result_reader = response.get_result();
-    assert_eq!(result_reader.has_math(), true);
-    let math_result = match result_reader.which() {
-        Ok(rpc_response::result::Which::Math(v)) => v.unwrap(),
-        _ => panic!("Invalid RPC response")
-    };
-    assert_eq!(math_result.get_num(), RESULT);
+    let result = response.get_result().get_as::<math_result::Reader>().unwrap();
+    assert_eq!(result.get_num(), RESULT);
 }

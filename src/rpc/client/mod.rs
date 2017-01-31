@@ -48,7 +48,7 @@ impl Rpc {
     /// Returns a params::Builder for this request.
     /// Returns a capnp::Error if Rpc::new was not called first
     ///
-    pub fn get_param_builder (&mut self) -> Result<rpc_request::params::Builder, capnp::Error> {
+    pub fn get_param_builder (&mut self) -> Result<capnp::any_pointer::Builder, capnp::Error> {
         self.msg.get_root::<rpc_request::Builder>()
             .map(|root| {
                 root.get_params()
@@ -78,7 +78,7 @@ impl Rpc {
     }
 
     pub fn get_result_reader (msg: &message::Reader<OwnedSegments>) 
-        -> Result<rpc_response::result::Reader, RpcError>
+        -> Result<capnp::any_pointer::Reader, RpcError>
     {
         msg.get_root::<rpc_response::Reader>()
         .map(|response| {

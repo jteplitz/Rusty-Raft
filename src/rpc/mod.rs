@@ -1,5 +1,7 @@
 pub mod client;
 pub mod server;
+#[cfg(test)]
+mod test;
 
 extern crate capnp;
 use std::io::{Error as IoError};
