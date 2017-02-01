@@ -1,4 +1,69 @@
+/// Used to construct and send an Rpc to a remote server.
+/// 
+/// # Examples
+///
+/// Constructing and sending an RPC:
+///
+/// ```rust,no_run
+/// # let opcode = 0i16;
+/// # let my_server_ip = "192.168.0.1";
+/// # let my_server_port = 8080u16;
+/// # use rusty_raft::rpc::client::Rpc;
+/// let mut rpc = Rpc::new(opcode);
+/// {
+///     // We need to scope the creation of the parameters here
+///     // because the parameter builder borrows a mutable reference to the rpc
+///     // object.
+///     let param_builder = rpc.get_param_builder();
+///     // construct params here. Cast param_builder to the correct type by doing
+///     // param_builder.init_as::<my_type::Builder>();
+/// }
+/// rpc.send((my_server_ip, my_server_port))
+/// .and_then(|msg| {
+///     Rpc::get_result_reader(&msg)
+///     .map(|result| {
+///         // handle result here. Cast result to the correct type by doing
+///         // result.get_as::<my_type::Reader>(),
+///         // which returns a Result<my_type::Reader, capnp::Error>
+///     })
+/// });
+/// ```
 pub mod client;
+/// Handles incoming Rpc requests and sends out responses.
+///
+/// #Examples
+/// Starting an Rpc server to handle a single type of request
+///
+/// ```rust
+/// # extern crate capnp;
+/// # extern crate rusty_raft;
+/// # fn main() {
+/// # use rusty_raft::rpc::server::{RpcServer, RpcObject};
+/// # use rusty_raft::rpc::RpcError;
+/// // Define the Rpc handler for our request type
+/// struct MyRpcHandler {
+///     // Any state needed to handle an Rpc should be stored here
+/// }
+/// 
+/// impl RpcObject for MyRpcHandler {
+///     fn handle_rpc (&self, params: capnp::any_pointer::Reader, result: capnp::any_pointer::Builder) 
+///         -> Result<(), RpcError> {
+///             // perform Rpc here, and place the results into the result builder.
+///             // return Ok(()) on success or an RpcError on error.
+///             # Ok(())
+///     }
+/// }
+///
+/// // Create an instance of the Rpc handler to handle all Rpcs and cast it to a trait object
+/// let my_rpc_handler: Box<RpcObject> = Box::new(MyRpcHandler {});
+/// # let my_opcode = 0i16;
+/// let services = vec![(my_opcode, my_rpc_handler)];
+/// let mut server = RpcServer::new_with_services(services);
+/// # let port_num = 0u16;
+/// server.bind(("localhost", port_num)).unwrap();
+/// server.repl().unwrap();
+/// # }
+/// ```
 pub mod server;
 #[cfg(test)]
 mod test;

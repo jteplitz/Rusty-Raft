@@ -7,32 +7,15 @@ use capnp::{serialize_packed, message};
 use capnp::serialize::{OwnedSegments};
 use super::RpcError;
 
-///
-/// Used to construct and send Rpc to a remote server.
-/// The usage is a bit more complicated than is ideal due to capnproto 
-/// 
-/// TODO: Get this example code to compile
-/// # Examples
-///
-/// ```rust,ignore
-/// #let opcode = 0i16;
-/// let rpc = Rpc::new(opcode);
-/// let param_builder = rpc.get_param_builder();
-/// // construct params here
-/// rpc.send(("192.168.0.15", 8080))
-/// .and_then(|msg| {
-///     Rpc::get_result_reader(msg)
-///     .map(|result| {
-///         // handle result here
-///     })
-/// });
-/// ```
-///
 pub struct Rpc {
     msg: message::Builder<message::HeapAllocator>,
 }
 
 impl Rpc {
+    ///
+    /// Constructs a new Rpc for the given opcode
+    /// call Rpc::get_param_builder to add parameters.
+    ///
     pub fn new (opcode: i16) -> Rpc {
         let mut msg = message::Builder::new_default(); 
         {
@@ -46,15 +29,27 @@ impl Rpc {
 
     ///
     /// Returns a params::Builder for this request.
-    /// Returns a capnp::Error if Rpc::new was not called first
     ///
-    pub fn get_param_builder (&mut self) -> Result<capnp::any_pointer::Builder, capnp::Error> {
+    /// # Panics
+    /// Panics if Rpc was not constructed by calling Rpc::new.
+    ///
+    pub fn get_param_builder (&mut self) -> capnp::any_pointer::Builder {
         self.msg.get_root::<rpc_request::Builder>()
             .map(|root| {
                 root.get_params()
-            })
+            }).unwrap()
     }
 
+    ///
+    /// Sends the Rpc to the given server, and blocks until a response is recieved (or it errors
+    /// out).
+    /// 
+    /// # Errors
+    /// * Returns an RpcError::Io if there was an Io error while sending the request or recieving 
+    /// the response.
+    /// * Returns an RpcError::Capnp if there was an issue parsing the RpcResponse header of the
+    /// server's resposne message.
+    ///
     pub fn send<A: ToSocketAddrs> (&self, addr: A) 
         -> Result<message::Reader<OwnedSegments>, RpcError>
     {
@@ -77,6 +72,13 @@ impl Rpc {
         })
     }
 
+    ///
+    /// Associated method that exposes the result from the message reader returned by send.
+    /// Returns a capnp::any_pointer:Reader which the user should cast to the correct type.
+    /// 
+    /// # Errors
+    /// Returns an RpcError::Capnp if msg is not a valid RpcResponse
+    ///
     pub fn get_result_reader (msg: &message::Reader<OwnedSegments>) 
         -> Result<capnp::any_pointer::Reader, RpcError>
     {
