@@ -99,7 +99,7 @@ impl Peer {
         // TODO
     }
 
-    // Main loop for this machine to ping Peers.
+    // Main loop for this machine to push to Peers.
     fn main (mut self) {
         loop {
             // Execute
