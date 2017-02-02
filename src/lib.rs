@@ -2,6 +2,7 @@
 /// See the submodules for information on how to set up a server and a client.
 pub mod rpc;
 extern crate capnp;
+extern crate rand;
 
 // DO NOT MOVE THIS OR RENAME THIS
 // TODO: This is a giant hack, but appears to be the "correct" way to do this

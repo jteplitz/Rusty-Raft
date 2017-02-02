@@ -6,6 +6,7 @@ build = "src/build.rs"
 
 [dependencies]
 capnp = "0.8.0"
+rand = "0.3"
 
 [build-dependencies]
 capnpc = "*"

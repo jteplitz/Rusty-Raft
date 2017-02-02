@@ -1,5 +1,6 @@
-extern crate capnp;
 mod log;
+use capnp;
+use rand;
 use raft_capnp::{append_entries, append_entries_reply,
                  request_vote, request_vote_reply};
 use rpc::{RpcError};
@@ -11,6 +12,15 @@ use std::sync::{Arc, Mutex};
 use std::sync::mpsc::{channel, Sender, Receiver};
 
 use self::log::{Log, MemoryLog, Entry};
+use std::time;
+use std::io::Error as IoError;
+use rand::distributions::{IndependentSample, Range};
+
+// Constants
+// TODO: Many of these should be overwritable by Config
+const ELECTION_TIMEOUT_MIN: u64 = 150; // min election timeout wait value in m.s.
+const ELECTION_TIMEOUT_MAX: u64 = 300; // min election timeout wait value in m.s.
+const HEARBEAT_INTERVAL: u64    = 75; // time between hearbeats
 
 pub struct Config {
     cluster: Vec<SocketAddr>,
@@ -38,88 +48,101 @@ impl Config {
 
 // States that each machine can be in!
 pub enum State {
-    STARTING,
     CANDIDATE,
     LEADER,
     FOLLOWER,
 }
 
-pub struct PeerThreadMessage {
-    state: State,
+enum RpcType {
+    APPEND_ENTRIES,
+    REQUEST_VOTE
+}
+
+struct AppendEntriesMessage {
+    term: u64,
+    leader_id: u64,
+    prev_log_index: u64,
+    prev_log_term: u64,
+    entries: Entry,
+    leader_commit: u64
+}
+
+struct RequestVoteMessage {
+    term: u64,
+    candidate_id: u64,
+    last_log_index: u64,
+    las_log_term: u64
+}
+
+// TODO: Cooler name
+enum PeerThreadMessage {
+    AppendEntries (AppendEntriesMessage),
+    RequestVote (RequestVoteMessage)
+}
+
+enum PeerThreadResponse {
+    AppendEntries {
+        term: u64,
+        success: bool
+    },
+    RequestVote {
+        term: u64,
+        vote_granted: bool
+    }
 }
 
 pub struct PeerHandle {
-    channel: Sender<PeerThreadMessage>,
-    commit_index: Arc<Mutex<u64>>, // Locked access.
+    channel: Sender<PeerThreadMessage>
 }
 
+// Things this needs to know, change, and why:
+// mut current state  
+//
 pub struct Peer {
     addr: SocketAddr,
-    next_heartbeat: Instant,
-    heartbeat_timeout: Duration,
     channel: Receiver<PeerThreadMessage>,
-    commit_index: Arc<Mutex<u64>>, // Locked access.
-    ro_log: Arc<Mutex<Log>>,
-    state: State,
+    pending_entries: Vec<Entry>,
+    // TODO: Add send channel
+    commit_index: u64, 
 }
 
 impl Peer {
-    pub fn start (addr: SocketAddr, ro_log: Arc<Mutex<Log>>,
-                  initial_state: State, heartbeat_timeout: Duration) -> PeerHandle {
+    pub fn start (addr: SocketAddr) -> PeerHandle {
         let (send, recv) = channel();
-        let commit_index = Arc::new(Mutex::new(0));
-        {
-            let commit = commit_index.clone();
-            thread::spawn(move || {
-                let peer = Peer {
-                    addr: addr,
-                    next_heartbeat: Instant::now(),
-                    commit_index: commit,
-                    heartbeat_timeout: heartbeat_timeout,
-                    channel: recv,
-                    ro_log: ro_log.clone(),
-                    state: initial_state,
-                };
-                peer.main();
-            });
-        }
+        let commit_index = 0;
+        
+        thread::spawn(move || {
+            let peer = Peer {
+                addr: addr,
+                commit_index: commit_index,
+                pending_entries: vec![],
+                channel: recv
+            };
+            peer.main();
+        });
+
         PeerHandle {
-            channel: send.clone(),
-            commit_index: commit_index.clone(),
+            channel: send
         }
     }
 
-    pub fn send_append_entries (&self, ref ro_log: &Arc<Mutex<Log>>) {
+    pub fn send_append_entries (&mut self, entry: AppendEntriesMessage) {
+        unimplemented!()
         // TODO (syd)
         // 1. Construct an empty append_entries rpc
         // 2. Copy in entries from |ro_log| if peer commit index is behind.
     }
 
-    pub fn send_request_vote (&self) {
-        // TODO
+    pub fn send_request_vote (&self, vote: RequestVoteMessage) {
+        unimplemented!()
     }
 
     // Main loop for this machine to push to Peers.
     fn main (mut self) {
         loop {
-            // Execute
-            match self.state {
-                State::CANDIDATE => self.send_request_vote(),
-                State::LEADER => self.send_append_entries(&self.ro_log),
-                _ => {},
-            };
-            // Wait on next message
-            self.state = match self.state {
-                // Leaders have to send heartbeats.
-                State::LEADER => {
-                    let received = self.channel.recv_timeout(self.heartbeat_timeout);
-                    match received {
-                        Ok(_) => received.unwrap().state,
-                        Err(_) => self.state,
-                    }
-                },
-                // Everyone else simply waits on the next message.
-                _ => self.channel.recv().unwrap().state
+            match self.channel.recv().unwrap() {
+                PeerThreadMessage::AppendEntries(entry) => self.send_append_entries(entry),
+                PeerThreadMessage::RequestVote(vote) => self.send_request_vote(vote)
             }
         }
     }
@@ -131,10 +154,46 @@ pub struct Server {
     log: Arc<Mutex<Log>>,
     peers: Vec<PeerHandle>,
     addr: SocketAddr,
+    last_leader_contact: Instant,
+    voted_for: Option<SocketAddr>
+}
+
+
+///
+/// Starts up a new raft server with the given config.
+/// This is mostly just a bootstrapper for now. It probably won't end up in the public API
+/// As of right now this function does not return. It just runs the state machine as long as it's
+/// in a live thread.
+///
+pub fn start_server(config: Config) -> ! {
+    let server = Server::new(config).unwrap();
+
+    // The server starts up in a follower state. Set a timeout to become a candidate.
+
+    loop {
+        match server.state {
+            State::FOLLOWER => {
+                let btwn = Range::new(ELECTION_TIMEOUT_MIN, ELECTION_TIMEOUT_MAX);
+                let mut range = rand::thread_rng();
+                let sleep_time = btwn.ind_sample(&mut range);
+                thread::sleep(time::Duration::from_millis(sleep_time));
+                
+                // if last_leader_contact < election timeout, start an election
+            },
+            State::CANDIDATE => {
+                // same as above?
+                unimplemented!()
+            },
+            State::LEADER => {
+                // sleep and then send a hearbeat?
+                unimplemented!()
+            }
+        }
+    }
 }
 
 impl Server {
-    pub fn new (config: Config) -> Server {
+    pub fn new (config: Config) -> Result<Server, IoError> {
         let addr = config.addr;
         // 1. Start RPC request handlers
         let append_entries_handler: Box<RpcObject> = Box::new(AppendEntriesHandler {});
@@ -142,33 +201,39 @@ impl Server {
             (1, append_entries_handler),
         ];
         let mut server = RpcServer::new_with_services(services);
-        server.bind((config.addr.ip(), config.addr.port())).unwrap();
-        server.repl().unwrap();
+        try!(
+            server.bind((config.addr.ip(), config.addr.port()))
+            .and_then(|_| {
+                server.repl()
+            })
+        );
+
 
         // 2. Start peer threads.
+        let peers = config.cluster.into_iter()
+            .filter(move |x| *x != addr) // filter all computers that aren't me
+            .map(|x| Peer::start(x))
+            .collect::<Vec<PeerHandle>>();
+
         let log = Arc::new(Mutex::new(MemoryLog::new()));
-        let heartbeat_timeout = config.heartbeat_timeout;
-        {
-            let ro_log = log.clone();
-            let peers = config.cluster.into_iter()
-                .filter(move |x| *x != addr) // filter all computers that aren't me
-                .map(move |x| Peer::start(x, ro_log.clone(),
-                                          if x == addr { State::LEADER }
-                                          else { State::FOLLOWER },
-                                          heartbeat_timeout))
-                .collect::<Vec<PeerHandle>>();
 
         // 3. Construct server state object.
-            Server {
-                state: State::STARTING,
-                current_term: 0,
-                log: log,
-                peers: peers,
-                addr: addr,
-            }
-        }
+        Ok(Server {
+            state: State::FOLLOWER,
+            current_term: 0,
+            log: log,
+            peers: peers,
+            addr: addr,
+            voted_for: None,
+            last_leader_contact: Instant::now()
+        })
     }
 
+    fn start_election(&mut self) {
+        self.state = State::CANDIDATE;
+
+        // tell each peer to send out RequestToVote RPCs
+    }
 }
 
 struct AppendEntriesHandler {}
