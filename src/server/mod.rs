@@ -1,71 +1,126 @@
 extern crate capnp;
 mod log;
-use self::log::{Log, MemoryLog};
-use rpc::{RpcError};
-use rpc::server::{RpcObject, RpcServer};
 use raft_capnp::{append_entries, append_entries_reply,
                  request_vote, request_vote_reply};
-use std::time::{Instant};
+use rpc::{RpcError};
+use rpc::server::{RpcObject, RpcServer};
+use std::net::{SocketAddr};
+use std::time::{Duration, Instant};
+use std::thread;
+use std::sync::{Arc, Mutex};
+use std::sync::mpsc::{channel, Sender, Receiver};
 
-#[derive(PartialEq, Eq)]
-pub struct SocketAddress {
-    pub port: u16,
-    pub hostname: String,
-}
+use self::log::{Log, MemoryLog, Entry};
 
 pub struct Config {
-    cluster: Vec<SocketAddress>,
-    leader: SocketAddress,
-    addr: SocketAddress,
+    cluster: Vec<SocketAddr>,
+    leader: SocketAddr,
+    addr: SocketAddr,
+    heartbeat_timeout: Duration,
 }
 
 impl Config {
-    pub fn new (cluster: Vec<SocketAddress>, leader: SocketAddress, addr: SocketAddress) -> Config {
+    pub fn new (cluster: Vec<SocketAddr>, leader: SocketAddr,
+                addr: SocketAddr, heartbeat_timeout: Duration) -> Config {
         Config {
             cluster: cluster,
             leader: leader,
             addr: addr,
+            heartbeat_timeout: heartbeat_timeout,
         }
     }
 
-    // TODO: eventually implement
+    // TODO eventually implement
     // pub fn fromFile (file: String) -> Config {
     //     
     // }
 }
 
 // States that each machine can be in!
-enum State {
+pub enum State {
     STARTING,
     CANDIDATE,
     LEADER,
     FOLLOWER,
 }
 
+pub struct PeerThreadMessage {
+    state: State,
+}
+
+pub struct PeerHandle {
+    channel: Sender<PeerThreadMessage>,
+    commit_index: Arc<Mutex<u64>>, // Locked access.
+}
+
 pub struct Peer {
-    addr: SocketAddress,
+    addr: SocketAddr,
     next_heartbeat: Instant,
-    commit_index: u64,
+    heartbeat_timeout: Duration,
+    channel: Receiver<PeerThreadMessage>,
+    commit_index: Arc<Mutex<u64>>, // Locked access.
+    ro_log: Arc<Mutex<Log>>,
+    state: State,
 }
 
 impl Peer {
-    pub fn new (addr: SocketAddress) -> Peer {
-        Peer {
-            addr: addr,
-            next_heartbeat: Instant::now(),
-            commit_index: 0,
+    pub fn start (addr: SocketAddr, ro_log: Arc<Mutex<Log>>,
+                  initial_state: State, heartbeat_timeout: Duration) -> PeerHandle {
+        let (send, recv) = channel();
+        let commit_index = Arc::new(Mutex::new(0));
+        {
+            let commit = commit_index.clone();
+            thread::spawn(move || {
+                let peer = Peer {
+                    addr: addr,
+                    next_heartbeat: Instant::now(),
+                    commit_index: commit,
+                    heartbeat_timeout: heartbeat_timeout,
+                    channel: recv,
+                    ro_log: ro_log.clone(),
+                    state: initial_state,
+                };
+                peer.main();
+            });
+        }
+        PeerHandle {
+            channel: send.clone(),
+            commit_index: commit_index.clone(),
         }
     }
 
+    pub fn send_append_entries (&self, ref ro_log: &Arc<Mutex<Log>>) {
+        // TODO (syd)
+        // 1. Construct an empty append_entries rpc
+        // 2. Copy in entries from |ro_log| if peer commit index is behind.
+    }
+
+    pub fn send_request_vote (&self) {
+        // TODO
+    }
+
     // Main loop for this machine to ping Peers.
-    pub fn main (&self) -> bool {
-        // TODO Think more carefully about access patterns.
-        // For instance, here we need access to this Peer, the current Log, & leader state.
+    fn main (mut self) {
         loop {
-            // 1. Check machine state: am I leader?
-            // 2. If so, send heartbeat if time has passed.
-            // 2a.   * Piggyback any outstanding Log entries (> peer.commit_index)
-            //         onto heartbeat.
+            // Execute
+            match self.state {
+                State::CANDIDATE => self.send_request_vote(),
+                State::LEADER => self.send_append_entries(&self.ro_log),
+                _ => {},
+            };
+            // Wait on next message
+            self.state = match self.state {
+                // Leaders have to send heartbeats.
+                State::LEADER => {
+                    let received = self.channel.recv_timeout(self.heartbeat_timeout);
+                    match received {
+                        Ok(_) => received.unwrap().state,
+                        Err(_) => self.state,
+                    }
+                },
+                // Everyone else simply waits on the next message.
+                _ => self.channel.recv().unwrap().state
+            }
         }
     }
 }
@@ -73,31 +128,44 @@ impl Peer {
 pub struct Server {
     state: State,
     current_term: u64,
-    log: MemoryLog,
-    peers: Vec<SocketAddress>,
-    addr: SocketAddress,
+    log: Arc<Mutex<Log>>,
+    peers: Vec<PeerHandle>,
+    addr: SocketAddr,
 }
 
 impl Server {
     pub fn new (config: Config) -> Server {
+        let addr = config.addr;
         // 1. Start RPC request handlers
         let append_entries_handler: Box<RpcObject> = Box::new(AppendEntriesHandler {});
         let services = vec![
             (1, append_entries_handler),
         ];
         let mut server = RpcServer::new_with_services(services);
-        server.bind((config.addr.hostname.as_str(), config.addr.port)).unwrap();
+        server.bind((config.addr.ip(), config.addr.port())).unwrap();
         server.repl().unwrap();
 
-        // 2. Start peer heartbeat threads. TODO
+        // 2. Start peer threads.
+        let log = Arc::new(Mutex::new(MemoryLog::new()));
+        let heartbeat_timeout = config.heartbeat_timeout;
+        {
+            let ro_log = log.clone();
+            let peers = config.cluster.into_iter()
+                .filter(move |x| *x != addr) // filter all computers that aren't me
+                .map(move |x| Peer::start(x, ro_log.clone(),
+                                          if x == addr { State::LEADER }
+                                          else { State::FOLLOWER },
+                                          heartbeat_timeout))
+                .collect::<Vec<PeerHandle>>();
 
         // 3. Construct server state object.
-        Server {
-            state: State::STARTING,
-            current_term: 0,
-            log: MemoryLog::new(),
-            peers: config.cluster,
-            addr: config.addr,
+            Server {
+                state: State::STARTING,
+                current_term: 0,
+                log: log,
+                peers: peers,
+                addr: addr,
+            }
         }
     }
 
@@ -109,7 +177,7 @@ impl RpcObject for AppendEntriesHandler {
     fn handle_rpc (&self, params: capnp::any_pointer::Reader, result: capnp::any_pointer::Builder) 
         -> Result<(), RpcError>
     {
-        // TODO: implement
+        // TODO (syd) implement
         // 1. Ensure prevLogIndex matches our own.
         // 2. Append outstanding log entries.
         // 3. Construct reply.

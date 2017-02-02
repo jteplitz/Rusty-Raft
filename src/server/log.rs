@@ -14,7 +14,7 @@ enum EntryType {
     Unknown,
 }
 
-pub trait Log {
+pub trait Log: Sync + Send {
     fn get_entry(&self, index: u64) -> &Entry;
     fn append_entries(&mut self, entries: Vec<Entry>) -> u64;
     fn append_entry(&mut self, entry: Entry) -> u64;
