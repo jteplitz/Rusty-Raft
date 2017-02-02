@@ -55,7 +55,7 @@ pub enum State {
 
 enum RpcType {
     APPEND_ENTRIES,
-    REQUEST_VOTE
+    REQUEST_VOTE,
 }
 
 struct AppendEntriesMessage {
@@ -64,51 +64,53 @@ struct AppendEntriesMessage {
     prev_log_index: u64,
     prev_log_term: u64,
     entries: Entry,
-    leader_commit: u64
+    leader_commit: u64,
+}
+
+struct AppendEntriesReply {
+    term: u64,
+    success: u64,
 }
 
 struct RequestVoteMessage {
     term: u64,
     candidate_id: u64,
     last_log_index: u64,
-    las_log_term: u64
+    las_log_term: u64,
 }
 
-// TODO: Cooler name
+struct RequestVoteReply {
+    term: u64,
+    vote_granted: u64,
+}
+
 enum PeerThreadMessage {
     AppendEntries (AppendEntriesMessage),
-    RequestVote (RequestVoteMessage)
+    RequestVote (RequestVoteMessage),
 }
 
 enum PeerThreadResponse {
-    AppendEntries {
-        term: u64,
-        success: bool
-    },
-    RequestVote {
-        term: u64,
-        vote_granted: bool
-    }
+    AppendEntries (AppendEntriesReply),
+    RequestVote (RequestVoteReply),
 }
 
 pub struct PeerHandle {
-    channel: Sender<PeerThreadMessage>
+    to_peer: Sender<PeerThreadMessage>,
+    from_peer: Receiver<PeerThreadMessage>,
 }
 
-// Things this needs to know, change, and why:
-// mut current state  
-//
 pub struct Peer {
     addr: SocketAddr,
-    channel: Receiver<PeerThreadMessage>,
-    pending_entries: Vec<Entry>,
-    // TODO: Add send channel
     commit_index: u64, 
+    pending_entries: Vec<Entry>,
+    to_main: Sender<PeerThreadMessage>,
+    from_main: Receiver<PeerThreadMessage>,
 }
 
 impl Peer {
     pub fn start (addr: SocketAddr) -> PeerHandle {
-        let (send, recv) = channel();
+        let (to_peer, from_main) = channel();
+        let (to_main, from_peer) = channel();
         let commit_index = 0;
         
         thread::spawn(move || {
@@ -116,13 +118,15 @@ impl Peer {
                 addr: addr,
                 commit_index: commit_index,
                 pending_entries: vec![],
-                channel: recv
+                to_main: to_main,
+                from_main: from_main,
             };
             peer.main();
         });
 
         PeerHandle {
-            channel: send
+            to_peer: to_peer,
+            from_peer: from_peer,
         }
     }
 
@@ -140,7 +144,7 @@ impl Peer {
     // Main loop for this machine to push to Peers.
     fn main (mut self) {
         loop {
-            match self.channel.recv().unwrap() {
+            match self.from_main.recv().unwrap() { // If recv fails, we in deep shit already, so just unwrap
                 PeerThreadMessage::AppendEntries(entry) => self.send_append_entries(entry),
                 PeerThreadMessage::RequestVote(vote) => self.send_request_vote(vote)
             }
