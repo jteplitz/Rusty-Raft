@@ -96,7 +96,7 @@ enum PeerThreadResponse {
 
 pub struct PeerHandle {
     to_peer: Sender<PeerThreadMessage>,
-    from_peer: Receiver<PeerThreadMessage>,
+    //from_peer: Receiver<PeerThreadMessage>,
 }
 
 pub struct Peer {
@@ -108,9 +108,9 @@ pub struct Peer {
 }
 
 impl Peer {
-    pub fn start (addr: SocketAddr) -> PeerHandle {
+    fn start (addr: SocketAddr, to_main: Sender<PeerThreadMessage>) -> PeerHandle {
         let (to_peer, from_main) = channel();
-        let (to_main, from_peer) = channel();
+        //let (to_main, from_peer) = channel();
         let commit_index = 0;
         
         thread::spawn(move || {
@@ -126,7 +126,7 @@ impl Peer {
 
         PeerHandle {
             to_peer: to_peer,
-            from_peer: from_peer,
+            //from_peer: from_peer,
         }
     }
 
@@ -152,9 +152,17 @@ impl Peer {
     }
 }
 
-pub struct Server {
-    state: State,
+// Store's the state that the server is currently in along with the current_term
+// and current_id. This fields should all share a lock.
+struct ServerState {
+    current_state: State,
     current_term: u64,
+    current_id: u64
+}
+
+
+pub struct Server {
+    state: Arc<Mutex<ServerState>>,
     log: Arc<Mutex<Log>>,
     peers: Vec<PeerHandle>,
     addr: SocketAddr,
@@ -170,22 +178,29 @@ pub struct Server {
 /// in a live thread.
 ///
 pub fn start_server(config: Config) -> ! {
-    let server = Server::new(config).unwrap();
+    let (tx, rx) = channel();
+    let mut server = Server::new(config, tx).unwrap();
 
     // The server starts up in a follower state. Set a timeout to become a candidate.
 
     loop {
-        match server.state {
+        match server.state.current_state {
             State::FOLLOWER => {
                 let btwn = Range::new(ELECTION_TIMEOUT_MIN, ELECTION_TIMEOUT_MAX);
                 let mut range = rand::thread_rng();
-                let sleep_time = btwn.ind_sample(&mut range);
-                thread::sleep(time::Duration::from_millis(sleep_time));
-                
-                // if last_leader_contact < election timeout, start an election
+                let timeout = Duration::from_millis(btwn.ind_sample(&mut range));
+                thread::sleep(timeout);
+
+                let now = Instant::now();
+                let last_leader_contact = server.last_leader_contact;
+                if now.duration_since(last_leader_contact) >= timeout {
+                    // we have not heard from the leader for one timeout duration.
+                    // start an election
+                    server.start_election();
+                }
             },
             State::CANDIDATE => {
-                // same as above?
+                server.start_election();
                 unimplemented!()
             },
             State::LEADER => {
@@ -197,7 +212,7 @@ pub fn start_server(config: Config) -> ! {
 }
 
 impl Server {
-    pub fn new (config: Config) -> Result<Server, IoError> {
+    fn new (config: Config, tx: Sender<PeerThreadMessage>) -> Result<Server, IoError> {
         let addr = config.addr;
         // 1. Start RPC request handlers
         let append_entries_handler: Box<RpcObject> = Box::new(AppendEntriesHandler {});
@@ -216,15 +231,20 @@ impl Server {
         // 2. Start peer threads.
         let peers = config.cluster.into_iter()
             .filter(move |x| *x != addr) // filter all computers that aren't me
-            .map(|x| Peer::start(x))
+            .map(move |x| Peer::start(x, tx.clone()))
             .collect::<Vec<PeerHandle>>();
 
         let log = Arc::new(Mutex::new(MemoryLog::new()));
 
+        let state = Arc::new(Mutex::new(ServerState {
+            current_state: State::FOLLOWER,
+            current_term: 0,
+            current_id: 0
+        }));
+
         // 3. Construct server state object.
         Ok(Server {
-            state: State::FOLLOWER,
-            current_term: 0,
+            state: state,
             log: log,
             peers: peers,
             addr: addr,
@@ -233,10 +253,17 @@ impl Server {
         })
     }
 
+    ///
+    /// Starts a new election by requesting votes from all peers
+    /// If the election is successful then the server transitions into the LEADER state
+    /// Otherwise the leader stays in the candidate state.
+    /// The assumption is that the caller will start another election
+    ///
     fn start_election(&mut self) {
-        self.state = State::CANDIDATE;
-
+        debug_assert!(self.state == State::CANDIDATE);
         // tell each peer to send out RequestToVote RPCs
+        //let 
+        unimplemented!();
     }
 }
 
@@ -246,6 +273,11 @@ impl RpcObject for AppendEntriesHandler {
     fn handle_rpc (&self, params: capnp::any_pointer::Reader, result: capnp::any_pointer::Builder) 
         -> Result<(), RpcError>
     {
+        // TODO: If this is a valid rpc from the leader, update last_leader_contact
+        
+        // TODO: If we're in the CANDIDATE state and this leader's term is >= our current term
+        //
+        
         // TODO (syd) implement
         // 1. Ensure prevLogIndex matches our own.
         // 2. Append outstanding log entries.
