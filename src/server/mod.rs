@@ -20,7 +20,7 @@ use rand::distributions::{IndependentSample, Range};
 // TODO: Many of these should be overwritable by Config
 const ELECTION_TIMEOUT_MIN: u64 = 150; // min election timeout wait value in m.s.
 const ELECTION_TIMEOUT_MAX: u64 = 300; // min election timeout wait value in m.s.
-const HEARBEAT_INTERVAL: u64    = 75; // time between hearbeats
+const HEARTBEAT_INTERVAL: u64    = 75; // time between hearbeats
 
 pub struct Config {
     cluster: Vec<SocketAddr>,
@@ -47,6 +47,7 @@ impl Config {
 }
 
 // States that each machine can be in!
+#[derive(PartialEq)]
 pub enum State {
     CANDIDATE,
     LEADER,
@@ -69,6 +70,8 @@ struct AppendEntriesMessage {
 
 struct AppendEntriesReply {
     term: u64,
+    commit_index: u64,
+    peer_addr: SocketAddr, // or some other identifying field
     success: u64,
 }
 
@@ -84,31 +87,35 @@ struct RequestVoteReply {
     vote_granted: u64,
 }
 
+struct ClientAppendRequest {
+    entry: Entry,
+}
+
 enum PeerThreadMessage {
     AppendEntries (AppendEntriesMessage),
     RequestVote (RequestVoteMessage),
 }
 
-enum PeerThreadResponse {
-    AppendEntries (AppendEntriesReply),
-    RequestVote (RequestVoteReply),
+enum MainThreadMessage {
+    AppendEntriesReply (AppendEntriesReply),
+    RequestVoteReply (RequestVoteReply),
+    ClientAppendRequest (ClientAppendRequest),
 }
 
 pub struct PeerHandle {
     to_peer: Sender<PeerThreadMessage>,
-    //from_peer: Receiver<PeerThreadMessage>,
 }
 
 pub struct Peer {
     addr: SocketAddr,
     commit_index: u64, 
     pending_entries: Vec<Entry>,
-    to_main: Sender<PeerThreadMessage>,
+    to_main: Sender<MainThreadMessage>,
     from_main: Receiver<PeerThreadMessage>,
 }
 
 impl Peer {
-    fn start (addr: SocketAddr, to_main: Sender<PeerThreadMessage>) -> PeerHandle {
+    fn start (addr: SocketAddr, to_main: Sender<MainThreadMessage>) -> PeerHandle {
         let (to_peer, from_main) = channel();
         //let (to_main, from_peer) = channel();
         let commit_index = 0;
@@ -131,10 +138,10 @@ impl Peer {
     }
 
     pub fn send_append_entries (&mut self, entry: AppendEntriesMessage) {
-        unimplemented!()
         // TODO (syd)
         // 1. Construct an empty append_entries rpc
         // 2. Copy in entries from |ro_log| if peer commit index is behind.
+        unimplemented!();
     }
 
     pub fn send_request_vote (&self, vote: RequestVoteMessage) {
@@ -167,7 +174,8 @@ pub struct Server {
     peers: Vec<PeerHandle>,
     addr: SocketAddr,
     last_leader_contact: Instant,
-    voted_for: Option<SocketAddr>
+    voted_for: Option<SocketAddr>,
+    last_heartbeat: Instant,
 }
 
 
@@ -177,12 +185,11 @@ pub struct Server {
 /// As of right now this function does not return. It just runs the state machine as long as it's
 /// in a live thread.
 ///
-pub fn start_server(config: Config) -> ! {
+pub fn start_server (config: Config) -> ! {
     let (tx, rx) = channel();
     let mut server = Server::new(config, tx).unwrap();
 
     // The server starts up in a follower state. Set a timeout to become a candidate.
-
     loop {
         match server.state.current_state {
             State::FOLLOWER => {
@@ -204,15 +211,36 @@ pub fn start_server(config: Config) -> ! {
                 unimplemented!()
             },
             State::LEADER => {
-                // sleep and then send a hearbeat?
-                unimplemented!()
-            }
-        }
-    }
+                let heartbeat_wait = Duration::from_millis(HEARTBEAT_INTERVAL);
+                let duration_since_last_heartbeat = Instant::now().duration_since(server.last_heartbeat);
+                // TODO (sydli) : use checked_sub here (possible underflow)
+                let next_heartbeat = heartbeat_wait - duration_since_last_heartbeat;
+                // Timed wait on leader message pipe.
+                let message = match rx.recv_timeout(next_heartbeat) {
+                    Ok(message) => message,
+                    // If we timed out, just send a heartbeat.
+                    Err(e) => {
+                        server.send_append_entries();
+                        continue;
+                    },
+                };
+                match message {
+                    MainThreadMessage::AppendEntriesReply(m) => {
+                        server.aggregate_append_entries_reply(m);
+                        server.update_commit_index();
+                    },
+                    MainThreadMessage::ClientAppendRequest(m) => {
+                        server.send_append_entries();
+                    },
+                    _ => unimplemented!(),
+                };
+            },
+        } // end match server.state
+    } // end loop
 }
 
 impl Server {
-    fn new (config: Config, tx: Sender<PeerThreadMessage>) -> Result<Server, IoError> {
+    fn new (config: Config, tx: Sender<MainThreadMessage>) -> Result<Server, IoError> {
         let addr = config.addr;
         // 1. Start RPC request handlers
         let append_entries_handler: Box<RpcObject> = Box::new(AppendEntriesHandler {});
@@ -230,8 +258,8 @@ impl Server {
 
         // 2. Start peer threads.
         let peers = config.cluster.into_iter()
-            .filter(move |x| *x != addr) // filter all computers that aren't me
-            .map(move |x| Peer::start(x, tx.clone()))
+            .filter(|x| *x != addr) // filter all computers that aren't me
+            .map(|x| Peer::start(x, tx.clone()))
             .collect::<Vec<PeerHandle>>();
 
         let log = Arc::new(Mutex::new(MemoryLog::new()));
@@ -249,8 +277,32 @@ impl Server {
             peers: peers,
             addr: addr,
             voted_for: None,
-            last_leader_contact: Instant::now()
+            last_leader_contact: Instant::now(),
+            last_heartbeat: Instant::now()
         })
+    }
+
+    ///
+    /// Write |entry| to the log and try to replicate it across all servers.
+    /// This function is non-blocking; it simply forwards AppendEntries messages
+    /// to all known peers.
+    ///
+    fn send_append_entries(&mut self) {
+        self.last_heartbeat = Instant::now();
+    }
+
+    ///
+    /// Aggregate peer's append entries response into server state
+    ///
+    fn aggregate_append_entries_reply(&self, message: AppendEntriesReply) {
+        unimplemented!();
+    }
+
+    ///
+    /// Update commit_index count to the most recent log entry with quorum.
+    ///
+    fn update_commit_index(&self) {
+        unimplemented!();
     }
 
     ///
@@ -260,7 +312,7 @@ impl Server {
     /// The assumption is that the caller will start another election
     ///
     fn start_election(&mut self) {
-        debug_assert!(self.state == State::CANDIDATE);
+        debug_assert!(self.state.current_state == State::CANDIDATE);
         // tell each peer to send out RequestToVote RPCs
         //let 
         unimplemented!();
