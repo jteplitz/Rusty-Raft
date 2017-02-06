@@ -50,7 +50,7 @@ impl Config {
 }
 
 // States that each machine can be in!
-#[derive(PartialEq)]
+#[derive(PartialEq, Clone)]
 pub enum State {
     CANDIDATE,
     LEADER,
@@ -200,16 +200,15 @@ pub fn start_server (config: Config) -> ! {
 
     // The server starts up in a follower state. Set a timeout to become a candidate.
     loop {
-        let mut state = server.state.lock().unwrap(); // panics if any other threads have panicked.
-        match state.current_state {
+        let current_state = { server.state.lock().unwrap().current_state.clone() };
+        match current_state {
             State::FOLLOWER => {
                 let btwn = Range::new(ELECTION_TIMEOUT_MIN, ELECTION_TIMEOUT_MAX);
                 let mut range = rand::thread_rng();
                 // TODO(jason): Subtract time since last_leader_contact from wait time
                 let timeout = Duration::from_millis(btwn.ind_sample(&mut range));
-                drop(state);
                 thread::sleep(timeout);
-                state = server.state.lock().unwrap();
+                let state = server.state.lock().unwrap();
 
                 let now = Instant::now();
                 let last_leader_contact = state.last_leader_contact;
@@ -220,14 +219,16 @@ pub fn start_server (config: Config) -> ! {
                 }
             },
             State::CANDIDATE => {
+                let state = server.state.lock().unwrap();
                 server.start_election(state);
                 unimplemented!()
             },
             State::LEADER => {
                 let heartbeat_wait = Duration::from_millis(HEARTBEAT_INTERVAL);
-                let duration_since_last_heartbeat = Instant::now().duration_since(server.last_heartbeat);
+                let since_last_heartbeat = Instant::now()
+                                               .duration_since(server.last_heartbeat);
                 // TODO (sydli) : use checked_sub here (possible underflow)
-                let next_heartbeat = heartbeat_wait - duration_since_last_heartbeat;
+                let next_heartbeat = heartbeat_wait - since_last_heartbeat;
                 // Timed wait on leader message pipe.
                 let message = match rx.recv_timeout(next_heartbeat) {
                     Ok(message) => message,
@@ -256,7 +257,8 @@ impl Server {
     fn new (config: Config, tx: Sender<MainThreadMessage>) -> Result<Server, IoError> {
         let me = config.me;
         // 1. Start RPC request handlers
-        let append_entries_handler: Box<RpcObject> = Box::new(AppendEntriesHandler {});
+        let append_entries_handler: Box<RpcObject> = Box::new(
+            AppendEntriesHandler { to_main: Mutex::new(tx.clone()) });
         let services = vec![
             (1, append_entries_handler),
         ];
@@ -303,7 +305,7 @@ impl Server {
     /// This function is non-blocking; it simply forwards AppendEntries messages
     /// to all known peers.
     ///
-    fn send_append_entries(&/*mut*/ self) {
+    fn send_append_entries(&mut self) {
         unimplemented!();
         //self.last_heartbeat = Instant::now();
     }
@@ -356,7 +358,9 @@ impl Server {
     }
 }
 
-struct AppendEntriesHandler {}
+struct AppendEntriesHandler {
+    to_main: Mutex<Sender<MainThreadMessage>>,
+}
 
 impl RpcObject for AppendEntriesHandler {
     fn handle_rpc (&self, params: capnp::any_pointer::Reader, result: capnp::any_pointer::Builder) 
