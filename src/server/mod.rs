@@ -4,6 +4,7 @@ use rand;
 use raft_capnp::{append_entries, append_entries_reply,
                  request_vote, request_vote_reply};
 use rpc::{RpcError};
+use rpc::client::Rpc;
 use rpc::server::{RpcObject, RpcServer};
 use std::cmp;
 use std::net::{SocketAddr};
@@ -23,6 +24,8 @@ use std::collections::HashMap;
 const ELECTION_TIMEOUT_MIN: u64 = 150; // min election timeout wait value in m.s.
 const ELECTION_TIMEOUT_MAX: u64 = 300; // min election timeout wait value in m.s.
 const HEARTBEAT_INTERVAL: u64    = 75; // time between hearbeats
+const APPEND_ENTRIES_OPCODE: i16 = 0;
+const REQUEST_VOTE_OPCODE: i16 = 1;
 
 pub struct Config {
     // Each server has a unique 64bit integer id that and a socket address
@@ -118,10 +121,16 @@ pub struct Peer {
     addr: SocketAddr,
     pending_entries: Vec<Entry>,
     to_main: Sender<MainThreadMessage>,
-    from_main: Receiver<PeerThreadMessage>,
+    from_main: Receiver<PeerThreadMessage>
 }
 
 impl Peer {
+    ///
+    /// Spawns a new Peer in a background thread to communicate with the server at id.
+    ///
+    /// # Panics
+    /// Panics if the OS fails to create a new background thread.
+    ///
     fn start (id: (u64, SocketAddr), to_main: Sender<MainThreadMessage>) -> PeerHandle {
         let (to_peer, from_main) = channel();
         //let (to_main, from_peer) = channel();
@@ -132,7 +141,7 @@ impl Peer {
                 addr: id.1,
                 pending_entries: vec![],
                 to_main: to_main,
-                from_main: from_main,
+                from_main: from_main
             };
             peer.main();
         });
@@ -152,7 +161,34 @@ impl Peer {
     }
 
     fn send_request_vote (&self, vote: RequestVoteMessage) {
-        unimplemented!()
+        let mut rpc = Rpc::new(REQUEST_VOTE_OPCODE);
+        {
+            let mut params = rpc.get_param_builder().init_as::<request_vote::Builder>();
+            params.set_term(vote.term);
+            params.set_candidate_id(vote.candidate_id);
+            params.set_last_log_index(vote.last_log_index);
+            params.set_last_log_term(vote.last_log_term);
+        }
+        let vote_granted = rpc.send(self.addr)
+            .and_then(|msg| {
+                Rpc::get_result_reader(&msg)
+                    .and_then(|result| {
+                        result.get_as::<request_vote_reply::Reader>()
+                              .map_err(RpcError::Capnp)
+                    })
+                    .map(|reply_reader| {
+                        let term = reply_reader.get_term();
+                        let vote_granted = reply_reader.get_vote_granted();
+                        term == vote.term && vote_granted
+                    })
+            })
+            .unwrap_or(false);
+        let reply = RequestVoteReply {
+            term: vote.term,
+            vote_granted: vote_granted
+        };
+        // Panics if the main thread has panicked or been deallocated
+        self.to_main.send(MainThreadMessage::RequestVoteReply(reply)).unwrap();
     }
 
     // Main loop for this machine to push to Peers.
@@ -167,7 +203,7 @@ impl Peer {
 }
 
 // Store's the state that the server is currently in along with the current_term
-// and current_id. This fields should all share a lock.
+// and current_id. These fields should all share a lock.
 struct ServerState {
     // TODO: state and term must be persisted to disk
     current_state: State,
@@ -314,7 +350,8 @@ impl Server {
                 log: log.clone(),
             });
         let services = vec![
-            (1, append_entries_handler),
+            (APPEND_ENTRIES_OPCODE, append_entries_handler),
+            //(REQUEST_VOTE_OPCODE, request_vote_handler)
         ];
         let mut server = RpcServer::new_with_services(services);
         try!(
@@ -478,7 +515,7 @@ impl Server {
 
 struct AppendEntriesHandler {
     state: Arc<Mutex<ServerState>>,
-    log: Arc<Mutex<Log>>,
+    log: Arc<Mutex<Log>>
 }
 
 impl RpcObject for AppendEntriesHandler {
