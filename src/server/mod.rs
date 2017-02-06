@@ -51,7 +51,7 @@ impl Config {
 }
 
 // States that each machine can be in!
-#[derive(PartialEq, Clone)]
+#[derive(PartialEq, Clone, Copy)]
 pub enum State {
     CANDIDATE,
     LEADER,
@@ -90,7 +90,7 @@ struct RequestVoteMessage {
 
 struct RequestVoteReply {
     term: u64,
-    vote_granted: u64,
+    vote_granted: bool,
 }
 
 struct ClientAppendRequest {
@@ -144,14 +144,14 @@ impl Peer {
         }
     }
 
-    pub fn send_append_entries (&mut self, entry: AppendEntriesMessage) {
+    fn send_append_entries (&mut self, entry: AppendEntriesMessage) {
         // TODO (syd)
         // 1. Construct an empty append_entries rpc
         // 2. Copy in entries from |ro_log| if peer commit index is behind.
         unimplemented!();
     }
 
-    pub fn send_request_vote (&self, vote: RequestVoteMessage) {
+    fn send_request_vote (&self, vote: RequestVoteMessage) {
         unimplemented!()
     }
 
@@ -174,7 +174,51 @@ struct ServerState {
     current_term: u64,
     commit_index: u64,
     last_leader_contact: Instant,
-    voted_for: Option<u64>
+    voted_for: Option<u64>,
+    election_timeout: Duration
+}
+
+/// 
+/// Implements state transitions
+///
+impl ServerState {
+    ///
+    /// Transitions into the candidate state by incrementing the current_term and resting the
+    /// current_index.
+    /// This should only be called if we're in the follower state or already in the candidate state
+    /// Returns a tuple containing the (last_log_term, last_log_index)
+    ///
+    fn transition_to_candidate(&mut self, my_id: u64) -> (u64, u64){
+        debug_assert!(self.current_state == State::FOLLOWER || self.current_state == State::CANDIDATE);
+        let last_log_index = self.commit_index;
+        let last_log_term = self.current_term;
+        self.current_state = State::CANDIDATE;
+        self.current_term += 1;
+        self.commit_index = 0;
+        self.voted_for = Some(my_id); // vote for ourselves
+        self.election_timeout = generate_election_timeout();
+
+        return (last_log_term, last_log_index);
+    }
+
+    ///
+    /// Transitions into the leader state from the candidate state.
+    ///
+    /// TODO: Persist term information to disk?
+    fn transition_to_leader(&mut self) {
+        debug_assert!(self.current_state == State::CANDIDATE);
+        self.current_state = State::LEADER;
+    }
+
+
+    ///
+    /// Returns true if an election timeout has occured.
+    ///
+    fn has_election_timeout_occured(&self) -> bool {
+        let now = Instant::now();
+        let last_leader_contact = self.last_leader_contact;
+        now.duration_since(last_leader_contact) < self.election_timeout
+    }
 }
 
 // TODO: RW locks?
@@ -183,7 +227,7 @@ pub struct Server {
     log: Arc<Mutex<Log>>,
     peers: Vec<PeerHandle>,
     me: (u64, SocketAddr),
-    last_heartbeat: Instant,
+    last_heartbeat: Instant
 }
 
 ///
@@ -202,28 +246,17 @@ pub fn start_server (config: Config) -> ! {
 
     // The server starts up in a follower state. Set a timeout to become a candidate.
     loop {
-        let current_state = { server.state.lock().unwrap().current_state.clone() };
+        let (current_state, election_timeout) = { 
+            let state = server.state.lock().unwrap();
+            (state.current_state, state.election_timeout)
+        };
         match current_state {
             State::FOLLOWER => {
-                let btwn = Range::new(ELECTION_TIMEOUT_MIN, ELECTION_TIMEOUT_MAX);
-                let mut range = rand::thread_rng();
                 // TODO(jason): Subtract time since last_leader_contact from wait time
-                let timeout = Duration::from_millis(btwn.ind_sample(&mut range));
-                thread::sleep(timeout);
-                let state = server.state.lock().unwrap();
-
-                let now = Instant::now();
-                let last_leader_contact = state.last_leader_contact;
-                if now.duration_since(last_leader_contact) >= timeout {
-                    // we have not heard from the leader for one timeout duration.
-                    // start an election
-                    server.start_election(state);
-                }
+                thread::sleep(election_timeout);
             },
             State::CANDIDATE => {
-                let state = server.state.lock().unwrap();
-                server.start_election(state);
-                unimplemented!()
+                server.start_election(&rx);
             },
             State::LEADER => {
                 let heartbeat_wait = Duration::from_millis(HEARTBEAT_INTERVAL);
@@ -270,7 +303,8 @@ impl Server {
             current_term: 0,
             commit_index: 0,
             voted_for: None,
-            last_leader_contact: Instant::now()
+            last_leader_contact: Instant::now(),
+            election_timeout: generate_election_timeout()
         }));
 
         // 1. Start RPC request handlers
@@ -374,32 +408,71 @@ impl Server {
     /// If the election is successful then the server transitions into the LEADER state
     /// Otherwise the leader stays in the candidate state.
     /// The assumption is that the caller will start another election
+    /// If the server transitions back into the FOLLOWER state during this election the
+    /// election times out and start election will just return.
     ///
-    fn start_election(&self, mut state: MutexGuard<ServerState>) {
+    /// # Panics
+    /// Panics if any other thread has panicked while holding the state lock
+    fn start_election(&mut self, rx: &Receiver<MainThreadMessage> ) {
+        let (election_timeout, election_term);
         { // state lock scope
-            // move the lock into this scope
-            let mut locked_state = state;
+            let mut state = self.state.lock().unwrap();
+            if state.current_state == State::FOLLOWER {
+                if state.has_election_timeout_occured() { return }
+            }
+
             // transition to the candidate state
-            let last_log_index = locked_state.commit_index;
-            let last_log_term = locked_state.current_term;
-            locked_state.current_state = State::CANDIDATE;
-            locked_state.current_term += 1;
-            locked_state.commit_index = 0;
-            locked_state.voted_for = Some(self.me.0); // vote for ourselves
+            let last_log_index = state.commit_index;
+            let last_log_term = state.current_term;
+            state.current_state = State::CANDIDATE;
+            state.current_term += 1;
+            state.commit_index = 0;
+            state.voted_for = Some(self.me.0); // vote for ourselves
+            let (last_log_term, last_log_index) = state.transition_to_candidate(self.me.0);
+
+            // save the election information in the parent scope
+            election_timeout = state.election_timeout;
+            election_term = state.current_term;
+
             // tell each peer to send out RequestToVote RPCs
             let request_vote_message = RequestVoteMessage {
-                term: locked_state.current_term,
+                term: state.current_term,
                 candidate_id: self.me.0,
                 last_log_index: last_log_index,
                 last_log_term: last_log_term
             };
-            let ref peers = self.peers;
-            for peer in peers {
+
+            for peer in &self.peers {
                 peer.to_peer.send(PeerThreadMessage::RequestVote(request_vote_message))
                     .unwrap(); // panic if the peer thread is down
             }
         }
-        unimplemented!();
+
+        let election_start_time = Instant::now();
+        let mut num_votes = 1;
+        while num_votes <= self.peers.len() / 2 {
+            let time_since_election_start = Instant::now().duration_since(election_start_time);
+            let time_remaining = election_timeout - time_since_election_start;
+            let message = match rx.recv_timeout(time_remaining) {
+                Ok(message) => message,
+                // If we timed out cancel this election.
+                Err(e) => return
+            };
+
+            match message {
+                MainThreadMessage::RequestVoteReply(reply) => {
+                    if reply.term == election_term && reply.vote_granted {
+                        num_votes += 1;
+                    }
+                },
+                // Ignore all other message types
+                _ => continue
+            }
+        }
+
+        // Woo we won the election. Transition to the leader state
+        let mut state = self.state.lock().unwrap();
+        state.transition_to_leader();
     }
 }
 
@@ -455,3 +528,15 @@ impl RpcObject for AppendEntriesHandler {
        .map_err(RpcError::Capnp)
     }
 }
+///
+/// Returns a new random election timeout.
+/// The election timeout should be reset whenever we transition into the follower state or the
+/// candidate state
+/// TODO: Write state changing methods on the server (or server state) structs?
+///
+fn generate_election_timeout() -> Duration {
+    let btwn = Range::new(ELECTION_TIMEOUT_MIN, ELECTION_TIMEOUT_MAX);
+    let mut range = rand::thread_rng();
+    Duration::from_millis(btwn.ind_sample(&mut range))
+}
+
