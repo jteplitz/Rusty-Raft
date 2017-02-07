@@ -1,9 +1,10 @@
 @0xdcf9b3ce29f421d0;
 
 struct Entry {
-  term          @0   :Int64;
-  type          @1   :Type;
-  data          @2   :Data;
+  term          @0   :UInt64;
+  index         @1   :UInt64;
+  type          @2   :Type;
+  data          @3   :Data;
   enum Type {
     data @0;
     read @1;
@@ -12,27 +13,27 @@ struct Entry {
 }
 
 struct AppendEntries {
-  term          @0   :Int64;
-  leaderId      @1   :Int64;
-  prevLogIndex  @2   :Int64;
-  prevLogTerm   @3   :Int64;
+  term          @0   :UInt64;
+  leaderId      @1   :UInt64;
+  prevLogIndex  @2   :UInt64;
+  prevLogTerm   @3   :UInt64;
   entries       @4   :List(Entry);
-  leaderCommit  @5   :Int64;
+  leaderCommit  @5   :UInt64;
 }
 
 struct AppendEntriesReply {
-  term          @0   :Int64;
+  term          @0   :UInt64;
   success       @1   :Bool;
 }
 
 struct RequestVote {
-  term          @0   :Int64;
-  candidateId   @1   :Int64;
-  lastLogIndex  @2   :Int64;
-  lastLogTerm   @3   :Int64;
+  term          @0   :UInt64;
+  candidateId   @1   :UInt64;
+  lastLogIndex  @2   :UInt64;
+  lastLogTerm   @3   :UInt64;
 }
 
 struct RequestVoteReply {
-  term          @0   :Int64;
+  term          @0   :UInt64;
   voteGranted   @1   :Bool;
 }

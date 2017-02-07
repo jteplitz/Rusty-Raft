@@ -5,6 +5,7 @@ use raft_capnp::{append_entries, append_entries_reply,
                  request_vote, request_vote_reply};
 use rpc::{RpcError};
 use rpc::server::{RpcObject, RpcServer};
+use std::cmp;
 use std::net::{SocketAddr};
 use std::time::{Duration, Instant};
 use std::thread;
@@ -68,15 +69,15 @@ struct AppendEntriesMessage {
     leader_id: u64,
     prev_log_index: u64,
     prev_log_term: u64,
-    entries: Entry,
+    entries: Vec<Entry>,
     leader_commit: u64,
 }
 
 struct AppendEntriesReply {
     term: u64,
     commit_index: u64,
-    peer_addr: SocketAddr, // or some other identifying field
-    success: u64,
+    peer: (u64, SocketAddr),
+    success: bool,
 }
 
 #[derive(Copy, Clone)]
@@ -108,27 +109,27 @@ enum MainThreadMessage {
 }
 
 pub struct PeerHandle {
+    id: u64,
     to_peer: Sender<PeerThreadMessage>,
+    commit_index: u64,
 }
 
 pub struct Peer {
     addr: SocketAddr,
-    commit_index: u64, 
     pending_entries: Vec<Entry>,
     to_main: Sender<MainThreadMessage>,
     from_main: Receiver<PeerThreadMessage>,
 }
 
 impl Peer {
-    fn start (addr: SocketAddr, to_main: Sender<MainThreadMessage>) -> PeerHandle {
+    fn start (id: (u64, SocketAddr), to_main: Sender<MainThreadMessage>) -> PeerHandle {
         let (to_peer, from_main) = channel();
         //let (to_main, from_peer) = channel();
         let commit_index = 0;
         
         thread::spawn(move || {
             let peer = Peer {
-                addr: addr,
-                commit_index: commit_index,
+                addr: id.1,
                 pending_entries: vec![],
                 to_main: to_main,
                 from_main: from_main,
@@ -137,8 +138,9 @@ impl Peer {
         });
 
         PeerHandle {
+            id: id.0,
             to_peer: to_peer,
-            //from_peer: from_peer,
+            commit_index: commit_index,
         }
     }
 
@@ -170,7 +172,7 @@ struct ServerState {
     // TODO: state and term must be persisted to disk
     current_state: State,
     current_term: u64,
-    current_index: u64,
+    commit_index: u64,
     last_leader_contact: Instant,
     voted_for: Option<u64>
 }
@@ -240,8 +242,14 @@ pub fn start_server (config: Config) -> ! {
                 };
                 match message {
                     MainThreadMessage::AppendEntriesReply(m) => {
-                        server.aggregate_append_entries_reply(m);
-                        server.update_commit_index();
+                        if m.success {
+                            server.get_peer_mut(m.peer.0).map(|peer| {
+                                    if (m.commit_index > peer.commit_index) {
+                                        peer.commit_index = m.commit_index;
+                                    }
+                            });
+                            server.update_commit_index();
+                        }
                     },
                     MainThreadMessage::ClientAppendRequest(m) => {
                         server.send_append_entries();
@@ -256,9 +264,21 @@ pub fn start_server (config: Config) -> ! {
 impl Server {
     fn new (config: Config, tx: Sender<MainThreadMessage>) -> Result<Server, IoError> {
         let me = config.me;
+        let log = Arc::new(Mutex::new(MemoryLog::new()));
+        let state = Arc::new(Mutex::new(ServerState {
+            current_state: State::FOLLOWER,
+            current_term: 0,
+            commit_index: 0,
+            voted_for: None,
+            last_leader_contact: Instant::now()
+        }));
+
         // 1. Start RPC request handlers
         let append_entries_handler: Box<RpcObject> = Box::new(
-            AppendEntriesHandler { to_main: Mutex::new(tx.clone()) });
+            AppendEntriesHandler {
+                state: state.clone(),
+                log: log.clone(),
+            });
         let services = vec![
             (1, append_entries_handler),
         ];
@@ -270,25 +290,14 @@ impl Server {
             })
         );
 
-
         // TODO: Should peers be a map of id->PeerHandle. I.E. Will we ever need to send a message
         // to a specific peer?
 
         // 2. Start peer threads.
         let peers = config.cluster.into_iter()
             .filter(|&(id, addr)| id != me.0) // filter all computers that aren't me
-            .map(|(id, addr)| Peer::start(addr, tx.clone()))
+            .map(|(id, addr)| Peer::start((id, addr), tx.clone()))
             .collect::<Vec<PeerHandle>>();
-
-        let log = Arc::new(Mutex::new(MemoryLog::new()));
-
-        let state = Arc::new(Mutex::new(ServerState {
-            current_state: State::FOLLOWER,
-            current_term: 0,
-            current_index: 0,
-            voted_for: None,
-            last_leader_contact: Instant::now()
-        }));
 
         // 3. Construct server state object.
         Ok(Server {
@@ -306,22 +315,58 @@ impl Server {
     /// to all known peers.
     ///
     fn send_append_entries(&mut self) {
-        unimplemented!();
-        //self.last_heartbeat = Instant::now();
+        // 1. Retrieve relevant state info (locked).
+        let (commit_index, current_term) = { 
+            let state = self.state.lock().unwrap();
+            (state.commit_index.clone(),    // = commit_index
+                state.current_term.clone()) // = current_term
+        };
+        // 2. Retrieve relevant all relevant entries from log (locked).
+        let min_peer_index = self.peers.iter().fold(commit_index,
+                                 |acc, ref peer| cmp::min(acc, peer.commit_index));
+        let entries = {
+            let log = self.log.lock().unwrap();
+            log.get_entries_from(min_peer_index).to_vec()
+        };
+        // 3. Construct append entries requests for all peers.
+        for peer in &self.peers {
+            // TODO These indices should be checked against |entries|
+            let peer_index = peer.commit_index as usize;
+            let peer_entries = &entries[peer_index + 1 ..];
+            let last_entry = entries.get(peer_index).unwrap();
+            peer.to_peer.send(PeerThreadMessage::AppendEntries(AppendEntriesMessage {
+                term: current_term,
+                leader_id: self.me.0,
+                prev_log_index: peer.commit_index,
+                prev_log_term: last_entry.term,
+                entries: peer_entries.to_vec(),
+                leader_commit: commit_index,
+            })).unwrap(); // TODO actually do something prodcutive on error
+        }
+        self.last_heartbeat = Instant::now();
     }
 
     ///
-    /// Aggregate peer's append entries response into server state
+    /// Returns a mutable reference to the peer referred to by |id|.
+    /// None if no peer with |id| is found.
     ///
-    fn aggregate_append_entries_reply(&self, message: AppendEntriesReply) {
-        unimplemented!();
+    fn get_peer_mut(&mut self, id: u64) -> Option<&mut PeerHandle> {
+        self.peers.iter_mut().find(|peer| peer.id == id)
     }
 
     ///
     /// Update commit_index count to the most recent log entry with quorum.
     ///
-    fn update_commit_index(&self) {
-        unimplemented!();
+    fn update_commit_index(&mut self) {
+        // Find median of all peer commit indices.
+        let mut indices: Vec<u64> = self.peers.iter().map(|ref peer| peer.commit_index.clone())
+                                                     .collect();
+        indices.sort();
+        let new_index = *indices.get( (indices.len() - 1) / 2 ).unwrap();
+        // Set new commit index if it's higher!
+        let mut state = self.state.lock().unwrap();
+        if state.commit_index >= new_index { return; }
+        state.commit_index = new_index;
     }
 
     ///
@@ -335,11 +380,11 @@ impl Server {
             // move the lock into this scope
             let mut locked_state = state;
             // transition to the candidate state
-            let last_log_index = locked_state.current_index;
+            let last_log_index = locked_state.commit_index;
             let last_log_term = locked_state.current_term;
             locked_state.current_state = State::CANDIDATE;
             locked_state.current_term += 1;
-            locked_state.current_index = 0;
+            locked_state.commit_index = 0;
             locked_state.voted_for = Some(self.me.0); // vote for ourselves
             // tell each peer to send out RequestToVote RPCs
             let request_vote_message = RequestVoteMessage {
@@ -359,26 +404,54 @@ impl Server {
 }
 
 struct AppendEntriesHandler {
-    to_main: Mutex<Sender<MainThreadMessage>>,
+    state: Arc<Mutex<ServerState>>,
+    log: Arc<Mutex<Log>>,
 }
 
 impl RpcObject for AppendEntriesHandler {
     fn handle_rpc (&self, params: capnp::any_pointer::Reader, result: capnp::any_pointer::Builder) 
         -> Result<(), RpcError>
     {
-        // TODO: If this is a valid rpc from the leader, update last_leader_contact
-        
-        // TODO: If we're in the CANDIDATE state and this leader's term is >= our current term
-        //
-        
-        // TODO (syd) implement
-        // 1. Ensure prevLogIndex matches our own.
-        // 2. Append outstanding log entries.
-        // 3. Construct reply.
-        params.get_as::<append_entries::Reader>()
-           .map(|append_entries| {
-               result.init_as::<append_entries_reply::Builder>().set_success(true);
-           })
-           .map_err(RpcError::Capnp)
+        // Let's read some state first :D
+        let (commit_index, term) = { 
+            let state = self.state.lock().unwrap();
+            (state.commit_index, state.current_term)
+        };
+        params.get_as::<append_entries::Reader>().map(|append_entries| {
+           let mut success = false;
+           // TODO: If this is a valid rpc from the leader, update last_leader_contact
+           // TODO: If we're in the CANDIDATE state and this leader's term is
+           //       >= our current term
+
+           // If term doesn't match, something's wrong (incorrect leader).
+           if append_entries.get_term() != term {
+               return; /* TODO @Jason Wat do?? */
+           }
+           // Update last leader contact timestamp.
+           { self.state.lock().unwrap().last_leader_contact = Instant::now() }
+           // If term matches we're good to go... update state!
+           if append_entries.get_prev_log_index() == commit_index {
+               // Deserialize entries from RPC.
+               let entries: Vec<Entry> = append_entries.get_entries().unwrap().iter()
+                   .map(|entry_proto| Entry {
+                       index: entry_proto.get_index(),
+                       term: entry_proto.get_term(),
+                       data: entry_proto.get_data().unwrap().to_vec(),
+                   }).collect();
+               let entries_len = entries.len() as u64;
+               { // Append entries to log.
+                   let mut log = self.log.lock().unwrap();
+                   log.append_entries(entries);
+               }
+               { // March forward our commit index.
+                   self.state.lock().unwrap().commit_index += entries_len;
+               }
+               success = true;
+           }
+           let mut reply = result.init_as::<append_entries_reply::Builder>();
+           reply.set_success(success);
+           reply.set_term(term);
+       })
+       .map_err(RpcError::Capnp)
     }
 }

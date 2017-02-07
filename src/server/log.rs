@@ -1,10 +1,11 @@
 /// This module abstracts away local log storage
 /// ... and eventually snapshotting.
 
+#[derive(Clone)]
 pub struct Entry {
-    index: u64,
-    term: u64,
-    data: Vec<u8>,
+    pub index: u64,
+    pub term: u64,
+    pub data: Vec<u8>,
 }
 
 enum EntryType {
@@ -15,6 +16,7 @@ enum EntryType {
 
 pub trait Log: Sync + Send {
     fn get_entry(&self, index: u64) -> &Entry;
+    fn get_entries_from(&self, start_index: u64) -> &[Entry];
     fn append_entries(&mut self, entries: Vec<Entry>) -> u64;
     fn append_entry(&mut self, entry: Entry) -> u64;
     fn get_last_entry_index(&self) -> u64;
@@ -33,6 +35,10 @@ impl MemoryLog {
 impl Log for MemoryLog {
     fn get_entry(&self, index:u64) -> &Entry {
         self.entries.get(index as usize).unwrap()
+    }
+
+    fn get_entries_from(&self, start_index: u64) -> &[Entry] {
+        &self.entries[start_index as usize .. self.entries.len()]
     }
 
     fn append_entries(&mut self, entries: Vec<Entry>) -> u64 {
