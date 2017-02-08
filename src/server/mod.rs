@@ -218,8 +218,9 @@ struct ServerState {
 /// Implements state transitions
 ///
 impl ServerState {
+    // TODO: We should read through these state transitions carefully together @sydli
     ///
-    /// Transitions into the candidate state by incrementing the current_term and resting the
+    /// Transitions into the candidate state by incrementing the current_term and resetting the
     /// current_index.
     /// This should only be called if we're in the follower state or already in the candidate state
     /// Returns a tuple containing the (last_log_term, last_log_index)
@@ -230,10 +231,10 @@ impl ServerState {
         let last_log_term = self.current_term;
         self.current_state = State::CANDIDATE;
         self.current_term += 1;
-        self.commit_index = 0;
         self.voted_for = Some(my_id); // vote for ourselves
         self.election_timeout = generate_election_timeout();
 
+        // TODO: These return values are wrong. It needs to be the last term and index FROM the log
         return (last_log_term, last_log_index);
     }
 
@@ -244,8 +245,17 @@ impl ServerState {
     fn transition_to_leader(&mut self) {
         debug_assert!(self.current_state == State::CANDIDATE);
         self.current_state = State::LEADER;
+        // TODO: We need to initialize all the next indices in the peer threads.
     }
 
+    fn transition_to_follower(&mut self, new_term: u64) {
+        debug_assert!(self.current_state == State::CANDIDATE || self.current_state == State::LEADER);
+        self.current_term = new_term;
+        self.current_state = State::FOLLOWER;
+        self.voted_for = None;
+        self.election_timeout = generate_election_timeout();
+        // TODO: We need to stop the peers from continuing to send AppendEntries here.
+    }
 
     ///
     /// Returns true if an election timeout has occured.
@@ -260,6 +270,7 @@ impl ServerState {
 // TODO: RW locks?
 pub struct Server {
     state: Arc<Mutex<ServerState>>,
+    // NB: Log lock must only be acquired after or independetly of state lock
     log: Arc<Mutex<Log>>,
     peers: Vec<PeerHandle>,
     me: (u64, SocketAddr),
@@ -327,6 +338,7 @@ pub fn start_server (config: Config) -> ! {
                 };
             },
         } // end match server.state
+
     } // end loop
 }
 
@@ -345,13 +357,14 @@ impl Server {
 
         // 1. Start RPC request handlers
         let append_entries_handler: Box<RpcObject> = Box::new(
-            AppendEntriesHandler {
-                state: state.clone(),
-                log: log.clone(),
-            });
+            AppendEntriesHandler {state: state.clone(), log: log.clone()}
+        );
+        let request_vote_handler: Box<RpcObject> = Box::new(
+            RequestVoteHandler {state: state.clone(), log: log.clone()}
+        );
         let services = vec![
             (APPEND_ENTRIES_OPCODE, append_entries_handler),
-            //(REQUEST_VOTE_OPCODE, request_vote_handler)
+            (REQUEST_VOTE_OPCODE, request_vote_handler)
         ];
         let mut server = RpcServer::new_with_services(services);
         try!(
@@ -513,10 +526,63 @@ impl Server {
     }
 }
 
+struct RequestVoteHandler {
+    state: Arc<Mutex<ServerState>>,
+    log: Arc<Mutex<MemoryLog>>
+}
+
+impl RpcObject for RequestVoteHandler {
+    fn handle_rpc (&self, params: capnp::any_pointer::Reader, result: capnp::any_pointer::Builder) 
+        ->Result<(), RpcError>
+    {
+        let (candidate_id, term, last_log_index, last_log_term) = try!(
+            params.get_as::<request_vote::Reader>()
+            .map_err(RpcError::Capnp)
+            .map(|params| {
+                (params.get_candidate_id(), params.get_term(), params.get_last_log_index(),
+                 params.get_last_log_term())
+            }));
+        let mut vote_granted = false;
+        let current_term;
+        {
+            let mut state = self.state.lock().unwrap(); // panics if mutex is poisoned
+            state.last_leader_contact = Instant::now();
+
+            if term > state.current_term {
+                // TODO(jason): This should happen on the main thread.
+                state.transition_to_follower(term);
+            }
+
+            if state.voted_for == None || state.voted_for == Some(candidate_id) {
+                let log = self.log.lock().unwrap(); // panics if mutex is poisoned
+                if term == state.current_term && log.is_other_log_valid(last_log_index, last_log_term) {
+                    vote_granted = true;
+                    state.voted_for = Some(candidate_id);
+                    state.transition_to_follower(term);
+                }
+            }
+            current_term = state.current_term;
+        }
+        let mut result_builder = result.init_as::<request_vote_reply::Builder>();
+        result_builder.set_term(current_term);
+        result_builder.set_vote_granted(vote_granted);
+        Ok(())
+    }
+}
+
+
+/// Returns true if the log represented by the first tuple is more up to date than the log
+/// represented by the 
+/// 
+fn log_is_more_up_to_date () {
+
+}
+
 struct AppendEntriesHandler {
     state: Arc<Mutex<ServerState>>,
     log: Arc<Mutex<Log>>
 }
+
 
 impl RpcObject for AppendEntriesHandler {
     fn handle_rpc (&self, params: capnp::any_pointer::Reader, result: capnp::any_pointer::Builder) 
@@ -569,7 +635,6 @@ impl RpcObject for AppendEntriesHandler {
 /// Returns a new random election timeout.
 /// The election timeout should be reset whenever we transition into the follower state or the
 /// candidate state
-/// TODO: Write state changing methods on the server (or server state) structs?
 ///
 fn generate_election_timeout() -> Duration {
     let btwn = Range::new(ELECTION_TIMEOUT_MIN, ELECTION_TIMEOUT_MAX);
