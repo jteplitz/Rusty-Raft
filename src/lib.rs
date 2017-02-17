@@ -1,3 +1,5 @@
+#[macro_use] extern crate matches;
+
 /// Simple Rpc Module.
 /// See the submodules for information on how to set up a server and a client.
 pub mod rpc;
