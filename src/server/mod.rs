@@ -305,7 +305,7 @@ impl ServerInfo {
 
 
 // TODO: Double check we never commit an entry from a previous term
-fn update_commit_index(server_info: &ServerInfo, mut state: MutexGuard<ServerState>) {
+fn update_commit_index(server_info: &ServerInfo, state: &mut ServerState) {
     // Find median of all peer commit indices.
     let mut indices: Vec<usize> = server_info.peers.iter().map(|ref peer| peer.commit_index.clone())
                                                  .collect();
@@ -342,7 +342,12 @@ pub fn start_server (config: Config) -> ! {
                 }
                 State::CANDIDATE(election_info) => {
                     let time_since_election = Instant::now() - election_info.start_time;
+
+                    // TODO: Replace explicit underflow checks with checked_sub once rust 1.16
+                    // is out. Scheduled for March 16th 2017
                     if time_since_election > state.election_timeout {
+                        // We timed out in between recieving a message and blocking on the message
+                        // pipe. Start a new election
                         current_timeout = server.start_election(&mut state);
                     } else {
                         current_timeout = state.election_timeout - time_since_election;
@@ -353,8 +358,16 @@ pub fn start_server (config: Config) -> ! {
                     let heartbeat_wait = Duration::from_millis(HEARTBEAT_INTERVAL);
                     let since_last_heartbeat = Instant::now()
                                                    .duration_since(server.info.last_heartbeat);
-                    // TODO (sydli) : use checked_sub here (possible underflow)
-                    current_timeout = heartbeat_wait - since_last_heartbeat;
+                    // TODO: Replace explicit underflow checks with checked_sub once rust 1.16
+                    // is out. Scheduled for March 16th 2017
+                    if (since_last_heartbeat > heartbeat_wait) {
+                        // We timed out in between recieving a message and blocking on the message
+                        // pipe. Send a heartbeat,
+                        send_append_entries(&mut server.info, &mut state, server.log.clone());
+                        current_timeout = heartbeat_wait;
+                    } else {
+                        current_timeout = heartbeat_wait - since_last_heartbeat;
+                    }
                 },
             } // end match server.state
         } // release state lock
@@ -362,28 +375,44 @@ pub fn start_server (config: Config) -> ! {
         let message = match rx.recv_timeout(current_timeout) {
             Ok(message) => message,
             Err(e) => {
-                // TODO(jason): Handle timeout in different ways based on state
-                // If Follower or Candidate we should start a new election
-                // if Leader we should send a heartbeat
-                //send_append_entries();
-                unimplemented!();
+                handle_timeout(&mut server);
                 continue;
             },
         };
 
+        // Acquire state lock
+        let ref mut state = * server.state.lock().unwrap();
         match message {
             MainThreadMessage::AppendEntriesReply(m) => 
-                handle_append_entries_reply(m, &mut server.info, server.state.clone()),
+                handle_append_entries_reply(m, &mut server.info, state),
             MainThreadMessage::ClientAppendRequest(m) => 
-                send_append_entries(&mut server.info, server.state.clone(), server.log.clone()),
+                send_append_entries(&mut server.info, state, server.log.clone()),
             MainThreadMessage::RequestVoteReply(m) => 
-                handle_request_vote_reply(m, &server.info, server.state.clone())
+                handle_request_vote_reply(m, &server.info, state)
         };
     } // end loop
 }
 
-fn handle_append_entries_reply(m: AppendEntriesReply, server_info: &mut ServerInfo, state: Arc<Mutex<ServerState>>) {
-    let state = state.lock().unwrap();
+///
+/// Handles timeouts on the main thread.
+/// Timeouts are handled differently based on our current state.
+/// If we're a follower or candidate we start a new election
+/// If we're the leader we send a hearbeat
+///
+/// # Panics
+/// Panics if any of the peer threads have panicked.
+///
+fn handle_timeout(server: &mut Server) {
+    let ref mut state = * server.state.lock().unwrap();
+    match state.current_state {
+        State::FOLLOWER | State::CANDIDATE(_) => {
+            server.start_election(state);
+        },
+        State::LEADER => send_append_entries(&mut server.info, state, server.log.clone())
+    }
+}
+
+fn handle_append_entries_reply(m: AppendEntriesReply, server_info: &mut ServerInfo, state: &mut ServerState) {
     match state.current_state {
         State::LEADER => {
             if m.success {
@@ -405,12 +434,12 @@ fn handle_append_entries_reply(m: AppendEntriesReply, server_info: &mut ServerIn
 /// This function is non-blocking; it simply forwards AppendEntries messages
 /// to all known peers.
 ///
-fn send_append_entries(info: &mut ServerInfo, state: Arc<Mutex<ServerState>>, log: Arc<Mutex<Log>>) {
+fn send_append_entries(info: &mut ServerInfo, state: &mut ServerState, log: Arc<Mutex<Log>>) {
     // TODO This needs to return an Error or something if we're not the leader
     
     // 1. Retrieve relevant state info (locked).
     let (commit_index, current_term) = { 
-        let state = state.lock().unwrap(); // move state into scope
+        let state = state; // move state into scope, so it gets dropped after we get the info
         (state.commit_index,    // = commit_index
             state.current_term) // = current_term
     };
@@ -443,8 +472,8 @@ fn send_append_entries(info: &mut ServerInfo, state: Arc<Mutex<ServerState>>, lo
 ///
 /// Handles replies to RequestVote Rpc
 ///
-fn handle_request_vote_reply(reply: RequestVoteReply, info: &ServerInfo, state: Arc<Mutex<ServerState>>) {
-    let ref mut state = * state.lock().unwrap();
+fn handle_request_vote_reply(reply: RequestVoteReply, info: &ServerInfo, state: &mut ServerState) {
+    //let ref mut state = * state.lock().unwrap();
 
     let num_votes = match state.current_state {
         State::CANDIDATE(ref mut election_info) => {
@@ -498,9 +527,6 @@ impl Server {
             })
         );
 
-        // TODO: Should peers be a map of id->PeerHandle. I.E. Will we ever need to send a message
-        // to a specific peer?
-
         // 2. Start peer threads.
         let peers = config.cluster.into_iter()
             .filter(|&(id, addr)| id != me.0) // filter all computers that aren't me
@@ -530,9 +556,9 @@ impl Server {
     /// election after a timeout.
     ///
     /// # Panics
-    /// Panics if any other thread has panicked while holding the state or log locks
+    /// Panics if any other thread has panicked while holding the log lock
     ///
-    fn start_election(&self, state: &mut MutexGuard<ServerState> ) -> Duration {
+    fn start_election(&self, state: &mut ServerState) -> Duration {
         // transition to the candidate state
         state.transition_to_candidate(self.info.me.0);
 
