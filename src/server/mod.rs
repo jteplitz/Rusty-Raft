@@ -64,12 +64,6 @@ struct ElectionInfo {
     start_time: Instant
 }
 
-#[allow(dead_code)] // TODO: What are we planning to use this for?
-enum RpcType {
-    AppendEntries,
-    RequestVote
-}
-
 //#[derive(Clone)
 #[allow(dead_code)] // TODO(sydli): Remove once we're using the message
 struct AppendEntriesMessage {
@@ -94,32 +88,23 @@ enum PeerThreadMessage {
     RequestVote (RequestVoteMessage),
 }
 
-
-// NB: It's a bit unfortunate the entire MainThreadMessage enum along with associated structs have to be public
-// just so ClientAppendRequest is public, but I'm not sure we can easily do much about it.
-#[allow(dead_code)] // TODO: Remove once reply is implemented
-pub struct AppendEntriesReply {
+struct AppendEntriesReply {
     term: u64,
     commit_index: usize,
     peer: (u64, SocketAddr),
     success: bool,
 }
 
-pub struct RequestVoteReply {
+struct RequestVoteReply {
     term: u64,
     vote_granted: bool,
 }
 
 
-#[allow(dead_code)] // TODO: Remove once client is implemented
-pub struct ClientAppendRequest {
-    entry: Entry,
-}
-
-pub enum MainThreadMessage {
+enum MainThreadMessage {
     AppendEntriesReply (AppendEntriesReply),
     RequestVoteReply (RequestVoteReply),
-    ClientAppendRequest (ClientAppendRequest),
+    ClientAppendRequest,
 }
 
 struct PeerHandle {
@@ -305,7 +290,6 @@ impl ServerInfo {
 }
 
 
-// TODO: Double check we never commit an entry from a previous term
 fn update_commit_index(server_info: &ServerInfo, state: &mut ServerState) {
     // Find median of all peer commit indices.
     let mut indices: Vec<usize> = server_info.peers.iter().map(|ref peer| peer.commit_index.clone())
@@ -386,8 +370,8 @@ pub fn start_server (config: Config) -> ! {
         match message {
             MainThreadMessage::AppendEntriesReply(m) => 
                 handle_append_entries_reply(m, &mut server.info, state),
-            MainThreadMessage::ClientAppendRequest(_) => 
-                // TODO: Why do we even have an entry in the message?
+            MainThreadMessage::ClientAppendRequest => 
+                // TODO: Rpc handler needs to already append message to log
                 send_append_entries(&mut server.info, state, server.log.clone()),
             MainThreadMessage::RequestVoteReply(m) => 
                 handle_request_vote_reply(m, &server.info, state)
