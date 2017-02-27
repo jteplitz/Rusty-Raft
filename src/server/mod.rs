@@ -687,7 +687,7 @@ mod tests {
     use std::net::{IpAddr, Ipv4Addr, SocketAddr};
     use super::{PeerThreadMessage, PeerHandle, Server, State,
                 ServerState, ServerInfo, generate_election_timeout, send_append_entries};
-    use super::log::{Entry, MemoryLog};
+    use super::log::{MemoryLog, random_entry};
     use std::time::{Duration, Instant};
     use std::sync::mpsc::{channel, Receiver};
     use std::sync::{Arc, Mutex};
@@ -726,7 +726,7 @@ mod tests {
     #[test]
     fn test_server_send_append_entries() {
         let (rx, mut s) = mock_server();
-        let vec = vec![Entry::random(); 3];
+        let vec = vec![random_entry(); 3];
         { // Append some random entries to log
           let mut log = s.log.lock().unwrap();
           log.append_entries(vec.clone());
@@ -735,7 +735,6 @@ mod tests {
         // Send append entries to peers!
         let ref mut state = s.state.lock().unwrap();
         send_append_entries(&mut s.info, state, s.log.clone());
-        println!("{:?}", vec);
 
         // Each peer should receive a message...
         for i in 0..s.info.peers.len() {

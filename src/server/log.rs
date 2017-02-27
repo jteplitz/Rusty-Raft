@@ -1,4 +1,5 @@
 use std::fmt;
+use rand::{Rng, thread_rng};
 
 ///
 /// Abstraction for a single Entry for our log.
@@ -10,6 +11,18 @@ pub struct Entry {
     pub data: Vec<u8>,  // data blob containing client-defined command to
                         // apply to the client state machine.
 }
+
+#[allow(dead_code)]
+pub fn random_entry() -> Entry {
+  let mut vec = vec![0; 8];
+  thread_rng().fill_bytes(&mut vec);
+  Entry {
+      index: 0,
+      term: 0,  // Unneeded, for testing, for now.
+      data: vec,
+  }
+}
+
 
 impl fmt::Debug for Entry {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
@@ -148,22 +161,13 @@ impl Log for MemoryLog {
 /// type returned by the |create_log()| helper.
 #[cfg(test)]
 mod tests {
-    use super::{Entry, Log, MemoryLog};
+    use super::{Log, MemoryLog, random_entry};
     fn create_log() -> MemoryLog { MemoryLog::new() } // Replace with other log types as needed
+
     fn create_filled_log(length: usize) -> MemoryLog {
         let mut log = create_log();
-        log.append_entries( vec![Entry::random(); length] );
+        log.append_entries( vec![random_entry(); length] );
         log
-    }
-
-    fn random_entry() {
-        let mut vec = vec![0; 8];
-        thread_rng().fill_bytes(&mut vec);
-        Entry {
-            index: 0, // TODO (sydli) this should not be 0
-            term: 0,  // Unneeded, for testing, for now.
-            data: vec,
-        }
     }
 
     #[test]
@@ -171,7 +175,7 @@ mod tests {
     /// Makes sure we panic if an incorrect index is supplied to the log.
     fn test_log_get_entry_out_of_index() {
         let mut log = create_log();
-        log.append_entry(Entry::random());
+        log.append_entry(random_entry());
         log.get_entry(1); // should panic
     }
 
@@ -179,8 +183,8 @@ mod tests {
     /// Tests that simple append and get works for a two-element array.
     fn test_log_append_get_simple() {
         let mut log = create_log();
-        let entry1 = Entry::random();
-        let entry2 = Entry::random();
+        let entry1 = random_entry();
+        let entry2 = random_entry();
 
         // Append operations
         log.append_entry(entry1.clone());
@@ -195,7 +199,7 @@ mod tests {
     /// Tests that indices stay valid after appending entries.
     fn test_log_append_indices_simple() {
         let length = 10;
-        let mut log = create_filled_log(length);
+        let log = create_filled_log(length);
         // Make sure the indices are correctly set
         for i in 0..length {
             assert_eq!(log.get_entry(i).index, i);
