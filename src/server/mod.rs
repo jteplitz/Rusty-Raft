@@ -10,20 +10,18 @@ use std::cmp;
 use std::net::SocketAddr;
 use std::time::{Duration, Instant};
 use std::thread;
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, Mutex};
 use std::sync::mpsc::{channel, Sender, Receiver};
 
 use self::log::{Log, MemoryLog, Entry};
-use std::time;
 use std::io::Error as IoError;
 use rand::distributions::{IndependentSample, Range};
 use std::collections::HashMap;
 
 // Constants
-// TODO: Many of these should be overwritable by Config
+// TODO: Many of these should be overwrittable by Config
 const ELECTION_TIMEOUT_MIN: u64 = 150; // min election timeout wait value in m.s.
 const ELECTION_TIMEOUT_MAX: u64 = 300; // min election timeout wait value in m.s.
-const HEARTBEAT_INTERVAL: u64    = 75; // time between hearbeats
 const APPEND_ENTRIES_OPCODE: i16 = 0;
 const REQUEST_VOTE_OPCODE: i16 = 1;
 
@@ -31,17 +29,15 @@ pub struct Config {
     // Each server has a unique 64bit integer id that and a socket address
     // These mappings MUST be identical for eaah server in the cluster
     cluster: HashMap<u64, SocketAddr>,
-    leader: u64,
     me: (u64, SocketAddr),
     heartbeat_timeout: Duration,
 }
 
 impl Config {
-    pub fn new (cluster: HashMap<u64, SocketAddr>, leader: u64, my_id: u64,
+    pub fn new (cluster: HashMap<u64, SocketAddr>, my_id: u64,
                 my_addr: SocketAddr, heartbeat_timeout: Duration) -> Config {
         Config {
             cluster: cluster,
-            leader: leader,
             me: (my_id, my_addr),
             heartbeat_timeout: heartbeat_timeout,
         }
@@ -57,9 +53,9 @@ impl Config {
 // TODO: We could clean things up by storing state specific data in each of these?
 #[derive(PartialEq, Clone, Copy)]
 enum State {
-    CANDIDATE (ElectionInfo),
-    LEADER,
-    FOLLOWER,
+    Candidate (ElectionInfo),
+    Leader,
+    Follower,
 }
 
 #[derive(PartialEq, Clone, Copy)]
@@ -68,12 +64,14 @@ struct ElectionInfo {
     start_time: Instant
 }
 
+#[allow(dead_code)] // TODO: What are we planning to use this for?
 enum RpcType {
-    APPEND_ENTRIES,
-    REQUEST_VOTE,
+    AppendEntries,
+    RequestVote
 }
 
-//#[derive(Clone)]
+//#[derive(Clone)
+#[allow(dead_code)] // TODO(sydli): Remove once we're using the message
 struct AppendEntriesMessage {
     term: u64,
     leader_id: u64,
@@ -81,13 +79,6 @@ struct AppendEntriesMessage {
     prev_log_term: u64,
     entries: Vec<Entry>,
     leader_commit: usize,
-}
-
-struct AppendEntriesReply {
-    term: u64,
-    commit_index: usize,
-    peer: (u64, SocketAddr),
-    success: bool,
 }
 
 #[derive(Copy, Clone)]
@@ -98,35 +89,47 @@ struct RequestVoteMessage {
     last_log_term: u64,
 }
 
-struct RequestVoteReply {
-    term: u64,
-    vote_granted: bool,
-}
-
-struct ClientAppendRequest {
-    entry: Entry,
-}
-
 enum PeerThreadMessage {
     AppendEntries (AppendEntriesMessage),
     RequestVote (RequestVoteMessage),
 }
 
-enum MainThreadMessage {
+
+// NB: It's a bit unfortunate the entire MainThreadMessage enum along with associated structs have to be public
+// just so ClientAppendRequest is public, but I'm not sure we can easily do much about it.
+#[allow(dead_code)] // TODO: Remove once reply is implemented
+pub struct AppendEntriesReply {
+    term: u64,
+    commit_index: usize,
+    peer: (u64, SocketAddr),
+    success: bool,
+}
+
+pub struct RequestVoteReply {
+    term: u64,
+    vote_granted: bool,
+}
+
+
+#[allow(dead_code)] // TODO: Remove once client is implemented
+pub struct ClientAppendRequest {
+    entry: Entry,
+}
+
+pub enum MainThreadMessage {
     AppendEntriesReply (AppendEntriesReply),
     RequestVoteReply (RequestVoteReply),
     ClientAppendRequest (ClientAppendRequest),
 }
 
-pub struct PeerHandle {
+struct PeerHandle {
     id: u64,
     to_peer: Sender<PeerThreadMessage>,
     commit_index: usize,
 }
 
-pub struct Peer {
+struct Peer {
     addr: SocketAddr,
-    pending_entries: Vec<Entry>,
     to_main: Sender<MainThreadMessage>,
     from_main: Receiver<PeerThreadMessage>
 }
@@ -145,7 +148,6 @@ impl Peer {
         thread::spawn(move || {
             let peer = Peer {
                 addr: id.1,
-                pending_entries: vec![],
                 to_main: to_main,
                 from_main: from_main
             };
@@ -243,11 +245,9 @@ impl ServerState {
     /// This should only be called if we're in the follower state or already in the candidate state
     ///
     fn transition_to_candidate(&mut self, my_id: u64) {
-        debug_assert!(self.current_state == State::FOLLOWER ||
-                      matches!(self.current_state, State::CANDIDATE(_)));
-        let last_log_index = self.commit_index;
-        let last_log_term = self.current_term;
-        self.current_state = State::CANDIDATE (ElectionInfo {
+        debug_assert!(self.current_state == State::Follower ||
+                      matches!(self.current_state, State::Candidate(_)));
+        self.current_state = State::Candidate(ElectionInfo {
             start_time: Instant::now(),
             num_votes: 1
         }); // we always start with 1 vote from ourselves
@@ -261,17 +261,17 @@ impl ServerState {
     ///
     /// TODO: Persist term information to disk?
     fn transition_to_leader(&mut self) {
-        debug_assert!(matches!(self.current_state, State::CANDIDATE(_)));
-        self.current_state = State::LEADER;
+        debug_assert!(matches!(self.current_state, State::Candidate(_)));
+        self.current_state = State::Leader;
         // TODO: We need to initialize all the next indices in the peer threads
         // They should be set to the our next index (which is the highest index in our log + 1)
     }
 
     fn transition_to_follower(&mut self, new_term: u64) {
-        debug_assert!(matches!(self.current_state, State::CANDIDATE(_)) ||
-                      self.current_state == State::LEADER);
+        debug_assert!(matches!(self.current_state, State::Candidate(_)) ||
+                      self.current_state == State::Leader);
         self.current_term = new_term;
-        self.current_state = State::FOLLOWER;
+        self.current_state = State::Follower;
         self.voted_for = None;
         self.election_timeout = generate_election_timeout();
         // TODO: We need to stop the peers from continuing to send AppendEntries here.
@@ -290,7 +290,8 @@ pub struct Server {
 struct ServerInfo {
     peers: Vec<PeerHandle>,
     me: (u64, SocketAddr),
-    last_heartbeat: Instant
+    last_heartbeat: Instant,
+    heartbeat_timeout: Duration
 }
 
 impl ServerInfo {
@@ -336,11 +337,11 @@ pub fn start_server (config: Config) -> ! {
             let mut state = server.state.lock().unwrap();
 
             match state.current_state {
-                State::FOLLOWER => {
+                State::Follower=> {
                     let now = Instant::now();
                     current_timeout = state.election_timeout - now.duration_since(state.last_leader_contact)
                 }
-                State::CANDIDATE(election_info) => {
+                State::Candidate(election_info) => {
                     let time_since_election = Instant::now() - election_info.start_time;
 
                     // TODO: Replace explicit underflow checks with checked_sub once rust 1.16
@@ -353,20 +354,20 @@ pub fn start_server (config: Config) -> ! {
                         current_timeout = state.election_timeout - time_since_election;
                     }
                 },
-                State::LEADER => {
+                State::Leader => {
+                    let heartbeat_timeout = server.info.heartbeat_timeout;
                     // TODO: Should last_heartbeat be in the leader state?
-                    let heartbeat_wait = Duration::from_millis(HEARTBEAT_INTERVAL);
                     let since_last_heartbeat = Instant::now()
                                                    .duration_since(server.info.last_heartbeat);
                     // TODO: Replace explicit underflow checks with checked_sub once rust 1.16
                     // is out. Scheduled for March 16th 2017
-                    if (since_last_heartbeat > heartbeat_wait) {
+                    if since_last_heartbeat > heartbeat_timeout {
                         // We timed out in between recieving a message and blocking on the message
                         // pipe. Send a heartbeat,
                         send_append_entries(&mut server.info, &mut state, server.log.clone());
-                        current_timeout = heartbeat_wait;
+                        current_timeout = heartbeat_timeout;
                     } else {
-                        current_timeout = heartbeat_wait - since_last_heartbeat;
+                        current_timeout = heartbeat_timeout - since_last_heartbeat;
                     }
                 },
             } // end match server.state
@@ -374,7 +375,7 @@ pub fn start_server (config: Config) -> ! {
 
         let message = match rx.recv_timeout(current_timeout) {
             Ok(message) => message,
-            Err(e) => {
+            Err(_) => {
                 handle_timeout(&mut server);
                 continue;
             },
@@ -385,7 +386,8 @@ pub fn start_server (config: Config) -> ! {
         match message {
             MainThreadMessage::AppendEntriesReply(m) => 
                 handle_append_entries_reply(m, &mut server.info, state),
-            MainThreadMessage::ClientAppendRequest(m) => 
+            MainThreadMessage::ClientAppendRequest(_) => 
+                // TODO: Why do we even have an entry in the message?
                 send_append_entries(&mut server.info, state, server.log.clone()),
             MainThreadMessage::RequestVoteReply(m) => 
                 handle_request_vote_reply(m, &server.info, state)
@@ -405,16 +407,16 @@ pub fn start_server (config: Config) -> ! {
 fn handle_timeout(server: &mut Server) {
     let ref mut state = * server.state.lock().unwrap();
     match state.current_state {
-        State::FOLLOWER | State::CANDIDATE(_) => {
+        State::Follower | State::Candidate(_) => {
             server.start_election(state);
         },
-        State::LEADER => send_append_entries(&mut server.info, state, server.log.clone())
+        State::Leader => send_append_entries(&mut server.info, state, server.log.clone())
     }
 }
 
 fn handle_append_entries_reply(m: AppendEntriesReply, server_info: &mut ServerInfo, state: &mut ServerState) {
     match state.current_state {
-        State::LEADER => {
+        State::Leader => {
             if m.success {
                 server_info.get_peer_mut(m.peer.0).map(|peer| {
                         if m.commit_index > peer.commit_index {
@@ -425,7 +427,7 @@ fn handle_append_entries_reply(m: AppendEntriesReply, server_info: &mut ServerIn
             }
         },
         // TODO: is it ok to drop these?
-        State::CANDIDATE(_) | State::FOLLOWER => ()
+        State::Candidate(_) | State::Follower => ()
     }
 }
 
@@ -455,7 +457,7 @@ fn send_append_entries(info: &mut ServerInfo, state: &mut ServerState, log: Arc<
     for peer in &info.peers {
         // TODO These indices should be checked against |entries|
         let peer_index = peer.commit_index as usize;
-        let peer_entries = &entries[peer_index + 1 ..];
+        let peer_entries = &entries[peer_index ..];
         let last_entry = entries.get(peer_index).unwrap();
         peer.to_peer.send(PeerThreadMessage::AppendEntries(AppendEntriesMessage {
             term: current_term,
@@ -476,14 +478,14 @@ fn handle_request_vote_reply(reply: RequestVoteReply, info: &ServerInfo, state: 
     //let ref mut state = * state.lock().unwrap();
 
     let num_votes = match state.current_state {
-        State::CANDIDATE(ref mut election_info) => {
+        State::Candidate(ref mut election_info) => {
             if reply.term == state.current_term && reply.vote_granted {
                 election_info.num_votes += 1;
             }
             Some(election_info.num_votes)
         },
         // we only care about vote replies if we're a candidate
-        State::LEADER | State::FOLLOWER => None
+        State::Leader | State::Follower => None
     };
     
     if let Some(votes) = num_votes {
@@ -500,7 +502,7 @@ impl Server {
         let me = config.me;
         let log = Arc::new(Mutex::new(MemoryLog::new()));
         let state = Arc::new(Mutex::new(ServerState {
-            current_state: State::FOLLOWER,
+            current_state: State::Follower,
             current_term: 0,
             commit_index: 0,
             voted_for: None,
@@ -529,7 +531,7 @@ impl Server {
 
         // 2. Start peer threads.
         let peers = config.cluster.into_iter()
-            .filter(|&(id, addr)| id != me.0) // filter all computers that aren't me
+            .filter(|&(id, _)| id != me.0) // filter all computers that aren't me
             .map(|(id, addr)| Peer::start((id, addr), tx.clone()))
             .collect::<Vec<PeerHandle>>();
 
@@ -537,7 +539,8 @@ impl Server {
         let info = ServerInfo {
             peers: peers,
             me: me,
-            last_heartbeat: Instant::now()
+            last_heartbeat: Instant::now(),
+            heartbeat_timeout: config.heartbeat_timeout
         };
         
         Ok(Server {
@@ -702,13 +705,15 @@ mod tests {
                 ServerState, ServerInfo, generate_election_timeout, send_append_entries};
     use super::log::{Entry, MemoryLog};
     use std::time::{Duration, Instant};
-    use std::sync::mpsc::{channel, Sender, Receiver};
-    use std::sync::{Arc, Mutex, MutexGuard};
+    use std::sync::mpsc::{channel, Receiver};
+    use std::sync::{Arc, Mutex};
+
+    const DEFAULT_HEARTBEAT_TIMEOUT_MS: u64 = 150;
 
     fn mock_server() -> (Receiver<PeerThreadMessage>, Server) {
         let log = Arc::new(Mutex::new(MemoryLog::new()));
         let state = Arc::new(Mutex::new(ServerState {
-            current_state: State::FOLLOWER,
+            current_state: State::Follower,
             current_term: 0,
             commit_index: 0,
             voted_for: None,
@@ -725,7 +730,8 @@ mod tests {
             info: ServerInfo {
                 peers: peers,
                 me: (0, SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 8080)),
-                last_heartbeat: Instant::now()
+                last_heartbeat: Instant::now(),
+                heartbeat_timeout: Duration::from_millis(DEFAULT_HEARTBEAT_TIMEOUT_MS)
             }
         };
         (rx, server)
@@ -735,7 +741,7 @@ mod tests {
     /// from main thread.
     #[test]
     fn test_server_send_append_entries() {
-        let (mut rx, mut s) = mock_server();
+        let (rx, mut s) = mock_server();
         let vec = vec![Entry::random(); 3];
         { // Append some random entries to log
           let mut log = s.log.lock().unwrap();
@@ -743,7 +749,8 @@ mod tests {
         }
 
         // Send append entries to peers!
-        send_append_entries(&mut s.info, s.state.clone(), s.log.clone());
+        let ref mut state = s.state.lock().unwrap();
+        send_append_entries(&mut s.info, state, s.log.clone());
         println!("{:?}", vec);
 
         // Each peer should receive a message...
@@ -754,7 +761,7 @@ mod tests {
                     assert_eq!(entry.entries, vec);
                 },
                 // Aaand we should never get this one:
-                PeerThreadMessage::RequestVote(vote) => panic!()
+                PeerThreadMessage::RequestVote(_) => panic!()
             }
         }
     }
