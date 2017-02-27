@@ -7,7 +7,7 @@ use rpc::{RpcError};
 use rpc::client::Rpc;
 use rpc::server::{RpcObject, RpcServer};
 use std::cmp;
-use std::net::{SocketAddr};
+use std::net::SocketAddr;
 use std::time::{Duration, Instant};
 use std::thread;
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -70,15 +70,15 @@ enum RpcType {
 struct AppendEntriesMessage {
     term: u64,
     leader_id: u64,
-    prev_log_index: u64,
+    prev_log_index: usize,
     prev_log_term: u64,
     entries: Vec<Entry>,
-    leader_commit: u64,
+    leader_commit: usize,
 }
 
 struct AppendEntriesReply {
     term: u64,
-    commit_index: u64,
+    commit_index: usize,
     peer: (u64, SocketAddr),
     success: bool,
 }
@@ -87,7 +87,7 @@ struct AppendEntriesReply {
 struct RequestVoteMessage {
     term: u64,
     candidate_id: u64,
-    last_log_index: u64,
+    last_log_index: usize,
     last_log_term: u64,
 }
 
@@ -114,7 +114,7 @@ enum MainThreadMessage {
 pub struct PeerHandle {
     id: u64,
     to_peer: Sender<PeerThreadMessage>,
-    commit_index: u64,
+    commit_index: usize,
 }
 
 pub struct Peer {
@@ -166,7 +166,7 @@ impl Peer {
             let mut params = rpc.get_param_builder().init_as::<request_vote::Builder>();
             params.set_term(vote.term);
             params.set_candidate_id(vote.candidate_id);
-            params.set_last_log_index(vote.last_log_index);
+            params.set_last_log_index(vote.last_log_index as u64);
             params.set_last_log_term(vote.last_log_term);
         }
         let vote_granted = rpc.send(self.addr)
@@ -208,7 +208,7 @@ struct ServerState {
     // TODO: state and term must be persisted to disk
     current_state: State,
     current_term: u64,
-    commit_index: u64,
+    commit_index: usize,
     last_leader_contact: Instant,
     voted_for: Option<u64>,
     election_timeout: Duration
@@ -225,7 +225,7 @@ impl ServerState {
     /// This should only be called if we're in the follower state or already in the candidate state
     /// Returns a tuple containing the (last_log_term, last_log_index)
     ///
-    fn transition_to_candidate(&mut self, my_id: u64) -> (u64, u64){
+    fn transition_to_candidate(&mut self, my_id: u64) -> (u64, usize){
         debug_assert!(self.current_state == State::FOLLOWER || self.current_state == State::CANDIDATE);
         let last_log_index = self.commit_index;
         let last_log_term = self.current_term;
@@ -324,7 +324,7 @@ pub fn start_server (config: Config) -> ! {
                     MainThreadMessage::AppendEntriesReply(m) => {
                         if m.success {
                             server.get_peer_mut(m.peer.0).map(|peer| {
-                                    if (m.commit_index > peer.commit_index) {
+                                    if m.commit_index > peer.commit_index {
                                         peer.commit_index = m.commit_index;
                                     }
                             });
@@ -415,8 +415,8 @@ impl Server {
         // 3. Construct append entries requests for all peers.
         for peer in &self.peers {
             // TODO These indices should be checked against |entries|
-            let peer_index = peer.commit_index as usize;
-            let peer_entries = &entries[peer_index + 1 ..];
+            let peer_index = peer.commit_index;
+            let peer_entries = &entries[peer_index..];
             let last_entry = entries.get(peer_index).unwrap();
             peer.to_peer.send(PeerThreadMessage::AppendEntries(AppendEntriesMessage {
                 term: current_term,
@@ -443,7 +443,7 @@ impl Server {
     ///
     fn update_commit_index(&mut self) {
         // Find median of all peer commit indices.
-        let mut indices: Vec<u64> = self.peers.iter().map(|ref peer| peer.commit_index.clone())
+        let mut indices: Vec<usize> = self.peers.iter().map(|ref peer| peer.commit_index.clone())
                                                      .collect();
         indices.sort();
         let new_index = *indices.get( (indices.len() - 1) / 2 ).unwrap();
@@ -489,7 +489,7 @@ impl Server {
                 term: state.current_term,
                 candidate_id: self.me.0,
                 last_log_index: last_log_index,
-                last_log_term: last_log_term
+                last_log_term: last_log_term,
             };
 
             for peer in &self.peers {
@@ -539,7 +539,7 @@ impl RpcObject for RequestVoteHandler {
             params.get_as::<request_vote::Reader>()
             .map_err(RpcError::Capnp)
             .map(|params| {
-                (params.get_candidate_id(), params.get_term(), params.get_last_log_index(),
+                (params.get_candidate_id(), params.get_term(), params.get_last_log_index() as usize,
                  params.get_last_log_term())
             }));
         let mut vote_granted = false;
@@ -595,6 +595,7 @@ impl RpcObject for AppendEntriesHandler {
         };
         params.get_as::<append_entries::Reader>().map(|append_entries| {
            let mut success = false;
+           let prev_log_index = append_entries.get_prev_log_index() as usize;
            // TODO: If this is a valid rpc from the leader, update last_leader_contact
            // TODO: If we're in the CANDIDATE state and this leader's term is
            //       >= our current term
@@ -606,15 +607,15 @@ impl RpcObject for AppendEntriesHandler {
            // Update last leader contact timestamp.
            { self.state.lock().unwrap().last_leader_contact = Instant::now() }
            // If term matches we're good to go... update state!
-           if append_entries.get_prev_log_index() == commit_index {
+           if prev_log_index == commit_index {
                // Deserialize entries from RPC.
                let entries: Vec<Entry> = append_entries.get_entries().unwrap().iter()
                    .map(|entry_proto| Entry {
-                       index: entry_proto.get_index(),
+                       index: entry_proto.get_index() as usize,
                        term: entry_proto.get_term(),
                        data: entry_proto.get_data().unwrap().to_vec(),
                    }).collect();
-               let entries_len = entries.len() as u64;
+               let entries_len = entries.len();
                { // Append entries to log.
                    let mut log = self.log.lock().unwrap();
                    log.append_entries(entries);
@@ -631,6 +632,7 @@ impl RpcObject for AppendEntriesHandler {
        .map_err(RpcError::Capnp)
     }
 }
+
 ///
 /// Returns a new random election timeout.
 /// The election timeout should be reset whenever we transition into the follower state or the
@@ -641,4 +643,68 @@ fn generate_election_timeout() -> Duration {
     let mut range = rand::thread_rng();
     Duration::from_millis(btwn.ind_sample(&mut range))
 }
+
+#[cfg(test)]
+mod tests {
+    use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+    use super::{PeerThreadMessage, PeerHandle, Server, State,
+                ServerState, generate_election_timeout};
+    use super::log::{Entry, MemoryLog};
+    use std::time::{Duration, Instant};
+    use std::sync::mpsc::{channel, Sender, Receiver};
+    use std::sync::{Arc, Mutex, MutexGuard};
+
+    fn mock_server() -> (Receiver<PeerThreadMessage>, Server) {
+        let log = Arc::new(Mutex::new(MemoryLog::new()));
+        let state = Arc::new(Mutex::new(ServerState {
+            current_state: State::FOLLOWER,
+            current_term: 0,
+            commit_index: 0,
+            voted_for: None,
+            last_leader_contact: Instant::now(),
+            election_timeout: generate_election_timeout()
+        }));
+        let (tx, rx) = channel();
+        let peers = vec![0, 1, 2, 3].into_iter()
+            .map(|n| PeerHandle {id:n, to_peer: tx.clone(), commit_index:0})
+            .collect::<Vec<PeerHandle>>();
+        let server = Server {
+            state: state,
+            log: log,
+            peers: peers,
+            me: (0, SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 8080)),
+            last_heartbeat: Instant::now(),
+        };
+        (rx, server)
+    }
+
+    /// Makes sure all peers get correct AppendEntries messages
+    /// from main thread.
+    #[test]
+    fn test_server_send_append_entries() {
+        let (mut rx, mut s) = mock_server();
+        let vec = vec![Entry::random(); 3];
+        { // Append some random entries to log
+          let mut log = s.log.lock().unwrap();
+          log.append_entries(vec.clone());
+        }
+
+        // Send append entries to peers!
+        s.send_append_entries();
+        println!("{:?}", vec);
+
+        // Each peer should receive a message...
+        for i in 0..s.peers.len() {
+            match rx.recv().unwrap() {
+                PeerThreadMessage::AppendEntries(entry) => {
+                    assert_eq!(entry.entries.len(), vec.len());
+                    assert_eq!(entry.entries, vec);
+                },
+                // Aaand we should never get this one:
+                PeerThreadMessage::RequestVote(vote) => panic!()
+            }
+        }
+    }
+}
+
 
