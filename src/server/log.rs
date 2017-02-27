@@ -1,4 +1,3 @@
-use rand::{thread_rng, Rng};
 use std::fmt;
 
 ///
@@ -21,22 +20,6 @@ impl fmt::Debug for Entry {
 impl PartialEq for Entry {
     fn eq(&self, other: &Entry) -> bool {
         self.term == other.term && self.data == other.data
-    }
-}
-
-impl Entry {
-    ///
-    /// Creates a dummy Entry (for testing!) with random data.
-    /// TODO (sydli): Could I have Entry implement like a random trait or something?
-    ///
-    pub fn random () -> Entry {
-        let mut vec = vec![0; 8];
-        thread_rng().fill_bytes(&mut vec);
-        Entry {
-            index: 0, // TODO (sydli) this should not be 0
-            term: 0,  // Unneeded, for testing, for now.
-            data: vec,
-        }
     }
 }
 
@@ -148,7 +131,7 @@ impl Log for MemoryLog {
     }
 
     fn roll_back(&mut self, index: usize) -> &Log {
-        let destroyed_logs: Vec<_> = self.entries.drain(index + 1..).collect();
+        self.entries.drain(index + 1..).collect::<Vec<_>>();
         self
     }
 
@@ -171,6 +154,16 @@ mod tests {
         let mut log = create_log();
         log.append_entries( vec![Entry::random(); length] );
         log
+    }
+
+    fn random_entry() {
+        let mut vec = vec![0; 8];
+        thread_rng().fill_bytes(&mut vec);
+        Entry {
+            index: 0, // TODO (sydli) this should not be 0
+            term: 0,  // Unneeded, for testing, for now.
+            data: vec,
+        }
     }
 
     #[test]
