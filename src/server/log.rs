@@ -13,11 +13,13 @@ pub struct Entry {
 }
 
 #[cfg(test)]
-fn random_entry_with_metadata(term: u64, index: usize) -> Entry {
+fn random_entry_with_term(term: u64) -> Entry {
+  assert_ne!(term, 0);
+
   let mut vec = vec![0; 8];
   thread_rng().fill_bytes(&mut vec);
   Entry {
-      index: index,
+      index: 0,
       term: term,
       data: vec,
   }
@@ -25,7 +27,7 @@ fn random_entry_with_metadata(term: u64, index: usize) -> Entry {
 
 #[cfg(test)]
 pub fn random_entry() -> Entry {
-    random_entry_with_metadata(0, 0)
+    random_entry_with_term(1)
 }
 
 
@@ -52,7 +54,7 @@ pub trait Log: Sync + Send {
     /// Retrieves read-only reference to an Entry in the log, specified by |index|.
     /// Will panic if supplied an index exceeds the log length.
     ///
-    fn get_entry(&self, index: usize) -> &Entry;
+    fn get_entry(&self, index: usize) -> Option<&Entry>;
 
     /// 
     /// Retrieves read-only reference to a slice of all Entries in the log past |start_index|.
@@ -106,26 +108,34 @@ pub trait Log: Sync + Send {
 ///
 pub struct MemoryLog {
     entries: Vec<Entry>,
+    start_index: usize
 }
 
 impl MemoryLog {
     pub fn new() -> MemoryLog {
-        MemoryLog { entries: Vec::new() }
+        // start index is always 1, but will be dynamic after we implement snapshotting
+        MemoryLog { entries: Vec::new(), start_index: 1}
     }
 }
 
 impl Log for MemoryLog {
-    fn get_entry(&self, index: usize) -> &Entry {
-        self.entries.get(index).unwrap()
+    fn get_entry(&self, index: usize) -> Option<&Entry> {
+        if index < self.start_index {
+            return None;
+        }
+
+        self.entries.get(index - self.start_index)
     }
 
+    // TODO(jason)
     fn get_entries_from(&self, start_index: usize) -> &[Entry] {
         &self.entries[start_index .. self.entries.len()]
     }
 
     fn append_entries(&mut self, entries: Vec<Entry>) -> &Log {
-        let mut start_index = self.entries.len();
+        let mut start_index = self.entries.len() + self.start_index;
         let indexed_entries = entries.into_iter().map(|mut entry| {
+            debug_assert!(entry.term > 0); // can't commit in term 0
             entry.index = start_index;
             start_index += 1;
             entry
@@ -135,25 +145,42 @@ impl Log for MemoryLog {
     }
 
     fn append_entry(&mut self, mut entry: Entry) -> &Log {
-        entry.index = self.entries.len();
+        debug_assert!(entry.term > 0); // can't commit in term 0
+        entry.index = self.entries.len() + self.start_index;
         self.entries.push(entry);
         self
     }
 
     fn get_last_entry_index(&self) -> usize {
-        self.entries.len() - 1 as usize
+        self.entries.len() - (self.start_index - 1)
     }
 
     fn get_last_entry_term(&self) -> u64 {
-        self.get_entry(self.get_last_entry_index()).term
+        if self.entries.len() == 0 {
+            return 0;
+        }
+
+        self.get_entry(self.get_last_entry_index())
+            .map_or(0, |e| e.term)
     }
 
+    ///
+    /// Deletes all entries > index from the log
+    ///
+    /// #Panics
+    /// Panics if you try to roll back entries that are < start_index
+    /// because you should never try to roll back snapshotted entries
+    ///
     fn roll_back(&mut self, index: usize) -> &Log {
-        self.entries.drain(index + 1..).collect::<Vec<_>>();
+        let start_index = index - self.start_index + 1;
+        if start_index >= self.entries.len() {
+            return self; // nothing to remove
+        }
+
+        self.entries.drain(start_index ..).collect::<Vec<_>>();
         self
     }
 
-    // TODO(jason): Add unit tests
     fn is_other_log_valid (&self, other_log_index: usize, other_log_term: u64) -> bool {
         let last_log_term = self.get_last_entry_term();
         other_log_term > last_log_term ||
@@ -166,7 +193,7 @@ impl Log for MemoryLog {
 /// type returned by the |create_log()| helper.
 #[cfg(test)]
 mod tests {
-    use super::{Log, MemoryLog, random_entry, random_entry_with_metadata};
+    use super::{Log, MemoryLog, random_entry, random_entry_with_term};
     fn create_log() -> MemoryLog { MemoryLog::new() } // Replace with other log types as needed
 
     fn create_filled_log(length: usize) -> MemoryLog {
@@ -176,12 +203,19 @@ mod tests {
     }
 
     #[test]
-    #[should_panic]
-    /// Makes sure we panic if an incorrect index is supplied to the log.
+    /// Makes sure we return None if the index is out of the log
     fn test_log_get_entry_out_of_index() {
         let mut log = create_log();
         log.append_entry(random_entry());
-        log.get_entry(1); // should panic
+        assert!(log.get_entry(2).is_none());
+    }
+
+    #[test]
+    fn test_log_0_is_none() {
+        let mut log = create_log();
+        assert!(log.get_entry(0).is_none());
+        log.append_entry(random_entry());
+        assert!(log.get_entry(0).is_none());
     }
 
     #[test]
@@ -196,8 +230,8 @@ mod tests {
         log.append_entry(entry2.clone());
 
         // Data should be the same
-        assert_eq!(entry1.data, log.get_entry(0).data);
-        assert_eq!(entry2.data, log.get_entry(1).data);
+        assert_eq!(entry1.data, log.get_entry(1).unwrap().data);
+        assert_eq!(entry2.data, log.get_entry(2).unwrap().data);
     }
 
     #[test]
@@ -206,8 +240,8 @@ mod tests {
         let length = 10;
         let log = create_filled_log(length);
         // Make sure the indices are correctly set
-        for i in 0..length {
-            assert_eq!(log.get_entry(i).index, i);
+        for i in 1..length + 1 {
+            assert_eq!(log.get_entry(i).unwrap().index, i);
         }
     }
 
@@ -223,26 +257,38 @@ mod tests {
     }
 
     #[test]
+    fn log_roll_back_works_with_nothing_to_roll_back() {
+        let mut log = create_log();
+        log.roll_back(1);
+    }
+
+    #[test]
     fn is_other_log_valid_rejects_previous_terms() {
         let mut log = create_log();
-        log.append_entry(random_entry_with_metadata(0, 0));
-        log.append_entry(random_entry_with_metadata(1, 1));
-        assert!(!log.is_other_log_valid(2, 0));
+        log.append_entry(random_entry_with_term(1));
+        log.append_entry(random_entry_with_term(2));
+        assert!(!log.is_other_log_valid(3, 1));
     }
 
     #[test]
     fn is_other_log_valid_rejects_lower_indices() {
         let mut log = create_log();
-        log.append_entry(random_entry_with_metadata(0, 0));
-        log.append_entry(random_entry_with_metadata(1, 1));
-        log.append_entry(random_entry_with_metadata(2, 1));
-        assert!(!log.is_other_log_valid(1, 1));
+        log.append_entry(random_entry_with_term(1));
+        log.append_entry(random_entry_with_term(1));
+        log.append_entry(random_entry_with_term(2));
+        assert!(!log.is_other_log_valid(1, 2));
     }
 
     #[test]
     fn is_other_log_valid_accepts_same_index() {
         let mut log = create_log();
-        log.append_entry(random_entry_with_metadata(0, 0));
+        log.append_entry(random_entry_with_term(1));
+        assert!(log.is_other_log_valid(1, 1));
+    }
+
+    #[test]
+    fn is_other_log_valid_accepts_with_empty_log() {
+        let mut log = create_log();
         assert!(log.is_other_log_valid(0, 0));
     }
 
