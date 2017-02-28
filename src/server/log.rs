@@ -1,6 +1,5 @@
 use std::fmt;
 use raft_capnp::entry;
-use rand::{Rng, thread_rng};
 
 ///
 /// Abstraction for a single Entry for our log.
@@ -20,6 +19,8 @@ pub enum Op {
     Unknown,
 }
 
+#[cfg(test)]
+use rand::{thread_rng, Rng};
 #[cfg(test)]
 fn random_entry_with_term(term: u64) -> Entry {
   assert_ne!(term, 0);
@@ -115,13 +116,13 @@ impl PartialEq for Entry {
 pub trait Log: Sync + Send {
     /// 
     /// Retrieves read-only reference to an Entry in the log, specified by |index|.
-    /// Will panic if supplied an index exceeds the log length.
+    /// Returns None if the index is out of bounds
     ///
     fn get_entry(&self, index: usize) -> Option<&Entry>;
 
     /// 
     /// Retrieves read-only reference to a slice of all Entries in the log past |start_index|.
-    /// Will panic if supplied an index exceeds the log length.
+    /// Slice does not include |start_index|
     ///
     fn get_entries_from(&self, start_index: usize) -> &[Entry];
 
@@ -151,8 +152,11 @@ pub trait Log: Sync + Send {
 
     ///
     /// Rolls back log so that the most recent entry is located at |index|.
-    /// Panics if |index| is an invalid log index.
     /// Returns this log object.
+    ///
+    /// #Panics
+    /// Panics if you try to roll back entries that are < start_index
+    /// because you should never try to roll back snapshotted entries
     ///
     fn roll_back(&mut self, index: usize) -> &Log;
 
@@ -190,9 +194,19 @@ impl Log for MemoryLog {
         self.entries.get(index - self.start_index)
     }
 
-    // TODO(jason)
-    fn get_entries_from(&self, start_index: usize) -> &[Entry] {
-        &self.entries[start_index .. self.entries.len()]
+    fn get_entries_from(&self, mut start_index: usize) -> &[Entry] {
+        if start_index < self.start_index {
+            // We should return a slice containing the full memory log
+            // TODO: Will we want snapshotted entries?
+            start_index = self.start_index - 1;
+        }
+
+        start_index -= self.start_index - 1;
+        if start_index > self.entries.len() {
+            return &[];
+        }
+
+        &self.entries[start_index ..]
     }
 
     fn append_entries(&mut self, entries: Vec<Entry>) -> &Log {
@@ -227,13 +241,6 @@ impl Log for MemoryLog {
             .map_or(0, |e| e.term)
     }
 
-    ///
-    /// Deletes all entries > index from the log
-    ///
-    /// #Panics
-    /// Panics if you try to roll back entries that are < start_index
-    /// because you should never try to roll back snapshotted entries
-    ///
     fn roll_back(&mut self, index: usize) -> &Log {
         let start_index = index - self.start_index + 1;
         if start_index >= self.entries.len() {
@@ -267,14 +274,14 @@ mod tests {
 
     #[test]
     /// Makes sure we return None if the index is out of the log
-    fn test_log_get_entry_out_of_index() {
+    fn get_entry_out_of_index() {
         let mut log = create_log();
         log.append_entry(random_entry());
         assert!(log.get_entry(2).is_none());
     }
 
     #[test]
-    fn test_log_0_is_none() {
+    fn index_0_is_none() {
         let mut log = create_log();
         assert!(log.get_entry(0).is_none());
         log.append_entry(random_entry());
@@ -283,7 +290,7 @@ mod tests {
 
     #[test]
     /// Tests that simple append and get works for a two-element array.
-    fn test_log_append_get_simple() {
+    fn append_get_simple() {
         let mut log = create_log();
         let entry1 = random_entry();
         let entry2 = random_entry();
@@ -299,7 +306,7 @@ mod tests {
 
     #[test]
     /// Tests that indices stay valid after appending entries.
-    fn test_log_append_indices_simple() {
+    fn append_indices_simple() {
         let length = 10;
         let log = create_filled_log(length);
         // Make sure the indices are correctly set
@@ -308,9 +315,47 @@ mod tests {
         }
     }
 
+
+    #[test]
+    /// Tests that get_entries can return a slice 
+    /// containing the second half of the log
+    fn get_entries_from_simple() {
+        let length = 10;
+        let log = create_filled_log(length);
+        assert_eq!(log.get_last_entry_index(), length);
+
+        let mut curr_index = 6;
+        let entries = log.get_entries_from(curr_index - 1);
+        assert_eq!(entries.len(), length - (curr_index - 1));
+
+        for entry in entries {
+            assert_eq!(entry.index, curr_index);
+            curr_index += 1;
+        }
+    }
+
+    #[test]
+    fn get_entries_from_out_of_bounds() {
+        let log = create_log();
+        assert_eq!(log.get_entries_from(0).len(), 0);
+        assert_eq!(log.get_entries_from(1).len(), 0);
+        
+        let length = 10;
+        let filled_log = create_filled_log(length);
+        assert_eq!(filled_log.get_entries_from(10).len(), 0);
+        assert_eq!(filled_log.get_entries_from(11).len(), 0);
+    }
+
+    #[test]
+    fn get_entries_from_full() {
+        let length = 100;
+        let log = create_filled_log(length);
+        assert_eq!(log.get_entries_from(0).len(), length);
+    }
+
     #[test]
     /// Tests that indices stay valid after appending entries.
-    fn test_log_roll_back_simple() {
+    fn roll_back_simple() {
         let length = 10;
         let mut log = create_filled_log(length);
         let new_length = 5;
@@ -320,7 +365,7 @@ mod tests {
     }
 
     #[test]
-    fn log_roll_back_works_with_nothing_to_roll_back() {
+    fn roll_back_works_with_nothing_to_roll_back() {
         let mut log = create_log();
         log.roll_back(1);
     }
