@@ -114,12 +114,13 @@ struct PeerHandle {
 }
 
 struct Peer {
+    id: u64,
     addr: SocketAddr,
     to_main: Sender<MainThreadMessage>,
     from_main: Receiver<PeerThreadMessage>
 }
 
-impl Peer {
+impl Peer{
     ///
     /// Spawns a new Peer in a background thread to communicate with the server at id.
     ///
@@ -132,6 +133,7 @@ impl Peer {
         
         thread::spawn(move || {
             let peer = Peer {
+                id: id.0,
                 addr: id.1,
                 to_main: to_main,
                 from_main: from_main
@@ -146,12 +148,50 @@ impl Peer {
         }
     }
 
+    ///
+    /// Sends the appropriate append entries RPC to this peer.
+    ///
+    /// # Panics
+    /// Panics if proto fails to initialize.
+    ///
     fn send_append_entries (&mut self, entry: AppendEntriesMessage) {
-        // TODO (syd)
-        // 1. Construct an empty append_entries rpc
-        // 2. Copy in entries from |ro_log| if peer commit index is behind.
-        unimplemented!();
-    }
+        let mut rpc = Rpc::new(APPEND_ENTRIES_OPCODE);
+        {
+            let mut params = rpc.get_param_builder().init_as::<append_entries::Builder>();
+            params.set_term(entry.term);
+            params.set_leader_id(entry.leader_id);
+            params.set_prev_log_index(entry.prev_log_index as u64);
+            params.set_prev_log_term(entry.prev_log_term);
+            params.set_leader_commit(entry.leader_commit as u64);
+            params.borrow().init_entries(entry.entries.len() as u32);
+            for i in 0..entry.entries.len() {
+                let mut entry_builder = params.borrow().get_entries().unwrap().get(i as u32);
+                let ref entry = entry.entries[i];
+                entry_builder.set_term(entry.term);
+                entry_builder.set_index(entry.index as u64);
+                entry_builder.set_data(&entry.data);
+            }
+        }
+        let (term, success) = rpc.send(self.addr).and_then(|msg| {
+            Rpc::get_result_reader(&msg).and_then(|result| {
+                result.get_as::<append_entries_reply::Reader>()
+                      .map_err(RpcError::Capnp)
+                })
+                .map(|reply_reader| {
+                    let term = reply_reader.get_term();
+                    let success = reply_reader.get_success();
+                    (term, term == entry.term && success)
+                })
+        }).unwrap_or((entry.term, false));
+        let new_commit_index = entry.prev_log_index + entry.entries.len();
+        let reply = AppendEntriesReply {
+            term: term,
+            commit_index: if success { new_commit_index } else { entry.prev_log_index },
+            peer: (self.id, self.addr),
+            success: success,
+        };
+        self.to_main.send(MainThreadMessage::AppendEntriesReply(reply)).unwrap();
+}
 
     ///
     /// Requests a vote in the new term from this peer.
@@ -248,7 +288,9 @@ impl ServerState {
     fn transition_to_leader(&mut self) {
         debug_assert!(matches!(self.current_state, State::Candidate(_)));
         self.current_state = State::Leader;
-        // TODO: We need to initialize all the next indices in the peer threads
+        // TODO (sydli):
+        // 1. Send empty append entries (to reset commit_index)
+        // We need to initialize all the next indices in the peer threads
         // They should be set to the our next index (which is the highest index in our log + 1)
     }
 
@@ -398,10 +440,17 @@ fn handle_timeout(server: &mut Server) {
     }
 }
 
+///
+/// If we're leader, handle replies from peers who respond to AppendEntries.
+/// If we hear about a term greater than ours, step down.
+/// If we're Candidate or Follower, we drop the message.
+/// 
 fn handle_append_entries_reply(m: AppendEntriesReply, server_info: &mut ServerInfo, state: &mut ServerState) {
     match state.current_state {
         State::Leader => {
-            if m.success {
+            if m.term > state.current_term {
+                state.transition_to_follower(m.term);
+            } else if m.success {
                 server_info.get_peer_mut(m.peer.0).map(|peer| {
                         if m.commit_index > peer.commit_index {
                             peer.commit_index = m.commit_index;
@@ -410,7 +459,6 @@ fn handle_append_entries_reply(m: AppendEntriesReply, server_info: &mut ServerIn
                 update_commit_index(server_info, state);
             }
         },
-        // TODO: is it ok to drop these?
         State::Candidate(_) | State::Follower => ()
     }
 }
