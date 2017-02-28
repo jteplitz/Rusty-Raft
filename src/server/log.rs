@@ -12,15 +12,20 @@ pub struct Entry {
                         // apply to the client state machine.
 }
 
-#[allow(dead_code)]
-pub fn random_entry() -> Entry {
+#[cfg(test)]
+fn random_entry_with_metadata(term: u64, index: usize) -> Entry {
   let mut vec = vec![0; 8];
   thread_rng().fill_bytes(&mut vec);
   Entry {
-      index: 0,
-      term: 0,  // Unneeded, for testing, for now.
+      index: index,
+      term: term,
       data: vec,
   }
+}
+
+#[cfg(test)]
+pub fn random_entry() -> Entry {
+    random_entry_with_metadata(0, 0)
 }
 
 
@@ -161,7 +166,7 @@ impl Log for MemoryLog {
 /// type returned by the |create_log()| helper.
 #[cfg(test)]
 mod tests {
-    use super::{Log, MemoryLog, random_entry};
+    use super::{Log, MemoryLog, random_entry, random_entry_with_metadata};
     fn create_log() -> MemoryLog { MemoryLog::new() } // Replace with other log types as needed
 
     fn create_filled_log(length: usize) -> MemoryLog {
@@ -215,6 +220,30 @@ mod tests {
         log.roll_back(new_length);
         // make sure log has been rolled back!
         assert_eq!(log.get_last_entry_index(), new_length);
+    }
+
+    #[test]
+    fn is_other_log_valid_rejects_previous_terms() {
+        let mut log = create_log();
+        log.append_entry(random_entry_with_metadata(0, 0));
+        log.append_entry(random_entry_with_metadata(1, 1));
+        assert!(!log.is_other_log_valid(2, 0));
+    }
+
+    #[test]
+    fn is_other_log_valid_rejects_lower_indices() {
+        let mut log = create_log();
+        log.append_entry(random_entry_with_metadata(0, 0));
+        log.append_entry(random_entry_with_metadata(1, 1));
+        log.append_entry(random_entry_with_metadata(2, 1));
+        assert!(!log.is_other_log_valid(1, 1));
+    }
+
+    #[test]
+    fn is_other_log_valid_accepts_same_index() {
+        let mut log = create_log();
+        log.append_entry(random_entry_with_metadata(0, 0));
+        assert!(log.is_other_log_valid(0, 0));
     }
 
     #[test]
