@@ -3,7 +3,14 @@
 struct Entry {
   term          @0   :UInt64;
   index         @1   :UInt64;
-  data          @2   :Data;
+  op            @2   :Op;
+  data          @3   :Data;
+  enum Op {
+    write @0;
+    read @1;
+    noop @2;
+    unknown @3;
+  }
 }
 
 struct AppendEntries {

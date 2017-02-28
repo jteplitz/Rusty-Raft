@@ -120,7 +120,7 @@ struct Peer {
     from_main: Receiver<PeerThreadMessage>
 }
 
-impl Peer{
+impl Peer {
     ///
     /// Spawns a new Peer in a background thread to communicate with the server at id.
     ///
@@ -166,10 +166,7 @@ impl Peer{
             params.borrow().init_entries(entry.entries.len() as u32);
             for i in 0..entry.entries.len() {
                 let mut entry_builder = params.borrow().get_entries().unwrap().get(i as u32);
-                let ref entry = entry.entries[i];
-                entry_builder.set_term(entry.term);
-                entry_builder.set_index(entry.index as u64);
-                entry_builder.set_data(&entry.data);
+                entry.entries[i].into_proto(&mut entry_builder);
             }
         }
         let (term, success) = rpc.send(self.addr).and_then(|msg| {
@@ -696,11 +693,7 @@ impl RpcObject for AppendEntriesHandler {
            if prev_log_index == commit_index {
                // Deserialize entries from RPC.
                let entries: Vec<Entry> = append_entries.get_entries().unwrap().iter()
-                   .map(|entry_proto| Entry {
-                       index: entry_proto.get_index() as usize,
-                       term: entry_proto.get_term(),
-                       data: entry_proto.get_data().unwrap().to_vec(),
-                   }).collect();
+                   .map(Entry::from_proto).collect();
                let entries_len = entries.len();
                { // Append entries to log.
                    let mut log = self.log.lock().unwrap();
@@ -785,7 +778,7 @@ mod tests {
         send_append_entries(&mut s.info, state, s.log.clone());
 
         // Each peer should receive a message...
-        for i in 0..s.info.peers.len() {
+        for _ in 0..s.info.peers.len() {
             match rx.recv().unwrap() {
                 PeerThreadMessage::AppendEntries(entry) => {
                     assert_eq!(entry.entries.len(), vec.len());

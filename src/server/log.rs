@@ -1,4 +1,5 @@
 use std::fmt;
+use raft_capnp::entry;
 use rand::{Rng, thread_rng};
 
 ///
@@ -6,10 +7,17 @@ use rand::{Rng, thread_rng};
 ///
 #[derive(Clone)]
 pub struct Entry {
-    pub index: usize,   // index of this Entry in the log
-    pub term: u64,      // term for which this Entry is committed
-    pub data: Vec<u8>,  // data blob containing client-defined command to
-                        // apply to the client state machine.
+    pub index: usize,  // index of this Entry in the log
+    pub term: u64,     // term for which this Entry is committed
+    pub op: Op,        // operation represented by this Entry
+}
+
+#[derive(Clone)]
+pub enum Op {
+    Write (Vec<u8>),
+    Read  (Vec<u8>),
+    Noop,
+    Unknown,
 }
 
 #[cfg(test)]
@@ -21,7 +29,7 @@ fn random_entry_with_term(term: u64) -> Entry {
   Entry {
       index: 0,
       term: term,
-      data: vec,
+      op: Op::Write(vec),
   }
 }
 
@@ -30,16 +38,71 @@ pub fn random_entry() -> Entry {
     random_entry_with_term(1)
 }
 
+impl Entry {
+    ///
+    /// Deserializes an Entry from its protobuf representation.
+    ///
+    /// # Panics
+    /// Panics if deserialization fails.
+    ///
+    pub fn from_proto(entry_proto: entry::Reader) -> Entry {
+        let op = match entry_proto.get_op().unwrap() {
+            entry::Op::Write => Op::Write(entry_proto.get_data().unwrap().to_vec()),
+            entry::Op::Read => Op::Read(entry_proto.get_data().unwrap().to_vec()),
+            entry::Op::Noop => Op::Noop,
+            entry::Op::Unknown => Op::Unknown,
+        };
+        Entry {
+            index: entry_proto.get_index() as usize,
+            term: entry_proto.get_term(),
+            op: op,
+        }
+    }
+
+    ///
+    /// Retrieves the appropriate proto "Op" enum for this entry's |op|.
+    ///
+    fn get_proto_op(&self) -> entry::Op {
+        match self.op {
+            Op::Write(_) => entry::Op::Write,
+            Op::Read(_) => entry::Op::Read,
+            Op::Noop => entry::Op::Noop,
+            Op::Unknown => entry::Op::Unknown,
+        }
+    }
+
+    ///
+    /// Populates the proto |builder| with information from this entry.
+    ///
+    pub fn into_proto(&self, builder: &mut entry::Builder) {
+        builder.set_term(self.term);
+        builder.set_term(self.index as u64);
+        builder.set_data(&self.get_data());
+        builder.set_op(self.get_proto_op());
+    }
+
+    ///
+    /// Retrieves a copy of the data within an Entry, if there is any.
+    ///
+    fn get_data(&self) -> Vec<u8> {
+        match self.op {
+            Op::Write(ref data) => data.clone(),
+            Op::Read(ref data) => data.clone(),
+            Op::Noop => vec![],
+            Op::Unknown => vec![],
+        }
+    }
+}
 
 impl fmt::Debug for Entry {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        write!(f, "Entry {{ term: {}, data: {:?} }}", self.term, self.data)
+        write!(f, "Entry {{ term: {}, data: {:?} }}", self.term, self.get_data())
     }
 }
 
 impl PartialEq for Entry {
     fn eq(&self, other: &Entry) -> bool {
-        self.term == other.term && self.data == other.data
+        self.term == other.term && self.get_data() == other.get_data()
     }
 }
 
@@ -230,8 +293,8 @@ mod tests {
         log.append_entry(entry2.clone());
 
         // Data should be the same
-        assert_eq!(entry1.data, log.get_entry(1).unwrap().data);
-        assert_eq!(entry2.data, log.get_entry(2).unwrap().data);
+        assert_eq!(entry1.get_data(), log.get_entry(1).unwrap().get_data());
+        assert_eq!(entry2.get_data(), log.get_entry(2).unwrap().get_data());
     }
 
     #[test]
@@ -288,7 +351,7 @@ mod tests {
 
     #[test]
     fn is_other_log_valid_accepts_with_empty_log() {
-        let mut log = create_log();
+        let log = create_log();
         assert!(log.is_other_log_valid(0, 0));
     }
 
