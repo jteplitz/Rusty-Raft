@@ -50,18 +50,18 @@ impl Config {
 }
 
 // States that each machine can be in!
-// TODO: We could clean things up by storing state specific data in each of these?
 #[derive(PartialEq, Clone, Copy)]
 enum State {
-    Candidate (ElectionInfo),
-    Leader,
+    Candidate { num_votes: usize, start_time: Instant },
+    Leader { last_heartbeat: Instant },
     Follower,
 }
 
-#[derive(PartialEq, Clone, Copy)]
-struct ElectionInfo {
-    num_votes: usize,
-    start_time: Instant
+///
+/// Messages for peer background threads to push to associated machines.
+enum PeerThreadMessage {
+    AppendEntries (AppendEntriesMessage),
+    RequestVote (RequestVoteMessage),
 }
 
 //#[derive(Clone)
@@ -83,11 +83,10 @@ struct RequestVoteMessage {
     last_log_term: u64,
 }
 
-enum PeerThreadMessage {
-    AppendEntries (AppendEntriesMessage),
-    RequestVote (RequestVoteMessage),
-}
-
+///
+/// Messages that can be sent to the main thread.
+/// *Reply messages encapsulate replies from peer machines, and
+/// ClientAppendRequest is a message sent by the client thread.
 struct AppendEntriesReply {
     term: u64,
     commit_index: usize,
@@ -100,19 +99,21 @@ struct RequestVoteReply {
     vote_granted: bool,
 }
 
-
 enum MainThreadMessage {
     AppendEntriesReply (AppendEntriesReply),
     RequestVoteReply (RequestVoteReply),
     ClientAppendRequest,
 }
 
+/// Handle for main thread to communicate with Peer.
 struct PeerHandle {
     id: u64,
     to_peer: Sender<PeerThreadMessage>,
     commit_index: usize,
 }
 
+/// A background thread whose job is to communicate and relay messages between
+/// the main thread and the peer at |addr|.
 struct Peer {
     id: u64,
     addr: SocketAddr,
@@ -244,8 +245,8 @@ impl Peer {
     }
 }
 
-// Store's the state that the server is currently in along with the current_term
-// and current_id. These fields should all share a lock.
+/// Store's the state that the server is currently in along with the current_term
+/// and current_id. These fields should all share a lock.
 struct ServerState {
     // TODO: state and term must be persisted to disk
     current_state: State,
@@ -268,11 +269,8 @@ impl ServerState {
     ///
     fn transition_to_candidate(&mut self, my_id: u64) {
         debug_assert!(self.current_state == State::Follower ||
-                      matches!(self.current_state, State::Candidate(_)));
-        self.current_state = State::Candidate(ElectionInfo {
-            start_time: Instant::now(),
-            num_votes: 1
-        }); // we always start with 1 vote from ourselves
+                      matches!(self.current_state, State::Candidate { .. }));
+        self.current_state = State::Candidate { start_time: Instant::now(), num_votes: 1 }; // we always start with 1 vote from ourselves
         self.current_term += 1;
         self.voted_for = Some(my_id); // vote for ourselves
         self.election_timeout = generate_election_timeout();
@@ -282,18 +280,18 @@ impl ServerState {
     /// Transitions into the leader state from the candidate state.
     ///
     /// TODO: Persist term information to disk?
-    fn transition_to_leader(&mut self) {
-        debug_assert!(matches!(self.current_state, State::Candidate(_)));
-        self.current_state = State::Leader;
-        // TODO (sydli):
-        // 1. Send empty append entries (to reset commit_index)
-        // We need to initialize all the next indices in the peer threads
-        // They should be set to the our next index (which is the highest index in our log + 1)
+    fn transition_to_leader(&mut self, info: &mut ServerInfo, log: Arc<Mutex<Log>>) {
+        debug_assert!(matches!(self.current_state, State::Candidate{ .. }));
+        self.current_state = State::Leader { last_heartbeat: Instant::now() };
+        { // Scope the log lock so we drop it immediately afterwards.
+            log.lock().unwrap().append_entry(Entry::noop(self.current_term));
+        }
+        send_append_entries(info, self, log.clone());
     }
 
     fn transition_to_follower(&mut self, new_term: u64) {
-        debug_assert!(matches!(self.current_state, State::Candidate(_)) ||
-                      self.current_state == State::Leader);
+        debug_assert!(matches!(self.current_state, State::Candidate{ .. }) ||
+                      matches!(self.current_state, State::Leader{ .. }));
         self.current_term = new_term;
         self.current_state = State::Follower;
         self.voted_for = None;
@@ -314,8 +312,7 @@ pub struct Server {
 struct ServerInfo {
     peers: Vec<PeerHandle>,
     me: (u64, SocketAddr),
-    last_heartbeat: Instant,
-    heartbeat_timeout: Duration
+    heartbeat_timeout: Duration,
 }
 
 impl ServerInfo {
@@ -328,11 +325,12 @@ impl ServerInfo {
     }
 }
 
-
+///
+/// Updates the server's commit index to the median of our peers' indices.
+///
 fn update_commit_index(server_info: &ServerInfo, state: &mut ServerState) {
     // Find median of all peer commit indices.
-    let mut indices: Vec<usize> = server_info.peers.iter().map(|ref peer| peer.commit_index.clone())
-                                                 .collect();
+    let mut indices: Vec<usize> = server_info.peers.iter().map(|ref peer| peer.commit_index.clone()).collect();
     indices.sort();
     let new_index = *indices.get( (indices.len() - 1) / 2 ).unwrap();
     // Set new commit index if it's higher!
@@ -360,12 +358,12 @@ pub fn start_server (config: Config) -> ! {
             let mut state = server.state.lock().unwrap();
 
             match state.current_state {
-                State::Follower=> {
+                State::Follower => {
                     let now = Instant::now();
                     current_timeout = state.election_timeout - now.duration_since(state.last_leader_contact)
                 }
-                State::Candidate(election_info) => {
-                    let time_since_election = Instant::now() - election_info.start_time;
+                State::Candidate{start_time, ..} => {
+                    let time_since_election = Instant::now() - start_time;
 
                     // TODO: Replace explicit underflow checks with checked_sub once rust 1.16
                     // is out. Scheduled for March 16th 2017
@@ -377,11 +375,11 @@ pub fn start_server (config: Config) -> ! {
                         current_timeout = state.election_timeout - time_since_election;
                     }
                 },
-                State::Leader => {
+                State::Leader{last_heartbeat} => {
                     let heartbeat_timeout = server.info.heartbeat_timeout;
                     // TODO: Should last_heartbeat be in the leader state?
                     let since_last_heartbeat = Instant::now()
-                                                   .duration_since(server.info.last_heartbeat);
+                                                   .duration_since(last_heartbeat);
                     // TODO: Replace explicit underflow checks with checked_sub once rust 1.16
                     // is out. Scheduled for March 16th 2017
                     if since_last_heartbeat > heartbeat_timeout {
@@ -413,7 +411,7 @@ pub fn start_server (config: Config) -> ! {
                 // TODO: Rpc handler needs to already append message to log
                 send_append_entries(&mut server.info, state, server.log.clone()),
             MainThreadMessage::RequestVoteReply(m) => 
-                handle_request_vote_reply(m, &server.info, state)
+                handle_request_vote_reply(m, &mut server.info, state, server.log.clone())
         };
     } // end loop
 }
@@ -430,10 +428,10 @@ pub fn start_server (config: Config) -> ! {
 fn handle_timeout(server: &mut Server) {
     let ref mut state = * server.state.lock().unwrap();
     match state.current_state {
-        State::Follower | State::Candidate(_) => {
+        State::Follower | State::Candidate{ .. } => {
             server.start_election(state);
         },
-        State::Leader => send_append_entries(&mut server.info, state, server.log.clone())
+        State::Leader{ .. } => send_append_entries(&mut server.info, state, server.log.clone())
     }
 }
 
@@ -444,7 +442,7 @@ fn handle_timeout(server: &mut Server) {
 /// 
 fn handle_append_entries_reply(m: AppendEntriesReply, server_info: &mut ServerInfo, state: &mut ServerState) {
     match state.current_state {
-        State::Leader => {
+        State::Leader{ .. } => {
             if m.term > state.current_term {
                 state.transition_to_follower(m.term);
             } else if m.success {
@@ -456,7 +454,7 @@ fn handle_append_entries_reply(m: AppendEntriesReply, server_info: &mut ServerIn
                 update_commit_index(server_info, state);
             }
         },
-        State::Candidate(_) | State::Follower => ()
+        State::Candidate{ .. } | State::Follower => ()
     }
 }
 
@@ -470,11 +468,10 @@ fn send_append_entries(info: &mut ServerInfo, state: &mut ServerState, log: Arc<
     
     // 1. Retrieve relevant state info (locked).
     let (commit_index, current_term) = { 
-        let state = state; // move state into scope, so it gets dropped after we get the info
+        // let state = state; // move state into scope, so it gets dropped after we get the info
         (state.commit_index,    // = commit_index
             state.current_term) // = current_term
     };
-
     // 2. Retrieve all relevant entries from log (locked).
     let min_peer_index = info.peers.iter().fold(commit_index,
                              |acc, ref peer| cmp::min(acc, peer.commit_index));
@@ -497,37 +494,33 @@ fn send_append_entries(info: &mut ServerInfo, state: &mut ServerState, log: Arc<
             leader_commit: commit_index,
         })).unwrap(); // TODO actually do something prodcutive on error
     }
-    info.last_heartbeat = Instant::now();
+    state.current_state = State::Leader { last_heartbeat: Instant::now() };
 }
 
 ///
 /// Handles replies to RequestVote Rpc
 ///
-fn handle_request_vote_reply(reply: RequestVoteReply, info: &ServerInfo, state: &mut ServerState) {
-    //let ref mut state = * state.lock().unwrap();
-
-    let num_votes = match state.current_state {
-        State::Candidate(ref mut election_info) => {
-            if reply.term == state.current_term && reply.vote_granted {
-                election_info.num_votes += 1;
-            }
-            Some(election_info.num_votes)
-        },
-        // we only care about vote replies if we're a candidate
-        State::Leader | State::Follower => None
-    };
-    
-    if let Some(votes) = num_votes {
-        if votes > info.peers.len() / 2 {
+fn handle_request_vote_reply(reply: RequestVoteReply, info: &mut ServerInfo,
+                             state: &mut ServerState, log: Arc<Mutex<Log>>) {
+    // Since we can't have two mutable borrows on |state| at once we gotta
+    // update votes & do the transition check in separate scopes.
+    if reply.term == state.current_term && reply.vote_granted {
+        if let State::Candidate{ref mut num_votes, ..} = state.current_state {
+            *num_votes += 1;
+        }
+    }
+    if let State::Candidate{num_votes, ..} = state.current_state {
+        if num_votes > info.peers.len() / 2 {
             // Woo! We won the election
-            state.transition_to_leader();
+            state.transition_to_leader(info, log);
         }
     }
 }
 
 
 impl Server {
-    fn new (config: Config, tx: Sender<MainThreadMessage>) -> Result<Server, IoError> {
+    fn new (config: Config, tx: Sender<MainThreadMessage>)
+        -> Result<Server, IoError> {
         let me = config.me;
         let log = Arc::new(Mutex::new(MemoryLog::new()));
         let state = Arc::new(Mutex::new(ServerState {
@@ -568,7 +561,6 @@ impl Server {
         let info = ServerInfo {
             peers: peers,
             me: me,
-            last_heartbeat: Instant::now(),
             heartbeat_timeout: config.heartbeat_timeout
         };
         
@@ -755,15 +747,14 @@ mod tests {
             info: ServerInfo {
                 peers: peers,
                 me: (0, SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 8080)),
-                last_heartbeat: Instant::now(),
                 heartbeat_timeout: Duration::from_millis(DEFAULT_HEARTBEAT_TIMEOUT_MS)
             }
         };
         (rx, server)
     }
 
-    /// Makes sure all peers get correct AppendEntries messages
-    /// from main thread.
+    /// Makes sure peer threads receive appendEntries msesages
+    /// when the log is appended to.
     #[test]
     fn test_server_send_append_entries() {
         let (rx, mut s) = mock_server();
@@ -784,8 +775,26 @@ mod tests {
                     assert_eq!(entry.entries.len(), vec.len());
                     assert_eq!(entry.entries, vec);
                 },
-                // Aaand we should never get this one:
                 PeerThreadMessage::RequestVote(_) => panic!()
+            }
+        }
+    }
+
+    /// Makes sure peer threads receive requestVote messages
+    /// when an election is started.
+    #[test]
+    fn test_server_start_election() {
+        let (rx, s) = mock_server();
+        let mut state = s.state.lock().unwrap();
+        s.start_election(&mut state);
+        // Each peer should have received a RequestVote message.
+        for _ in 0..s.info.peers.len() {
+            match rx.recv().unwrap() {
+                PeerThreadMessage::AppendEntries(_) => panic!(),
+                PeerThreadMessage::RequestVote(vote) => {
+                    assert_eq!(vote.term, state.current_term);
+                    assert_eq!(vote.candidate_id, s.info.me.0);
+                },
             }
         }
     }

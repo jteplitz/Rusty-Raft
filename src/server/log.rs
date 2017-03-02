@@ -41,6 +41,17 @@ pub fn random_entry() -> Entry {
 
 impl Entry {
     ///
+    /// Creates an empty entry for the specified term.
+    ///
+    pub fn noop(term: u64) -> Entry {
+        Entry {
+            index: 0,
+            term: term,
+            op: Op::Noop,
+        }
+    }
+
+    ///
     /// Deserializes an Entry from its protobuf representation.
     ///
     /// # Panics
