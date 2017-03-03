@@ -6,7 +6,6 @@ use raft_capnp::{append_entries, append_entries_reply,
 use rpc::{RpcError};
 use rpc::client::Rpc;
 use rpc::server::{RpcObject, RpcServer};
-use std::cmp;
 use std::net::SocketAddr;
 use std::time::{Duration, Instant};
 use std::thread;
@@ -42,7 +41,6 @@ impl Config {
             heartbeat_timeout: heartbeat_timeout,
         }
     }
-
     // TODO eventually implement
     // pub fn fromFile (file: String) -> Config {
     //     
@@ -109,7 +107,28 @@ enum MainThreadMessage {
 struct PeerHandle {
     id: u64,
     to_peer: Sender<PeerThreadMessage>,
-    commit_index: usize,
+    next_index: usize,
+}
+
+impl PeerHandle {
+    /// Pushes a non-blocking append-entries request to this peer.
+    /// Panics if associated peer background thread is somehow down.
+    fn append_entries_nonblocking (&self, leader_id: u64, commit_index: usize,
+                                   current_term: u64, log: Arc<Mutex<Log>>) {
+        let entries = {
+            log.lock().unwrap().get_entries_from(self.next_index).to_vec()
+        };
+        let peer_index = self.next_index;
+        let last_entry = entries.get(peer_index).unwrap();
+        self.to_peer.send(PeerThreadMessage::AppendEntries(AppendEntriesMessage {
+            term: current_term,
+            leader_id: leader_id,
+            prev_log_index: peer_index,
+            prev_log_term: last_entry.term,
+            entries: entries.to_vec(),
+            leader_commit: commit_index,
+        })).unwrap(); // This failing means the peer background thread is down.
+    }
 }
 
 /// A background thread whose job is to communicate and relay messages between
@@ -145,7 +164,7 @@ impl Peer {
         PeerHandle {
             id: id.0,
             to_peer: to_peer,
-            commit_index: commit_index,
+            next_index: commit_index,
         }
     }
 
@@ -155,7 +174,7 @@ impl Peer {
     /// # Panics
     /// Panics if proto fails to initialize.
     ///
-    fn send_append_entries (&mut self, entry: AppendEntriesMessage) {
+    fn append_entries_blocking (&mut self, entry: AppendEntriesMessage) {
         let mut rpc = Rpc::new(APPEND_ENTRIES_OPCODE);
         {
             let mut params = rpc.get_param_builder().init_as::<append_entries::Builder>();
@@ -238,7 +257,7 @@ impl Peer {
     fn main (mut self) {
         loop {
             match self.from_main.recv().unwrap() {
-                PeerThreadMessage::AppendEntries(entry) => self.send_append_entries(entry),
+                PeerThreadMessage::AppendEntries(entry) => self.append_entries_blocking(entry),
                 PeerThreadMessage::RequestVote(vote) => self.send_request_vote(vote)
             }
         }
@@ -283,10 +302,14 @@ impl ServerState {
     fn transition_to_leader(&mut self, info: &mut ServerInfo, log: Arc<Mutex<Log>>) {
         debug_assert!(matches!(self.current_state, State::Candidate{ .. }));
         self.current_state = State::Leader { last_heartbeat: Instant::now() };
+        // Append dummy entry.
         { // Scope the log lock so we drop it immediately afterwards.
             log.lock().unwrap().append_entry(Entry::noop(self.current_term));
         }
-        send_append_entries(info, self, log.clone());
+        for peer in &mut info.peers {
+            peer.next_index = self.commit_index;
+        }
+        broadcast_append_entries(info, self, log.clone());
     }
 
     fn transition_to_follower(&mut self, new_term: u64) {
@@ -330,7 +353,7 @@ impl ServerInfo {
 ///
 fn update_commit_index(server_info: &ServerInfo, state: &mut ServerState) {
     // Find median of all peer commit indices.
-    let mut indices: Vec<usize> = server_info.peers.iter().map(|ref peer| peer.commit_index.clone()).collect();
+    let mut indices: Vec<usize> = server_info.peers.iter().map(|ref peer| peer.next_index.clone()).collect();
     indices.sort();
     let new_index = *indices.get( (indices.len() - 1) / 2 ).unwrap();
     // Set new commit index if it's higher!
@@ -385,7 +408,7 @@ pub fn start_server (config: Config) -> ! {
                     if since_last_heartbeat > heartbeat_timeout {
                         // We timed out in between recieving a message and blocking on the message
                         // pipe. Send a heartbeat,
-                        send_append_entries(&mut server.info, &mut state, server.log.clone());
+                        broadcast_append_entries(&mut server.info, &mut state, server.log.clone());
                         current_timeout = heartbeat_timeout;
                     } else {
                         current_timeout = heartbeat_timeout - since_last_heartbeat;
@@ -406,10 +429,10 @@ pub fn start_server (config: Config) -> ! {
         let ref mut state = * server.state.lock().unwrap();
         match message {
             MainThreadMessage::AppendEntriesReply(m) => 
-                handle_append_entries_reply(m, &mut server.info, state),
+                handle_append_entries_reply(m, &mut server.info, state, server.log.clone()),
             MainThreadMessage::ClientAppendRequest => 
                 // TODO: Rpc handler needs to already append message to log
-                send_append_entries(&mut server.info, state, server.log.clone()),
+                broadcast_append_entries(&mut server.info, state, server.log.clone()),
             MainThreadMessage::RequestVoteReply(m) => 
                 handle_request_vote_reply(m, &mut server.info, state, server.log.clone())
         };
@@ -431,7 +454,7 @@ fn handle_timeout(server: &mut Server) {
         State::Follower | State::Candidate{ .. } => {
             server.start_election(state);
         },
-        State::Leader{ .. } => send_append_entries(&mut server.info, state, server.log.clone())
+        State::Leader{ .. } => broadcast_append_entries(&mut server.info, state, server.log.clone())
     }
 }
 
@@ -440,18 +463,28 @@ fn handle_timeout(server: &mut Server) {
 /// If we hear about a term greater than ours, step down.
 /// If we're Candidate or Follower, we drop the message.
 /// 
-fn handle_append_entries_reply(m: AppendEntriesReply, server_info: &mut ServerInfo, state: &mut ServerState) {
+fn handle_append_entries_reply(m: AppendEntriesReply, server_info: &mut ServerInfo, state: &mut ServerState, log: Arc<Mutex<Log>>) {
     match state.current_state {
         State::Leader{ .. } => {
             if m.term > state.current_term {
                 state.transition_to_follower(m.term);
             } else if m.success {
+                // On success, advance peer's index.
                 server_info.get_peer_mut(m.peer.0).map(|peer| {
-                        if m.commit_index > peer.commit_index {
-                            peer.commit_index = m.commit_index;
-                        }
+                    if m.commit_index > peer.next_index {
+                        peer.next_index = m.commit_index + 1;
+                    }
                 });
                 update_commit_index(server_info, state);
+            } else {
+                let leader_id = server_info.me.0;
+                // If we failed, roll back peer index by 1 and retry
+                // the append entries call.
+                server_info.get_peer_mut(m.peer.0).map(|peer| {
+                    peer.next_index = peer.next_index - 1;
+                    peer.append_entries_nonblocking(leader_id, state.commit_index,
+                                                    state.current_term, log);
+                });
             }
         },
         State::Candidate{ .. } | State::Follower => ()
@@ -463,36 +496,12 @@ fn handle_append_entries_reply(m: AppendEntriesReply, server_info: &mut ServerIn
 /// This function is non-blocking; it simply forwards AppendEntries messages
 /// to all known peers.
 ///
-fn send_append_entries(info: &mut ServerInfo, state: &mut ServerState, log: Arc<Mutex<Log>>) {
-    // TODO This needs to return an Error or something if we're not the leader
-    
-    // 1. Retrieve relevant state info (locked).
-    let (commit_index, current_term) = { 
-        // let state = state; // move state into scope, so it gets dropped after we get the info
-        (state.commit_index,    // = commit_index
-            state.current_term) // = current_term
-    };
-    // 2. Retrieve all relevant entries from log (locked).
-    let min_peer_index = info.peers.iter().fold(commit_index,
-                             |acc, ref peer| cmp::min(acc, peer.commit_index));
-    let entries = {
-        let log = log.lock().unwrap();
-        log.get_entries_from(min_peer_index).to_vec()
-    };
-    // 3. Construct append entries requests for all peers.
+fn broadcast_append_entries(info: &mut ServerInfo, state: &mut ServerState, log: Arc<Mutex<Log>>) {
+    debug_assert!(matches!(state.current_state, State::Leader{ .. }));
     for peer in &info.peers {
-        // TODO These indices should be checked against |entries|
-        let peer_index = peer.commit_index as usize;
-        let peer_entries = &entries[peer_index ..];
-        let last_entry = entries.get(peer_index).unwrap();
-        peer.to_peer.send(PeerThreadMessage::AppendEntries(AppendEntriesMessage {
-            term: current_term,
-            leader_id: info.me.0,
-            prev_log_index: peer.commit_index,
-            prev_log_term: last_entry.term,
-            entries: peer_entries.to_vec(),
-            leader_commit: commit_index,
-        })).unwrap(); // TODO actually do something prodcutive on error
+        // Perf: each call copies the needed |entries| from |log| to send along to the peer.
+        peer.append_entries_nonblocking(info.me.0, state.commit_index,
+                                        state.current_term, log.clone());
     }
     state.current_state = State::Leader { last_heartbeat: Instant::now() };
 }
@@ -719,7 +728,7 @@ fn generate_election_timeout() -> Duration {
 mod tests {
     use std::net::{IpAddr, Ipv4Addr, SocketAddr};
     use super::{PeerThreadMessage, PeerHandle, Server, State,
-                ServerState, ServerInfo, generate_election_timeout, send_append_entries};
+                ServerState, ServerInfo, generate_election_timeout, broadcast_append_entries};
     use super::log::{MemoryLog, random_entry};
     use std::time::{Duration, Instant};
     use std::sync::mpsc::{channel, Receiver};
@@ -739,7 +748,7 @@ mod tests {
         }));
         let (tx, rx) = channel();
         let peers = vec![0, 1, 2, 3].into_iter()
-            .map(|n| PeerHandle {id:n, to_peer: tx.clone(), commit_index:0})
+            .map(|n| PeerHandle {id:n, to_peer: tx.clone(), next_index:0})
             .collect::<Vec<PeerHandle>>();
         let server = Server {
             state: state,
@@ -766,7 +775,8 @@ mod tests {
 
         // Send append entries to peers!
         let ref mut state = s.state.lock().unwrap();
-        send_append_entries(&mut s.info, state, s.log.clone());
+        state.current_state = State::Leader { last_heartbeat: Instant::now() };
+        broadcast_append_entries(&mut s.info, state, s.log.clone());
 
         // Each peer should receive a message...
         for _ in 0..s.info.peers.len() {
@@ -799,5 +809,3 @@ mod tests {
         }
     }
 }
-
-
