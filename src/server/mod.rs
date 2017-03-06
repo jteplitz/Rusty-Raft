@@ -65,7 +65,6 @@ enum PeerThreadMessage {
 }
 
 //#[derive(Clone)
-#[allow(dead_code)] // TODO(sydli): Remove once we're using the message
 struct AppendEntriesMessage {
     term: u64,
     leader_id: u64,
@@ -374,7 +373,7 @@ impl ServerInfo {
 ///
 /// Updates the server's commit index to the median of our peers' indices.
 ///
-// TODO: Test
+// TODO(sydli): Test
 fn update_commit_index(server_info: &ServerInfo, state: &mut ServerState) {
     // Find median of all peer commit indices.
     let mut indices: Vec<usize> = server_info.peers.iter().map(|ref peer| peer.next_index.clone()).collect();
@@ -488,7 +487,7 @@ fn handle_timeout(server: &mut Server) {
 /// If we hear about a term greater than ours, step down.
 /// If we're Candidate or Follower, we drop the message.
 /// 
-// TODO: Test
+// TODO(sydli): Test
 fn handle_append_entries_reply(m: AppendEntriesReply, server_info: &mut ServerInfo, state: &mut ServerState, log: Arc<Mutex<Log>>) {
     match state.current_state {
         State::Leader{ .. } => {
@@ -535,7 +534,7 @@ fn broadcast_append_entries(info: &mut ServerInfo, state: &mut ServerState, log:
 ///
 /// Handles replies to RequestVote Rpc
 ///
-// TODO: Test
+// TODO(jason): Test
 fn handle_request_vote_reply(reply: RequestVoteReply, info: &mut ServerInfo,
                              state: &mut ServerState, log: Arc<Mutex<Log>>) {
     // Since we can't have two mutable borrows on |state| at once we gotta
@@ -618,7 +617,6 @@ impl Server {
     /// # Panics
     /// Panics if any other thread has panicked while holding the log lock
     ///
-    // TODO(jason): Test
     fn start_election(&self, state: &mut ServerState) -> Duration {
         // transition to the candidate state
         state.transition_to_candidate(self.info.me.0);
@@ -835,6 +833,7 @@ mod tests {
         let (rx, s) = mock_server();
         let mut state = s.state.lock().unwrap();
         s.start_election(&mut state);
+        assert!(matches!(state.current_state, State::Candidate{ .. }));
         // Each peer should have received a RequestVote message.
         for _ in 0..s.info.peers.len() {
             match rx.recv().unwrap() {
