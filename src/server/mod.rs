@@ -1,20 +1,22 @@
 mod log;
+mod state_machine;
 use capnp;
 use rand;
 use capnp::serialize::OwnedSegments;
 use capnp::message::Reader;
 use raft_capnp::{append_entries, append_entries_reply,
-                 request_vote, request_vote_reply};
+                 request_vote, request_vote_reply,
+                 client_request, client_request_reply};
 use rpc::{RpcError};
 use rpc::client::Rpc;
 use rpc::server::{RpcObject, RpcServer};
 use std::net::SocketAddr;
 use std::time::{Duration, Instant};
 use std::thread;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Condvar};
 use std::sync::mpsc::{channel, Sender, Receiver};
 
-use self::log::{Log, MemoryLog, Entry};
+use self::log::{Log, MemoryLog, Entry, Op};
 use std::io::Error as IoError;
 use rand::distributions::{IndependentSample, Range};
 use std::collections::HashMap;
@@ -25,6 +27,16 @@ const ELECTION_TIMEOUT_MIN: u64 = 150; // min election timeout wait value in m.s
 const ELECTION_TIMEOUT_MAX: u64 = 300; // min election timeout wait value in m.s.
 const APPEND_ENTRIES_OPCODE: i16 = 0;
 const REQUEST_VOTE_OPCODE: i16 = 1;
+const CLIENT_REQUEST_OPCODE: i16 = 2;
+
+///
+/// State machine trait for clients to implement.
+///
+pub trait StateMachine: Sync + Send {
+    fn write(&self, command: &[u8]) -> bool;
+    fn read(&self, query: &[u8]) -> Vec<u8>;
+    fn flush(&self, filename: String) -> bool;
+}
 
 pub struct Config {
     // Each server has a unique 64bit integer id that and a socket address
@@ -64,7 +76,6 @@ enum PeerThreadMessage {
     RequestVote (RequestVoteMessage),
 }
 
-//#[derive(Clone)
 struct AppendEntriesMessage {
     term: u64,
     leader_id: u64,
@@ -102,6 +113,54 @@ enum MainThreadMessage {
     AppendEntriesReply (AppendEntriesReply),
     RequestVoteReply (RequestVoteReply),
     ClientAppendRequest,
+}
+
+///
+/// Types of messages to be sent to the state machine thread.
+///
+enum StateMachineMessage {
+    Command,
+    Query { buffer: Vec<u8>, response_channel: Sender<Vec<u8>> },
+}
+
+///
+/// Starts thread responsible for performing operations on state machine.
+/// Loops waiting on a channel for operations to perform.
+///
+/// |Command| messages first advances an internal index pointer, then performs
+/// StateMachine::write on the log entry's command buffer at that index if it
+/// is a Write operation. This index is initialized at |start_index|.
+///
+/// |Query| messages perform StateMachine::read on the |query_buffer|, and
+/// sends the result over |response_channel|.
+///
+/// Returns a Sender handle to this thread.
+///
+fn state_machine_thread (log: Arc<Mutex<Log>>,
+                         start_index: usize,
+                         state_machine: Box<StateMachine>,
+                         ) -> Sender<StateMachineMessage> {
+    let(to_state_machine, from_main) = channel();
+    thread::spawn(move || {
+        let mut append_index = start_index;
+        loop {
+            match from_main.recv().unwrap() {
+                StateMachineMessage::Command => {
+                    append_index = append_index + 1;
+                    let result = { log.lock().unwrap().get_entry(append_index).cloned() };
+                    if let Some(entry) = result {
+                        if let Op::Write(data) = entry.op {
+                            state_machine.write(&data);
+                        }
+                    }
+                },
+                StateMachineMessage::Query { buffer, response_channel } => {
+                    response_channel.send(state_machine.read(&buffer)).unwrap();
+                },
+            }
+        }
+    });
+    to_state_machine
 }
 
 /// Handle for main thread to communicate with Peer.
@@ -285,6 +344,7 @@ impl Peer {
 
 /// Store's the state that the server is currently in along with the current_term
 /// and current_id. These fields should all share a lock.
+#[derive(Clone, Copy)]
 struct ServerState {
     // TODO: state and term must be persisted to disk
     current_state: State,
@@ -354,13 +414,14 @@ impl ServerState {
 // NB: State lock should never be acquired while holding the log lock
 pub struct Server {
     // TODO: Rename properties?
-    state: Arc<Mutex<ServerState>>,
+    state: Arc<(Mutex<ServerState>, Condvar)>,
     log: Arc<Mutex<Log>>,
-    info: ServerInfo
+    info: ServerInfo,
 }
 
 struct ServerInfo {
     peers: Vec<PeerHandle>,
+    to_state_machine: Sender<StateMachineMessage>,
     me: (u64, SocketAddr),
     heartbeat_timeout: Duration,
 }
@@ -386,6 +447,7 @@ fn update_commit_index(server_info: &ServerInfo, state: &mut ServerState) {
     let new_index = *indices.get( (indices.len() - 1) / 2 ).unwrap();
     // Set new commit index if it's higher!
     if state.commit_index >= new_index { return; }
+    server_info.to_state_machine.send(StateMachineMessage::Command).unwrap();
     state.commit_index = new_index;
 }
 
@@ -395,9 +457,9 @@ fn update_commit_index(server_info: &ServerInfo, state: &mut ServerState) {
 /// As of right now this function does not return. It just runs the state machine as long as it's
 /// in a live thread.
 ///
-pub fn start_server (config: Config) -> ! {
+pub fn start_server (config: Config, load_state_machine: &(Fn() -> Box<StateMachine>)) -> ! {
     let (tx, rx) = channel();
-    let mut server = Server::new(config, tx).unwrap();
+    let mut server = Server::new(config, tx, load_state_machine()).unwrap();
 
     // NB: This thread handles all state changes EXCEPT for those that move us back into the
     // follower state from either the candidate or leader state. Those are both handled in the
@@ -407,7 +469,8 @@ pub fn start_server (config: Config) -> ! {
         let current_timeout;
         { // state lock scope
             // TODO(jason): Decompose and test
-            let mut state = server.state.lock().unwrap();
+            let &(ref state_ref, ref cvar) = &*server.state;
+            let mut state = state_ref.lock().unwrap();
 
             match state.current_state {
                 State::Follower => {
@@ -422,7 +485,7 @@ pub fn start_server (config: Config) -> ! {
                     if time_since_election > state.election_timeout {
                         // We timed out in between recieving a message and blocking on the message
                         // pipe. Start a new election
-                        current_timeout = server.start_election(&mut state);
+                        current_timeout = server.start_election(&mut state, cvar);
                     } else {
                         current_timeout = state.election_timeout - time_since_election;
                     }
@@ -455,15 +518,15 @@ pub fn start_server (config: Config) -> ! {
         };
 
         // Acquire state lock
-        let ref mut state = * server.state.lock().unwrap();
+        let &(ref state_ref, ref cvar) = &*server.state;
+        let ref mut state = * state_ref.lock().unwrap();
         match message {
             MainThreadMessage::AppendEntriesReply(m) => 
-                handle_append_entries_reply(m, &mut server.info, state, server.log.clone()),
-            MainThreadMessage::ClientAppendRequest => 
-                // TODO: Rpc handler needs to already append message to log
+                handle_append_entries_reply(m, &mut server.info, state, cvar, server.log.clone()),
+            MainThreadMessage::ClientAppendRequest  => 
                 broadcast_append_entries(&mut server.info, state, server.log.clone()),
             MainThreadMessage::RequestVoteReply(m) => 
-                handle_request_vote_reply(m, &mut server.info, state, server.log.clone())
+                handle_request_vote_reply(m, &mut server.info, state, cvar, server.log.clone())
         };
     } // end loop
 }
@@ -478,10 +541,12 @@ pub fn start_server (config: Config) -> ! {
 /// Panics if any of the peer threads have panicked.
 ///
 fn handle_timeout(server: &mut Server) {
-    let ref mut state = * server.state.lock().unwrap();
+    let (ref state_ref, ref cvar) = *server.state;
+    let ref mut state = * state_ref.lock().unwrap();
+
     match state.current_state {
         State::Follower | State::Candidate{ .. } => {
-            server.start_election(state);
+            server.start_election(state, cvar);
         },
         State::Leader{ .. } => broadcast_append_entries(&mut server.info, state, server.log.clone())
     }
@@ -493,11 +558,12 @@ fn handle_timeout(server: &mut Server) {
 /// If we're Candidate or Follower, we drop the message.
 /// 
 // TODO(sydli): Test
-fn handle_append_entries_reply(m: AppendEntriesReply, server_info: &mut ServerInfo, state: &mut ServerState, log: Arc<Mutex<Log>>) {
+fn handle_append_entries_reply(m: AppendEntriesReply, server_info: &mut ServerInfo, state: &mut ServerState, state_condition: &Condvar, log: Arc<Mutex<Log>>) {
     match state.current_state {
         State::Leader{ .. } => {
             if m.term > state.current_term {
                 state.transition_to_follower(m.term);
+                state_condition.notify_all();
             } else if m.success {
                 // On success, advance peer's index.
                 server_info.get_peer_mut(m.peer.0).map(|peer| {
@@ -506,6 +572,7 @@ fn handle_append_entries_reply(m: AppendEntriesReply, server_info: &mut ServerIn
                     }
                 });
                 update_commit_index(server_info, state);
+                state_condition.notify_all();
             } else {
                 let leader_id = server_info.me.0;
                 // If we failed, roll back peer index by 1 and retry
@@ -541,7 +608,8 @@ fn broadcast_append_entries(info: &mut ServerInfo, state: &mut ServerState, log:
 ///
 // TODO(jason): Test
 fn handle_request_vote_reply(reply: RequestVoteReply, info: &mut ServerInfo,
-                             state: &mut ServerState, log: Arc<Mutex<Log>>) {
+                             state: &mut ServerState, state_condition: &Condvar,
+                             log: Arc<Mutex<Log>>) {
     // Since we can't have two mutable borrows on |state| at once we gotta
     // update votes & do the transition check in separate scopes.
     if reply.term == state.current_term && reply.vote_granted {
@@ -553,24 +621,28 @@ fn handle_request_vote_reply(reply: RequestVoteReply, info: &mut ServerInfo,
         if num_votes > info.peers.len() / 2 {
             // Woo! We won the election
             state.transition_to_leader(info, log);
+            state_condition.notify_all();
         }
     }
 }
 
 
 impl Server {
-    fn new (config: Config, tx: Sender<MainThreadMessage>)
+    fn new (config: Config, tx: Sender<MainThreadMessage>, state_machine: Box<StateMachine>)
         -> Result<Server, IoError> {
         let me = config.me;
         let log = Arc::new(Mutex::new(MemoryLog::new()));
-        let state = Arc::new(Mutex::new(ServerState {
+        let state = Arc::new((Mutex::new(ServerState {
             current_state: State::Follower,
             current_term: 0,
             commit_index: 0,
             voted_for: None,
             last_leader_contact: Instant::now(),
-            election_timeout: generate_election_timeout()
-        }));
+            election_timeout: generate_election_timeout(),
+        }), Condvar::new()));
+
+        // 1a. Start state machine thread.
+        let to_state_machine = state_machine_thread(log.clone(), 0, state_machine);
 
         // 1. Start RPC request handlers
         let append_entries_handler: Box<RpcObject> = Box::new(
@@ -579,9 +651,16 @@ impl Server {
         let request_vote_handler: Box<RpcObject> = Box::new(
             RequestVoteHandler {state: state.clone(), log: log.clone()}
         );
+        let client_request_handler: Box<RpcObject> = Box::new(
+            ClientRequestHandler {state: state.clone(), log: log.clone(),
+                                  to_main: Arc::new(Mutex::new(tx.clone())),
+                                  to_state_machine: Arc::new(Mutex::new(
+                                          to_state_machine.clone()))}
+        );
         let services = vec![
             (APPEND_ENTRIES_OPCODE, append_entries_handler),
-            (REQUEST_VOTE_OPCODE, request_vote_handler)
+            (REQUEST_VOTE_OPCODE, request_vote_handler),
+            (CLIENT_REQUEST_OPCODE, client_request_handler)
         ];
         let mut server = RpcServer::new_with_services(services);
         try!(
@@ -601,13 +680,14 @@ impl Server {
         let info = ServerInfo {
             peers: peers,
             me: me,
-            heartbeat_timeout: config.heartbeat_timeout
+            heartbeat_timeout: config.heartbeat_timeout,
+            to_state_machine: to_state_machine,
         };
         
         Ok(Server {
             state: state,
             log: log,
-            info: info
+            info: info,
         })
     }
 
@@ -622,7 +702,7 @@ impl Server {
     /// # Panics
     /// Panics if any other thread has panicked while holding the log lock
     ///
-    fn start_election(&self, state: &mut ServerState) -> Duration {
+    fn start_election(&self, state: &mut ServerState, state_condition: &Condvar) -> Duration {
         // transition to the candidate state
         state.transition_to_candidate(self.info.me.0);
 
@@ -643,13 +723,13 @@ impl Server {
             peer.to_peer.send(PeerThreadMessage::RequestVote(request_vote_message))
                 .unwrap(); // panic if the peer thread is down
         }
-
+        state_condition.notify_all();
         state.election_timeout
     }
 }
 
 struct RequestVoteHandler {
-    state: Arc<Mutex<ServerState>>,
+    state: Arc<(Mutex<ServerState>, Condvar)>,
     log: Arc<Mutex<MemoryLog>>
 }
 
@@ -668,12 +748,14 @@ impl RpcObject for RequestVoteHandler {
         let mut vote_granted = false;
         let current_term;
         {
-            let mut state = self.state.lock().unwrap(); // panics if mutex is poisoned
+            let &(ref state_ref, ref cvar) = &*self.state;
+            let mut state = state_ref.lock().unwrap(); // panics if mutex is poisoned
             state.last_leader_contact = Instant::now();
 
             if term > state.current_term {
                 // TODO(jason): This should happen on the main thread.
                 state.transition_to_follower(term);
+                cvar.notify_all();
             }
 
             if state.voted_for == None || state.voted_for == Some(candidate_id) {
@@ -683,6 +765,7 @@ impl RpcObject for RequestVoteHandler {
                     state.voted_for = Some(candidate_id);
                     // TODO(jason): This should happen on the main thread.
                     state.transition_to_follower(term);
+                    cvar.notify_all();
                 }
             }
             current_term = state.current_term;
@@ -695,7 +778,7 @@ impl RpcObject for RequestVoteHandler {
 }
 
 struct AppendEntriesHandler {
-    state: Arc<Mutex<ServerState>>,
+    state: Arc<(Mutex<ServerState>, Condvar)>,
     log: Arc<Mutex<Log>>
 }
 
@@ -707,7 +790,7 @@ impl RpcObject for AppendEntriesHandler {
     {
         // Let's read some state first :D
         let (commit_index, term) = { 
-            let state = self.state.lock().unwrap();
+            let state = self.state.0.lock().unwrap();
             (state.commit_index, state.current_term)
         };
         params.get_as::<append_entries::Reader>().map(|append_entries| {
@@ -722,7 +805,7 @@ impl RpcObject for AppendEntriesHandler {
                return; /* TODO @Jason Wat do?? */
            }
            // Update last leader contact timestamp.
-           { self.state.lock().unwrap().last_leader_contact = Instant::now() }
+           { self.state.0.lock().unwrap().last_leader_contact = Instant::now() }
            // If term matches we're good to go... update state!
            if prev_log_index == commit_index {
                // Deserialize entries from RPC.
@@ -734,7 +817,7 @@ impl RpcObject for AppendEntriesHandler {
                    log.append_entries(entries);
                }
                { // March forward our commit index.
-                   self.state.lock().unwrap().commit_index += entries_len;
+                   self.state.0.lock().unwrap().commit_index += entries_len;
                }
                success = true;
            }
@@ -757,6 +840,103 @@ fn generate_election_timeout() -> Duration {
     Duration::from_millis(btwn.ind_sample(&mut range))
 }
 
+
+///
+/// Client read. Blocks until most recent write is properly committed to the log,
+/// then returns result from client state machine query.
+///
+fn client_read_blocking (query: &[u8],
+                         to_state_machine: Arc<Mutex<Sender<StateMachineMessage>>>
+                         ) -> Option<Vec<u8>> {
+    let (to_me, from_sm) = channel();
+    to_state_machine.lock().unwrap().send(
+        StateMachineMessage::Query {
+            buffer: query.to_vec(),
+            response_channel: to_me,
+        }).unwrap();
+    return from_sm.recv().ok();
+}
+
+///
+/// Wait for commit index to reach |index| or stop when term has changed.
+/// Returns true if commit succeeds in this |term|; false if term has changed.
+///
+fn wait_for_commit(term: u64, index: usize, state: Arc<(Mutex<ServerState>, Condvar)>)
+    -> bool {
+    let &(ref state_ref, ref cvar) = &*state;
+    let mut state = state_ref.lock().unwrap();
+    while state.commit_index < index && state.current_term == term {
+        state = cvar.wait(state).unwrap();
+    }
+    state.commit_index >= index && state.current_term == term
+}
+
+///
+/// Client write. Blocks until client write is properly committed to the log.
+/// Returns true if client write succeeds; false if term changes and the write failed.
+///
+fn client_write_blocking (log: Arc<Mutex<Log>>,
+                          state: Arc<(Mutex<ServerState>, Condvar)>,
+                          command: &[u8],
+                          to_main: Arc<Mutex<Sender<MainThreadMessage>>>) -> bool {
+    // TODO (sydli): it may not be 100% safe to drop the state lock here.
+    let (current_state, current_term) = {
+        let state = state.0.lock().unwrap();
+        (state.current_state, state.current_term)
+    };
+    if !matches!(current_state, State::Leader { .. }) { return false; }
+    let index = { // Scope the log lock so we drop it immediately afterwards.
+        let mut log = log.lock().unwrap();
+        log.append_entry(Entry {
+            index: 0,
+            term: current_term,
+            op: Op::Write(command.to_vec()),
+        }).get_last_entry_index()
+    };
+    let unwrapped_to_main = to_main.lock().unwrap();
+    unwrapped_to_main.send(MainThreadMessage::ClientAppendRequest).unwrap();
+
+    // wait for commit index to update or term to change
+    wait_for_commit(current_term, index, state.clone())
+}
+
+struct ClientRequestHandler {
+    state: Arc<(Mutex<ServerState>, Condvar)>,
+    log: Arc<Mutex<Log>>,
+    to_main: Arc<Mutex<Sender<MainThreadMessage>>>,
+    to_state_machine: Arc<Mutex<Sender<StateMachineMessage>>>,
+}
+
+impl RpcObject for ClientRequestHandler {
+    fn handle_rpc (&self, params: capnp::any_pointer::Reader,
+                   result: capnp::any_pointer::Builder) -> Result<(), RpcError> {
+        params.get_as::<client_request::Reader>().map(|client_request| {
+            let op_result = match client_request.get_op().unwrap() {
+                client_request::Op::Write =>  {
+                    if client_write_blocking(self.log.clone(),
+                                             self.state.clone(),
+                                             client_request.get_data().unwrap(),
+                                             self.to_main.clone()) {
+                        Some(vec![]) } else { None }
+                }, 
+                client_request::Op::Read => client_read_blocking(
+                        client_request.get_data().unwrap(),
+                        self.to_state_machine.clone())
+            };
+            let mut reply = result.init_as::<client_request_reply::Builder>();
+            match op_result {
+                Some(data) => {
+                    reply.set_success(true);
+                    reply.set_data(&data);
+                }
+                None => reply.set_success(false),
+
+            }
+        })
+        .map_err(RpcError::Capnp)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use capnp::{message, serialize_packed};
@@ -772,20 +952,20 @@ mod tests {
     use super::log::{MemoryLog, random_entry};
     use std::time::{Duration, Instant};
     use std::sync::mpsc::{channel, Receiver};
-    use std::sync::{Arc, Mutex};
+    use std::sync::{Arc, Mutex, Condvar};
 
     const DEFAULT_HEARTBEAT_TIMEOUT_MS: u64 = 150;
 
     fn mock_server() -> (Receiver<PeerThreadMessage>, Server) {
         let log = Arc::new(Mutex::new(MemoryLog::new()));
-        let state = Arc::new(Mutex::new(ServerState {
+        let state = Arc::new((Mutex::new(ServerState {
             current_state: State::Follower,
             current_term: 0,
             commit_index: 0,
             voted_for: None,
             last_leader_contact: Instant::now(),
             election_timeout: generate_election_timeout()
-        }));
+        }), Condvar::new()));
         let (tx, rx) = channel();
         let peers = vec![0, 1, 2, 3].into_iter()
             .map(|n| PeerHandle {id:n, to_peer: tx.clone(), next_index:0})
@@ -796,8 +976,9 @@ mod tests {
             info: ServerInfo {
                 peers: peers,
                 me: (0, SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 8080)),
-                heartbeat_timeout: Duration::from_millis(DEFAULT_HEARTBEAT_TIMEOUT_MS)
-            }
+                heartbeat_timeout: Duration::from_millis(DEFAULT_HEARTBEAT_TIMEOUT_MS),
+                to_state_machine: channel().0,
+            },
         };
         (rx, server)
     }
@@ -814,7 +995,7 @@ mod tests {
         }
 
         // Send append entries to peers!
-        let ref mut state = s.state.lock().unwrap();
+        let ref mut state = s.state.0.lock().unwrap();
         state.current_state = State::Leader { last_heartbeat: Instant::now() };
         broadcast_append_entries(&mut s.info, state, s.log.clone());
 
@@ -835,8 +1016,9 @@ mod tests {
     #[test]
     fn server_starts_election() {
         let (rx, s) = mock_server();
-        let mut state = s.state.lock().unwrap();
-        s.start_election(&mut state);
+        let (ref state_ref, ref cvar) = *s.state;
+        let mut state = state_ref.lock().unwrap();
+        s.start_election(&mut state, cvar);
         assert!(matches!(state.current_state, State::Candidate{ .. }));
         // Each peer should have received a RequestVote message.
         for _ in 0..s.info.peers.len() {
@@ -968,7 +1150,7 @@ mod tests {
         fn transition_to_candidate_normal() {
             const OUR_ID: u64 = 5;
             let (_, s) = mock_server();
-            let mut state = s.state.lock().unwrap();
+            let mut state = s.state.0.lock().unwrap();
             assert_eq!(state.current_term, 0);
             assert_eq!(state.voted_for, None);
             assert!(matches!(state.current_state, State::Follower));
@@ -988,7 +1170,7 @@ mod tests {
         fn transition_to_leader_normal() {
             const OUR_ID: u64 = 1;
             let (rx, mut s) = mock_server();
-            let mut state = s.state.lock().unwrap();
+            let mut state = s.state.0.lock().unwrap();
             // we must be a candidate before we can become a leader
             state.transition_to_candidate(OUR_ID);
             state.transition_to_leader(&mut s.info, s.log.clone());
@@ -1016,7 +1198,7 @@ mod tests {
         fn transition_to_follower_normal() {
             const OUR_ID: u64 = 1;
             let (_, s) = mock_server();
-            let mut state = s.state.lock().unwrap();
+            let mut state = s.state.0.lock().unwrap();
             state.transition_to_candidate(OUR_ID);
             assert_eq!(state.current_term, 1);
             assert_eq!(state.voted_for, Some(OUR_ID));
@@ -1031,7 +1213,7 @@ mod tests {
             const OUR_ID: u64 = 1;
             const NEW_TERM: u64 = 2;
             let (_, s) = mock_server();
-            let mut state = s.state.lock().unwrap();
+            let mut state = s.state.0.lock().unwrap();
             state.transition_to_candidate(OUR_ID);
             assert_eq!(state.current_term, 1);
             assert_eq!(state.voted_for, Some(OUR_ID));
@@ -1040,6 +1222,7 @@ mod tests {
             assert_eq!(state.voted_for, None);
             assert!(matches!(state.current_state, State::Follower));
         }
+
     }
 }
 

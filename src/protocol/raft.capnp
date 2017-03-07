@@ -38,3 +38,18 @@ struct RequestVoteReply {
   term          @0   :UInt64;
   voteGranted   @1   :Bool;
 }
+
+struct ClientRequest {
+  op            @0   :Op;
+  data          @1   :Data;
+  enum Op {
+    write @0;
+    read @1;
+  }
+}
+
+struct ClientRequestReply {
+  success       @0   :Bool;
+  data          @1   :Data;
+}
+
