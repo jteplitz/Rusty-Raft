@@ -147,6 +147,7 @@ impl RelayServer {
             let bytes_read = from_stream.read(&mut buf[..]).unwrap();
             if bytes_read == 0 {
                 to_stream.shutdown(Shutdown::Write);
+                break;
             }
             to_stream.write(&buf[0..bytes_read]);
             to_stream.flush();
