@@ -20,7 +20,6 @@
 
 
 use std::collections::HashMap;
-use std::collections::hash_map::Keys;
 use std::net::{SocketAddr, TcpListener, TcpStream, Shutdown};
 use std::thread;
 use std::sync::{Arc, Mutex};
@@ -54,7 +53,7 @@ impl RelayServer {
     /// Or if one of the server's background threads have panicked.
     pub fn bind_random_addresses(&mut self, num_addresses: u64) {
         let mut addrs = self.addrs.lock().unwrap();
-        for i in 0..num_addresses {
+        for _ in 0..num_addresses {
             let listener = TcpListener::bind("127.0.0.1:0").unwrap();
             let socket_info = SocketInfo {to_addr: None, online: false};
             addrs.insert(listener.local_addr().unwrap(), socket_info);
@@ -95,7 +94,7 @@ impl RelayServer {
     /// Also panics if any of the server's background threads have panicked.
     pub fn set_address_active(&mut self, from_address: SocketAddr, online: bool) {
         let mut addrs = self.addrs.lock().unwrap();
-        addrs.get_mut(&from_address).unwrap().online = true;
+        addrs.get_mut(&from_address).unwrap().online = online;
     }
 
     /// Runs in a background thread, and relays messages according to the hash map.
@@ -103,7 +102,7 @@ impl RelayServer {
         let local_addr = listener.local_addr().unwrap();
         for stream in listener.incoming() {
             match stream {
-                Ok (mut stream) => {
+                Ok (stream) => {
                     let addrs = addrs.lock().unwrap();
                     match addrs.get(&local_addr) {
                         Some(info) => {
@@ -114,20 +113,20 @@ impl RelayServer {
                         None => {}
                     }
                 },
-                Err (e) => {
-                    // conection errors are dropped
+                Err (_) => {
+                    // conection errors are dropped. We might want to panic instead?
                 }
             }
         }
     }
 
     /// Relays the given stream to the to_addr and sends the result back to the stream.
-    fn relay_stream_to_addr(mut stream: TcpStream, to_addr: SocketAddr) {
+    fn relay_stream_to_addr(stream: TcpStream, to_addr: SocketAddr) {
         // Open a connection to to_addr
-        let mut outgoing = TcpStream::connect(to_addr).unwrap();
+        let outgoing = TcpStream::connect(to_addr).unwrap();
 
-        let mut outgoing_clone = outgoing.try_clone().unwrap();
-        let mut stream_clone = stream.try_clone().unwrap();
+        let outgoing_clone = outgoing.try_clone().unwrap();
+        let stream_clone = stream.try_clone().unwrap();
         thread::spawn (move || RelayServer::relay_stream_to_stream(outgoing_clone, stream_clone));
 
         RelayServer::relay_stream_to_stream(stream, outgoing);
@@ -146,11 +145,11 @@ impl RelayServer {
         loop {
             let bytes_read = from_stream.read(&mut buf[..]).unwrap();
             if bytes_read == 0 {
-                to_stream.shutdown(Shutdown::Write);
+                to_stream.shutdown(Shutdown::Write).unwrap();
                 break;
             }
-            to_stream.write(&buf[0..bytes_read]);
-            to_stream.flush();
+            to_stream.write(&buf[0..bytes_read]).unwrap();
+            to_stream.flush().unwrap();
         }
     }
 }
@@ -161,8 +160,7 @@ mod tests {
     use super::*;
     use std::thread;
     use std::sync::mpsc::{channel, Receiver};
-    use std::net::{SocketAddr, TcpListener, TcpStream};
-    use std::vec;
+    use std::net::{SocketAddr, TcpListener, TcpStream, Shutdown};
     use std::io::{Read, Write};
     use self::rand::{thread_rng, Rng};
     use std::time::Duration;
@@ -172,14 +170,14 @@ mod tests {
 
     #[test]
     /// Tests that the relay server will relay from A->B
-    fn it_relays_in_one_direction() {
+    fn it_relays_from_client() {
         const MESSAGE_LENGTH: usize = 1057;
 
         let mut relay_server = RelayServer::new_with_random_addresses(1);
         let addresses = relay_server.get_bound_addresses();
         assert_eq!(addresses.len(), 1);
 
-        let (addr, rx) = start_tcp_server();
+        let (addr, rx) = start_tcp_listening_server();
         relay_server.relay_address(addresses[0], addr);
 
         let msg: String = thread_rng().gen_ascii_chars().take(MESSAGE_LENGTH).collect();
@@ -195,24 +193,92 @@ mod tests {
         assert_eq!(msg.as_bytes(), &result[..]);
     }
 
+    #[test]
+    fn it_relays_from_server() {
+        const MESSAGE_LENGTH: usize = 904;
+
+        let mut relay_server = RelayServer::new_with_random_addresses(1);
+        let addresses = relay_server.get_bound_addresses();
+        assert_eq!(addresses.len(), 1);
+
+        let msg: String = thread_rng().gen_ascii_chars().take(MESSAGE_LENGTH).collect();
+        let addr = start_tcp_sending_server(msg.clone());
+        relay_server.relay_address(addresses[0], addr);
+
+        let mut client = TcpStream::connect(addresses[0]).unwrap();
+        let mut v = Vec::new();
+        client.read_to_end(&mut v).unwrap();
+        assert_eq!(&v[..], msg.as_bytes());
+    }
+
+    #[test]
+    fn it_relays_from_client_and_server() {
+        const MESSAGE_LENGTH: usize = 904;
+
+        let mut relay_server = RelayServer::new_with_random_addresses(1);
+        let addresses = relay_server.get_bound_addresses();
+        assert_eq!(addresses.len(), 1);
+
+        let msg: String = thread_rng().gen_ascii_chars().take(MESSAGE_LENGTH).collect();
+        let addr = start_tcp_echo_server();
+        relay_server.relay_address(addresses[0], addr);
+
+        let mut client = TcpStream::connect(addresses[0]).unwrap();
+        client.write_all(msg.as_bytes()).unwrap();
+        client.flush().unwrap();
+        client.shutdown(Shutdown::Write).unwrap();
+
+        let mut v = Vec::new();
+        client.read_to_end(&mut v).unwrap();
+
+        assert_eq!(&v[..], msg.as_bytes());
+    }
+
     /// Starts a simple TCP server on the returned address (OS assigned) in a background thread
     /// that sends every message it recieves down through the returned channel
-    fn start_tcp_server() -> (SocketAddr, Receiver<Vec<u8>>) {
+    fn start_tcp_listening_server() -> (SocketAddr, Receiver<Vec<u8>>) {
         let (tx, rx) = channel();
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
         thread::spawn(move || {
             for stream in listener.incoming() {
-                match stream {
-                    Ok(mut s) => {
-                        let mut v = Vec::new();
-                        s.read_to_end(&mut v);
-                        tx.send(v).unwrap();
-                    },
-                    Err(e) => {}
-                }
+                let mut s = stream.unwrap();
+                let mut v = Vec::new();
+                s.read_to_end(&mut v).unwrap();
+                tx.send(v).unwrap();
             }
         });
         (addr, rx)
+    }
+
+    /// Starts a TCP server that sends msg to each client when they connect
+    /// and then closes the connection
+    fn start_tcp_sending_server(msg: String) -> SocketAddr {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        thread::spawn(move || {
+            for stream in listener.incoming() {
+                let mut s = stream.unwrap();
+                s.write_all(msg.as_bytes()).unwrap();
+                s.flush().unwrap();
+            }
+        });
+        addr
+    }
+
+    /// Starts a TCP echo server and returns the address assigned to the server by the OS
+    fn start_tcp_echo_server() -> SocketAddr {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        thread::spawn(move || {
+            for stream in listener.incoming() {
+                let mut s = stream.unwrap();
+                let mut v = Vec::new();
+                s.read_to_end(&mut v).unwrap();
+                s.write_all(&v[..]).unwrap();
+                s.flush().unwrap();
+            }
+        });
+        addr
     }
 }
