@@ -1,41 +1,58 @@
 mod log;
-mod state_machine;
+mod peer;
+mod constants;
 use capnp;
 use rand;
-use capnp::serialize::OwnedSegments;
-use capnp::message::Reader;
 use raft_capnp::{append_entries, append_entries_reply,
                  request_vote, request_vote_reply,
                  client_request, client_request_reply};
 use rpc::{RpcError};
-use rpc::client::Rpc;
 use rpc::server::{RpcObject, RpcServer};
 use std::net::SocketAddr;
 use std::time::{Duration, Instant};
 use std::thread;
 use std::sync::{Arc, Mutex, Condvar};
-use std::sync::mpsc::{channel, Sender, Receiver};
+use std::sync::mpsc::{channel, Sender};
 
 use self::log::{Log, MemoryLog, Entry, Op};
+use self::peer::{Peer, PeerHandle, PeerThreadMessage, RequestVoteMessage};
 use std::io::Error as IoError;
 use rand::distributions::{IndependentSample, Range};
 use std::collections::HashMap;
 
-// Constants
-// TODO: Many of these should be overwrittable by Config
-const ELECTION_TIMEOUT_MIN: u64 = 150; // min election timeout wait value in m.s.
-const ELECTION_TIMEOUT_MAX: u64 = 300; // min election timeout wait value in m.s.
-const APPEND_ENTRIES_OPCODE: i16 = 0;
-const REQUEST_VOTE_OPCODE: i16 = 1;
-const CLIENT_REQUEST_OPCODE: i16 = 2;
+
+#[derive(Debug)]
+pub enum RaftError { 
+    ClientError(String),      // Error defined by client.
+    NotLeader(Option<u64>),   // I'm not the leader; give leader id
+                              // if we know it.
+                              // TODO: actually keep track of this
+}
 
 ///
-/// State machine trait for clients to implement.
+/// State machine trait for clients to implement. Client should define
+/// their own deserialization/serialization for the |buffer| that
+/// Raft passes around as an anonymous blob.
+/// TODO : implement StateMachineError trait instead of using IoError
 ///
 pub trait StateMachine: Sync + Send {
-    fn write(&self, command: &[u8]) -> bool;
-    fn read(&self, query: &[u8]) -> Vec<u8>;
-    fn flush(&self, filename: String) -> bool;
+    /// 
+    /// Perform the command defined by |buffer| on this state machine.
+    ///
+    /// # Returns
+    /// Returns an Ok if command successfully executes; otherwise
+    /// results in an IoError.
+    ///
+    fn command(&self, buffer: &[u8]) -> Result<(), RaftError> ;
+
+    ///
+    /// Performs the query defined by |buffer| on this state machine.
+    ///
+    /// # Returns
+    /// Returns a |buffer| (to be interpreted by client) wrapped in Result if
+    /// query successfully executes. Otherwise, results in an IoError.
+    ///
+    fn query(&self, buffer: &[u8]) -> Result<Vec<u8>, RaftError>;
 }
 
 pub struct Config {
@@ -55,10 +72,6 @@ impl Config {
             heartbeat_timeout: heartbeat_timeout,
         }
     }
-    // TODO eventually implement
-    // pub fn fromFile (file: String) -> Config {
-    //     
-    // }
 }
 
 // States that each machine can be in!
@@ -70,46 +83,22 @@ enum State {
 }
 
 ///
-/// Messages for peer background threads to push to associated machines.
-enum PeerThreadMessage {
-    AppendEntries (AppendEntriesMessage),
-    RequestVote (RequestVoteMessage),
-}
-
-struct AppendEntriesMessage {
-    term: u64,
-    leader_id: u64,
-    prev_log_index: usize,
-    prev_log_term: u64,
-    entries: Vec<Entry>,
-    leader_commit: usize,
-}
-
-#[derive(Copy, Clone)]
-struct RequestVoteMessage {
-    term: u64,
-    candidate_id: u64,
-    last_log_index: usize,
-    last_log_term: u64,
-}
-
-///
 /// Messages that can be sent to the main thread.
 /// *Reply messages encapsulate replies from peer machines, and
 /// ClientAppendRequest is a message sent by the client thread.
-struct AppendEntriesReply {
+pub struct AppendEntriesReply {
     term: u64,
     commit_index: usize,
     peer: (u64, SocketAddr),
     success: bool,
 }
 
-struct RequestVoteReply {
+pub struct RequestVoteReply {
     term: u64,
     vote_granted: bool,
 }
 
-enum MainThreadMessage {
+pub enum MainThreadMessage {
     AppendEntriesReply (AppendEntriesReply),
     RequestVoteReply (RequestVoteReply),
     ClientAppendRequest,
@@ -120,7 +109,7 @@ enum MainThreadMessage {
 ///
 enum StateMachineMessage {
     Command,
-    Query { buffer: Vec<u8>, response_channel: Sender<Vec<u8>> },
+    Query { buffer: Vec<u8>, response_channel: Sender<Result<Vec<u8>, RaftError>> },
 }
 
 ///
@@ -150,196 +139,19 @@ fn state_machine_thread (log: Arc<Mutex<Log>>,
                     let result = { log.lock().unwrap().get_entry(append_index).cloned() };
                     if let Some(entry) = result {
                         if let Op::Write(data) = entry.op {
-                            state_machine.write(&data);
+                            // TODO: there is currently no way to forward
+                            // |command| client errors to the client
+                            state_machine.command(&data);
                         }
                     }
                 },
                 StateMachineMessage::Query { buffer, response_channel } => {
-                    response_channel.send(state_machine.read(&buffer)).unwrap();
+                    response_channel.send(state_machine.query(&buffer)).unwrap();
                 },
             }
         }
     });
     to_state_machine
-}
-
-/// Handle for main thread to communicate with Peer.
-struct PeerHandle {
-    id: u64,
-    to_peer: Sender<PeerThreadMessage>,
-    next_index: usize,
-}
-
-impl PeerHandle {
-    /// Pushes a non-blocking append-entries request to this peer.
-    /// Panics if associated peer background thread is somehow down.
-    fn append_entries_nonblocking (&self, leader_id: u64, commit_index: usize,
-                                   current_term: u64, log: Arc<Mutex<Log>>) {
-        let entries = {
-            log.lock().unwrap().get_entries_from(self.next_index).to_vec()
-        };
-        let peer_index = self.next_index;
-        let last_entry = entries.get(peer_index).unwrap();
-        self.to_peer.send(PeerThreadMessage::AppendEntries(AppendEntriesMessage {
-            term: current_term,
-            leader_id: leader_id,
-            prev_log_index: peer_index,
-            prev_log_term: last_entry.term,
-            entries: entries.to_vec(),
-            leader_commit: commit_index,
-        })).unwrap(); // This failing means the peer background thread is down.
-    }
-}
-
-/// A background thread whose job is to communicate and relay messages between
-/// the main thread and the peer at |addr|.
-struct Peer {
-    id: u64,
-    addr: SocketAddr,
-    to_main: Sender<MainThreadMessage>,
-    from_main: Receiver<PeerThreadMessage>
-}
-
-impl Peer {
-    ///
-    /// Spawns a new Peer in a background thread to communicate with the server at id.
-    ///
-    /// # Panics
-    /// Panics if the OS fails to create a new background thread.
-    ///
-    fn start (id: (u64, SocketAddr), to_main: Sender<MainThreadMessage>) -> PeerHandle {
-        let (to_peer, from_main) = channel();
-        let commit_index = 0;
-        
-        thread::spawn(move || {
-            let peer = Peer {
-                id: id.0,
-                addr: id.1,
-                to_main: to_main,
-                from_main: from_main
-            };
-            peer.main();
-        });
-
-        PeerHandle {
-            id: id.0,
-            to_peer: to_peer,
-            next_index: commit_index,
-        }
-    }
-
-    ///
-    /// Sends the appropriate append entries RPC to this peer.
-    ///
-    /// # Panics
-    /// Panics if proto fails to initialize.
-    ///
-    // TODO(sydli): Test
-    fn append_entries_blocking (&mut self, entry: AppendEntriesMessage) {
-        let mut rpc = Rpc::new(APPEND_ENTRIES_OPCODE);
-        {
-            let mut params = rpc.get_param_builder().init_as::<append_entries::Builder>();
-            params.set_term(entry.term);
-            params.set_leader_id(entry.leader_id);
-            params.set_prev_log_index(entry.prev_log_index as u64);
-            params.set_prev_log_term(entry.prev_log_term);
-            params.set_leader_commit(entry.leader_commit as u64);
-            params.borrow().init_entries(entry.entries.len() as u32);
-            for i in 0..entry.entries.len() {
-                let mut entry_builder = params.borrow().get_entries().unwrap().get(i as u32);
-                entry.entries[i].into_proto(&mut entry_builder);
-            }
-        }
-        let (term, success) = rpc.send(self.addr).and_then(|msg| {
-            Rpc::get_result_reader(&msg).and_then(|result| {
-                result.get_as::<append_entries_reply::Reader>()
-                      .map_err(RpcError::Capnp)
-                })
-                .map(|reply_reader| {
-                    let term = reply_reader.get_term();
-                    let success = reply_reader.get_success();
-                    (term, term == entry.term && success)
-                })
-        }).unwrap_or((entry.term, false));
-        let new_commit_index = entry.prev_log_index + entry.entries.len();
-        let reply = AppendEntriesReply {
-            term: term,
-            commit_index: if success { new_commit_index } else { entry.prev_log_index },
-            peer: (self.id, self.addr),
-            success: success,
-        };
-        self.to_main.send(MainThreadMessage::AppendEntriesReply(reply)).unwrap();
-    }
-
-    ///
-    /// Requests a vote in the new term from this peer.
-    ///
-    /// # Panics
-    /// Panics if the main thread has panicked or been deallocated
-    ///
-    fn send_request_vote (&self, vote: RequestVoteMessage) {
-        let mut rpc = Rpc::new(REQUEST_VOTE_OPCODE);
-        Peer::construct_request_vote(&mut rpc, &vote);
-
-        let vote_granted = rpc.send(self.addr)
-            .and_then(|msg| Peer::handle_request_vote_reply(vote.term, msg))
-            .unwrap_or(false);
-
-        let reply = RequestVoteReply {
-            term: vote.term,
-            vote_granted: vote_granted
-        };
-        // Panics if the main thread has panicked or been deallocated
-        self.to_main.send(MainThreadMessage::RequestVoteReply(reply)).unwrap();
-    }
-
-    ///
-    /// Sets the term, candidate_id, and last_log index on the rpc from the
-    /// data in the RequestVoteMessage
-    ///
-    fn construct_request_vote (rpc: &mut Rpc, vote: &RequestVoteMessage) {
-        let mut params = rpc.get_param_builder().init_as::<request_vote::Builder>();
-        params.set_term(vote.term);
-        params.set_candidate_id(vote.candidate_id);
-        params.set_last_log_index(vote.last_log_index as u64);
-        params.set_last_log_term(vote.last_log_term);
-    }
-
-    ///
-    /// Processes a request_vote_reply for the given vote_term
-    /// Returms true if the peer granted their vote or false if the peer denied their vote
-    ///
-    /// # Errors
-    /// Returns an RpcError if the msg is not a well formed request_vote_reply
-    ///
-    fn handle_request_vote_reply (vote_term: u64, msg: Reader<OwnedSegments>) -> Result<bool, RpcError> {
-        Rpc::get_result_reader(&msg)
-        .and_then(|result| {
-            result.get_as::<request_vote_reply::Reader>()
-                  .map_err(RpcError::Capnp)
-        })
-        .map(|reply_reader| {
-            let reply_term = reply_reader.get_term();
-            let vote_granted = reply_reader.get_vote_granted();
-            (reply_term == vote_term) && vote_granted
-        })
-    }
-
-    ///
-    /// Main loop for background thread
-    /// Waits on messages from its pipe and acts on them
-    ///
-    /// # Panics
-    /// Panics if the main thread has panicked or been deallocated
-    ///
-    fn main (mut self) {
-        loop {
-            match self.from_main.recv().unwrap() {
-                PeerThreadMessage::AppendEntries(entry) => self.append_entries_blocking(entry),
-                PeerThreadMessage::RequestVote(vote) => self.send_request_vote(vote)
-            }
-        }
-    }
 }
 
 /// Store's the state that the server is currently in along with the current_term
@@ -658,9 +470,9 @@ impl Server {
                                           to_state_machine.clone()))}
         );
         let services = vec![
-            (APPEND_ENTRIES_OPCODE, append_entries_handler),
-            (REQUEST_VOTE_OPCODE, request_vote_handler),
-            (CLIENT_REQUEST_OPCODE, client_request_handler)
+            (constants::APPEND_ENTRIES_OPCODE, append_entries_handler),
+            (constants::REQUEST_VOTE_OPCODE, request_vote_handler),
+            (constants::CLIENT_REQUEST_OPCODE, client_request_handler)
         ];
         let mut server = RpcServer::new_with_services(services);
         try!(
@@ -835,7 +647,7 @@ impl RpcObject for AppendEntriesHandler {
 /// candidate state
 ///
 fn generate_election_timeout() -> Duration {
-    let btwn = Range::new(ELECTION_TIMEOUT_MIN, ELECTION_TIMEOUT_MAX);
+    let btwn = Range::new(constants::ELECTION_TIMEOUT_MIN, constants::ELECTION_TIMEOUT_MAX);
     let mut range = rand::thread_rng();
     Duration::from_millis(btwn.ind_sample(&mut range))
 }
@@ -847,14 +659,14 @@ fn generate_election_timeout() -> Duration {
 ///
 fn client_read_blocking (query: &[u8],
                          to_state_machine: Arc<Mutex<Sender<StateMachineMessage>>>
-                         ) -> Option<Vec<u8>> {
+                         ) -> Result<Vec<u8>, RaftError> {
     let (to_me, from_sm) = channel();
     to_state_machine.lock().unwrap().send(
         StateMachineMessage::Query {
             buffer: query.to_vec(),
             response_channel: to_me,
         }).unwrap();
-    return from_sm.recv().ok();
+    from_sm.recv().unwrap()
 }
 
 ///
@@ -878,13 +690,16 @@ fn wait_for_commit(term: u64, index: usize, state: Arc<(Mutex<ServerState>, Cond
 fn client_write_blocking (log: Arc<Mutex<Log>>,
                           state: Arc<(Mutex<ServerState>, Condvar)>,
                           command: &[u8],
-                          to_main: Arc<Mutex<Sender<MainThreadMessage>>>) -> bool {
+                          to_main: Arc<Mutex<Sender<MainThreadMessage>>>)
+                          -> Result<(), RaftError> {
     // TODO (sydli): it may not be 100% safe to drop the state lock here.
     let (current_state, current_term) = {
         let state = state.0.lock().unwrap();
         (state.current_state, state.current_term)
     };
-    if !matches!(current_state, State::Leader { .. }) { return false; }
+    if !matches!(current_state, State::Leader { .. }) { 
+        return Err(RaftError::NotLeader(None));
+    }
     let index = { // Scope the log lock so we drop it immediately afterwards.
         let mut log = log.lock().unwrap();
         log.append_entry(Entry {
@@ -897,7 +712,11 @@ fn client_write_blocking (log: Arc<Mutex<Log>>,
     unwrapped_to_main.send(MainThreadMessage::ClientAppendRequest).unwrap();
 
     // wait for commit index to update or term to change
-    wait_for_commit(current_term, index, state.clone())
+    if wait_for_commit(current_term, index, state.clone()) {
+        Ok(())
+    } else {
+        Err(RaftError::NotLeader(None))
+    }
 }
 
 struct ClientRequestHandler {
@@ -912,24 +731,22 @@ impl RpcObject for ClientRequestHandler {
                    result: capnp::any_pointer::Builder) -> Result<(), RpcError> {
         params.get_as::<client_request::Reader>().map(|client_request| {
             let op_result = match client_request.get_op().unwrap() {
-                client_request::Op::Write =>  {
-                    if client_write_blocking(self.log.clone(),
-                                             self.state.clone(),
-                                             client_request.get_data().unwrap(),
-                                             self.to_main.clone()) {
-                        Some(vec![]) } else { None }
-                }, 
+                client_request::Op::Write => client_write_blocking(
+                        self.log.clone(),
+                        self.state.clone(),
+                        client_request.get_data().unwrap(),
+                        self.to_main.clone()).map(|_| vec![]),
                 client_request::Op::Read => client_read_blocking(
                         client_request.get_data().unwrap(),
                         self.to_state_machine.clone())
             };
             let mut reply = result.init_as::<client_request_reply::Builder>();
             match op_result {
-                Some(data) => {
+                Ok(data) => {
                     reply.set_success(true);
                     reply.set_data(&data);
                 }
-                None => reply.set_success(false),
+                Err(_) => reply.set_success(false),
 
             }
         })
@@ -939,16 +756,11 @@ impl RpcObject for ClientRequestHandler {
 
 #[cfg(test)]
 mod tests {
-    use capnp::{message, serialize_packed};
-    use capnp::serialize::OwnedSegments;
-    use std::io::BufReader;
     use std::net::{IpAddr, Ipv4Addr, SocketAddr};
     use super::*;
-    use super::{PeerThreadMessage, ServerInfo, broadcast_append_entries, ServerState,
-                State, generate_election_timeout, PeerHandle, Peer, RequestVoteMessage};
-    use super::super::rpc::client::*;
-    use super::super::raft_capnp::{request_vote, request_vote_reply, append_entries_reply};
-    use super::super::rpc_capnp::rpc_response;
+    use super::peer::{PeerThreadMessage, PeerHandle};
+    use super::{ServerInfo, broadcast_append_entries, ServerState,
+                State, generate_election_timeout};
     use super::log::{MemoryLog, random_entry};
     use std::time::{Duration, Instant};
     use std::sync::mpsc::{channel, Receiver};
@@ -1031,119 +843,11 @@ mod tests {
             }
         }
     }
-
-    #[test]
-    fn peer_constructs_valid_request_vote() {
-        const TERM: u64 = 13;
-        const CANDIDATE_ID: u64 = 6;
-        const LAST_LOG_INDEX: u64 = 78;
-        const LAST_LOG_TERM: u64 = 5;
-        let mut rpc = Rpc::new(1);
-        let vote = RequestVoteMessage {
-            term: TERM,
-            candidate_id: CANDIDATE_ID,
-            last_log_index: LAST_LOG_INDEX as usize,
-            last_log_term: LAST_LOG_TERM
-        };
-
-        Peer::construct_request_vote(&mut rpc, &vote);
-        let param_reader = rpc.get_param_builder().as_reader().get_as::<request_vote::Reader>().unwrap();
-        assert_eq!(param_reader.get_term(), TERM);
-        assert_eq!(param_reader.get_candidate_id(), CANDIDATE_ID);
-        assert_eq!(param_reader.get_last_log_index(), LAST_LOG_INDEX);
-        assert_eq!(param_reader.get_last_log_term(), LAST_LOG_TERM);
-    }
-
-    fn get_message_reader<A> (msg: &message::Builder<A>) -> message::Reader<OwnedSegments> 
-        where A: message::Allocator
-    {
-        let mut message_buffer = Vec::new();
-        serialize_packed::write_message(&mut message_buffer, &msg).unwrap();
-
-        let mut buf_reader = BufReader::new(&message_buffer[..]);
-        serialize_packed::read_message(&mut buf_reader, message::ReaderOptions::new()).unwrap()
-    }
-
-    #[test]
-    fn peer_vote_reply_handles_vote_granted() {
-        const TERM: u64 = 54;
-        let mut builder = message::Builder::new_default();
-        construct_request_vote_reply(&mut builder, TERM, true);
-
-        let reader = get_message_reader(&builder);
-        assert!(Peer::handle_request_vote_reply(TERM, reader).unwrap());
-    }
-
-    #[test]
-    fn peer_vote_reply_handles_incorrect_term() {
-        const TERM: u64 = 26;
-        let mut builder = message::Builder::new_default();
-        construct_request_vote_reply(&mut builder, TERM - 1, true);
-
-        let reader = get_message_reader(&builder);
-        assert!(!Peer::handle_request_vote_reply(TERM, reader).unwrap());
-    }
-
-    #[test]
-    fn peer_vote_reply_handles_vote_rejected() {
-        const TERM: u64 = 14;
-        let mut builder = message::Builder::new_default();
-        construct_request_vote_reply(&mut builder, TERM, false);
-
-        let reader = get_message_reader(&builder);
-        assert!(!Peer::handle_request_vote_reply(TERM, reader).unwrap());
-    }
-
-    #[test]
-    // TODO: Determine what level of error checking we want on the messages
-    // I have not found consistent error behavior. Even out of bounds seems to proceed
-    // without error on travis...
-    fn peer_vote_reply_handles_malformed_vote_replies() {
-        /*const TERM: u64 = 14;
-        let mut builder = message::Builder::new_default();
-        construct_append_entries_reply(&mut builder, TERM, true);
-
-        let reader = get_message_reader(&builder);
-        let err = Peer::handle_request_vote_reply(TERM, reader).unwrap_err();
-        assert!(matches!(err, RpcError::Capnp(_)));*/
-    }
-
-    #[test]
-    fn peer_vote_reply_handles_malformed_rpc_replies() {
-        // TODO(jason): Figure out why this test fails on travis
-        /*const TERM: u64 = 19;
-        let builder = message::Builder::new_default();
-        let reader = get_message_reader(&builder);
-        let err = Peer::handle_request_vote_reply(TERM, reader).unwrap_err();
-        assert!(matches!(err, RpcError::Capnp(_)));*/
-    }
-
-    /// Constructs a valid rpc_response with the given information contained in an
-    /// append_entries_reply inside the provided msg buffer.
-    fn construct_append_entries_reply<A> (msg: &mut message::Builder<A>, term: u64, success: bool)
-        where A: message::Allocator
-    {
-        let response_builder = msg.init_root::<rpc_response::Builder>();
-        let mut reply_builder = response_builder.get_result().init_as::<append_entries_reply::Builder>();
-        reply_builder.set_term(term);
-        reply_builder.set_success(success);
-    }
-
-    /// Constructs a valid rpc_response with the given information contained in a request_vote_reply
-    /// inside the provided msg buffer.
-    fn construct_request_vote_reply<A> (msg: &mut message::Builder<A>, term: u64, vote_granted: bool) 
-        where A: message::Allocator 
-    {
-        let response_builder = msg.init_root::<rpc_response::Builder>();
-        let mut vote_reply_builder = response_builder.get_result().init_as::<request_vote_reply::Builder>();
-        vote_reply_builder.set_term(term);
-        vote_reply_builder.set_vote_granted(vote_granted);
-    }
-
     // TODO: Come up with a consistent way to structure modules and unit tests 
     mod server_state {
         use super::mock_server;
-        use super::super::{State, PeerThreadMessage};
+        use super::super::{State};
+        use super::super::peer::{PeerThreadMessage};
         use super::super::log::{Op};
 
         #[test]
@@ -1222,7 +926,5 @@ mod tests {
             assert_eq!(state.voted_for, None);
             assert!(matches!(state.current_state, State::Follower));
         }
-
     }
 }
-
