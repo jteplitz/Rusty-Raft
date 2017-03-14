@@ -176,20 +176,21 @@ impl ServerState {
     /// current_index.
     /// This should only be called if we're in the follower state or already in the candidate state
     ///
-    fn transition_to_candidate(&mut self, my_id: u64) {
+    fn transition_to_candidate(&mut self, my_id: u64, cv: &Condvar) {
         debug_assert!(self.current_state == State::Follower ||
                       matches!(self.current_state, State::Candidate { .. }));
         self.current_state = State::Candidate { start_time: Instant::now(), num_votes: 1 }; // we always start with 1 vote from ourselves
         self.current_term += 1;
         self.voted_for = Some(my_id); // vote for ourselves
         self.election_timeout = generate_election_timeout();
+        cv.notify_all();
     }
 
     ///
     /// Transitions into the leader state from the candidate state.
     ///
     /// TODO: Persist term information to disk
-    fn transition_to_leader(&mut self, info: &mut ServerInfo, log: Arc<Mutex<Log>>) {
+    fn transition_to_leader(&mut self, info: &mut ServerInfo, log: Arc<Mutex<Log>>, cv: &Condvar) {
         debug_assert!(matches!(self.current_state, State::Candidate{ .. }));
         self.current_state = State::Leader { last_heartbeat: Instant::now() };
         // Append dummy entry.
@@ -200,6 +201,7 @@ impl ServerState {
             peer.next_index = self.commit_index;
         }
         broadcast_append_entries(info, self, log.clone());
+        cv.notify_all();
     }
 
     ///
@@ -207,7 +209,7 @@ impl ServerState {
     /// If the new term is greater than our current term this also resets
     /// our vote tracker.
     ///
-    fn transition_to_follower(&mut self, new_term: u64) {
+    fn transition_to_follower(&mut self, new_term: u64, cv: &Condvar) {
         debug_assert!(matches!(self.current_state, State::Candidate{ .. }) ||
                       matches!(self.current_state, State::Leader{ .. }));
         debug_assert!(new_term >= self.current_term);
@@ -218,6 +220,7 @@ impl ServerState {
         self.current_term = new_term;
         self.current_state = State::Follower;
         self.election_timeout = generate_election_timeout();
+        cv.notify_all();
         // TODO: We need to stop the peers from continuing to send AppendEntries here.
     }
 }
@@ -251,8 +254,7 @@ impl ServerInfo {
 ///
 /// Updates the server's commit index to the median of our peers' indices.
 ///
-// TODO(sydli): Test
-fn update_commit_index(server_info: &ServerInfo, state: &mut ServerState) {
+fn update_commit_index(server_info: &ServerInfo, state: &mut ServerState, cv: &Condvar) {
     // Find median of all peer commit indices.
     let mut indices: Vec<usize> = server_info.peers.iter().map(|ref peer| peer.next_index.clone()).collect();
     indices.sort();
@@ -261,6 +263,7 @@ fn update_commit_index(server_info: &ServerInfo, state: &mut ServerState) {
     if state.commit_index >= new_index { return; }
     server_info.to_state_machine.send(StateMachineMessage::Command).unwrap();
     state.commit_index = new_index;
+    cv.notify_all();
 }
 
 ///
@@ -374,8 +377,7 @@ fn handle_append_entries_reply(m: AppendEntriesReply, server_info: &mut ServerIn
     match state.current_state {
         State::Leader{ .. } => {
             if m.term > state.current_term {
-                state.transition_to_follower(m.term);
-                state_condition.notify_all();
+                state.transition_to_follower(m.term, state_condition);
             } else if m.success {
                 // On success, advance peer's index.
                 server_info.get_peer_mut(m.peer.0).map(|peer| {
@@ -383,8 +385,7 @@ fn handle_append_entries_reply(m: AppendEntriesReply, server_info: &mut ServerIn
                         peer.next_index = m.commit_index + 1;
                     }
                 });
-                update_commit_index(server_info, state);
-                state_condition.notify_all();
+                update_commit_index(server_info, state, state_condition);
             } else {
                 let leader_id = server_info.me.0;
                 // If we failed, roll back peer index by 1 and retry
@@ -432,8 +433,7 @@ fn handle_request_vote_reply(reply: RequestVoteReply, info: &mut ServerInfo,
     if let State::Candidate{num_votes, ..} = state.current_state {
         if num_votes > info.peers.len() / 2 {
             // Woo! We won the election
-            state.transition_to_leader(info, log);
-            state_condition.notify_all();
+            state.transition_to_leader(info, log, state_condition);
         }
     }
 }
@@ -516,7 +516,7 @@ impl Server {
     ///
     fn start_election(&self, state: &mut ServerState, state_condition: &Condvar) -> Duration {
         // transition to the candidate state
-        state.transition_to_candidate(self.info.me.0);
+        state.transition_to_candidate(self.info.me.0, state_condition);
 
         let (last_log_index, last_log_term) = {
             let log = self.log.lock().unwrap();
@@ -535,7 +535,6 @@ impl Server {
             peer.to_peer.send(PeerThreadMessage::RequestVote(request_vote_message))
                 .unwrap(); // panic if the peer thread is down
         }
-        state_condition.notify_all();
         state.election_timeout
     }
 }
@@ -566,8 +565,7 @@ impl RpcObject for RequestVoteHandler {
 
             if term > state.current_term {
                 // TODO(jason): This should happen on the main thread.
-                state.transition_to_follower(term);
-                cvar.notify_all();
+                state.transition_to_follower(term, &cvar);
             }
 
             if state.voted_for == None || state.voted_for == Some(candidate_id) {
@@ -576,8 +574,7 @@ impl RpcObject for RequestVoteHandler {
                     vote_granted = true;
                     state.voted_for = Some(candidate_id);
                     // TODO(jason): This should happen on the main thread.
-                    state.transition_to_follower(term);
-                    cvar.notify_all();
+                    state.transition_to_follower(term, &cvar);
                 }
             }
             current_term = state.current_term;
@@ -760,7 +757,8 @@ mod tests {
     use super::*;
     use super::peer::{PeerThreadMessage, PeerHandle};
     use super::{ServerInfo, broadcast_append_entries, ServerState,
-                State, generate_election_timeout};
+                State, generate_election_timeout, update_commit_index,
+                StateMachineMessage};
     use super::log::{MemoryLog, random_entry};
     use std::time::{Duration, Instant};
     use std::sync::mpsc::{channel, Receiver};
@@ -768,7 +766,7 @@ mod tests {
 
     const DEFAULT_HEARTBEAT_TIMEOUT_MS: u64 = 150;
 
-    fn mock_server() -> (Receiver<PeerThreadMessage>, Server) {
+    fn mock_server() -> (Receiver<PeerThreadMessage>, Receiver<StateMachineMessage>, Server) {
         let log = Arc::new(Mutex::new(MemoryLog::new()));
         let state = Arc::new((Mutex::new(ServerState {
             current_state: State::Follower,
@@ -779,6 +777,7 @@ mod tests {
             election_timeout: generate_election_timeout()
         }), Condvar::new()));
         let (tx, rx) = channel();
+        let (tx1, rx1) = channel();
         let peers = vec![0, 1, 2, 3].into_iter()
             .map(|n| PeerHandle {id:n, to_peer: tx.clone(), next_index:0})
             .collect::<Vec<PeerHandle>>();
@@ -789,17 +788,17 @@ mod tests {
                 peers: peers,
                 me: (0, SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 8080)),
                 heartbeat_timeout: Duration::from_millis(DEFAULT_HEARTBEAT_TIMEOUT_MS),
-                to_state_machine: channel().0,
+                to_state_machine: tx1,
             },
         };
-        (rx, server)
+        (rx, rx1, server)
     }
 
     /// Makes sure peer threads receive appendEntries msesages
     /// when the log is appended to.
     #[test]
     fn server_sends_append_entries() {
-        let (rx, mut s) = mock_server();
+        let (rx, _, mut s) = mock_server();
         let vec = vec![random_entry(); 3];
         { // Append some random entries to log
           let mut log = s.log.lock().unwrap();
@@ -827,7 +826,7 @@ mod tests {
     /// when an election is started.
     #[test]
     fn server_starts_election() {
-        let (rx, s) = mock_server();
+        let (rx, _, s) = mock_server();
         let (ref state_ref, ref cvar) = *s.state;
         let mut state = state_ref.lock().unwrap();
         s.start_election(&mut state, cvar);
@@ -843,6 +842,27 @@ mod tests {
             }
         }
     }
+
+    #[test]
+    fn server_updates_commit_index() {
+        let (_, rx2, mut s) = mock_server();
+        let (ref state_ref, ref cvar) = *s.state;
+        let mut state = state_ref.lock().unwrap();
+        { // Change state
+            s.info.peers[0].next_index = 2;
+            s.info.peers[1].next_index = 1;
+            s.info.peers[2].next_index = 2;
+            s.info.peers[3].next_index = 3;
+        }
+        update_commit_index(&s.info, &mut state, &cvar);
+        assert_eq!(state.commit_index, 2);
+        // make sure state machine got a command
+        match rx2.recv().unwrap() {
+            StateMachineMessage::Command => (),
+            StateMachineMessage::Query { .. } => panic!(),
+        }
+    }
+
     // TODO: Come up with a consistent way to structure modules and unit tests 
     mod server_state {
         use super::mock_server;
@@ -850,16 +870,18 @@ mod tests {
         use super::super::peer::{PeerThreadMessage};
         use super::super::log::{Op};
 
+        // TODO (sydli) make sure cv is called
         #[test]
         fn transition_to_candidate_normal() {
             const OUR_ID: u64 = 5;
-            let (_, s) = mock_server();
-            let mut state = s.state.0.lock().unwrap();
+            let (_, _, s) = mock_server();
+            let (ref state_ref, ref cvar) = *s.state;
+            let mut state = state_ref.lock().unwrap();
             assert_eq!(state.current_term, 0);
             assert_eq!(state.voted_for, None);
             assert!(matches!(state.current_state, State::Follower));
 
-            state.transition_to_candidate(OUR_ID);
+            state.transition_to_candidate(OUR_ID, cvar);
             match state.current_state {
                 State::Candidate{num_votes, ..} => {
                     assert_eq!(state.current_term, 1);
@@ -873,11 +895,12 @@ mod tests {
         #[test]
         fn transition_to_leader_normal() {
             const OUR_ID: u64 = 1;
-            let (rx, mut s) = mock_server();
-            let mut state = s.state.0.lock().unwrap();
+            let (rx, _, mut s) = mock_server();
+            let (ref state_ref, ref cvar) = *s.state;
+            let mut state = state_ref.lock().unwrap();
             // we must be a candidate before we can become a leader
-            state.transition_to_candidate(OUR_ID);
-            state.transition_to_leader(&mut s.info, s.log.clone());
+            state.transition_to_candidate(OUR_ID, cvar);
+            state.transition_to_leader(&mut s.info, s.log.clone(), cvar);
             assert!(matches!(state.current_state, State::Leader{..}));
 
             // ensure that we appended a dummy log entry
@@ -901,12 +924,13 @@ mod tests {
         #[test]
         fn transition_to_follower_normal() {
             const OUR_ID: u64 = 1;
-            let (_, s) = mock_server();
-            let mut state = s.state.0.lock().unwrap();
-            state.transition_to_candidate(OUR_ID);
+            let (_, _, s) = mock_server();
+            let (ref state_ref, ref cvar) = *s.state;
+            let mut state = state_ref.lock().unwrap();
+            state.transition_to_candidate(OUR_ID, cvar);
             assert_eq!(state.current_term, 1);
             assert_eq!(state.voted_for, Some(OUR_ID));
-            state.transition_to_follower(1);
+            state.transition_to_follower(1, cvar);
             assert_eq!(state.current_term, 1);
             assert_eq!(state.voted_for, Some(OUR_ID));
             assert!(matches!(state.current_state, State::Follower));
@@ -916,12 +940,13 @@ mod tests {
         fn transition_to_follower_wipes_vote_if_new_term() {
             const OUR_ID: u64 = 1;
             const NEW_TERM: u64 = 2;
-            let (_, s) = mock_server();
-            let mut state = s.state.0.lock().unwrap();
-            state.transition_to_candidate(OUR_ID);
+            let (_, _, s) = mock_server();
+            let (ref state_ref, ref cvar) = *s.state;
+            let mut state = state_ref.lock().unwrap();
+            state.transition_to_candidate(OUR_ID, cvar);
             assert_eq!(state.current_term, 1);
             assert_eq!(state.voted_for, Some(OUR_ID));
-            state.transition_to_follower(NEW_TERM);
+            state.transition_to_follower(NEW_TERM, cvar);
             assert_eq!(state.current_term, NEW_TERM);
             assert_eq!(state.voted_for, None);
             assert!(matches!(state.current_state, State::Follower));
