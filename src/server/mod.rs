@@ -75,7 +75,7 @@ impl Config {
 }
 
 // States that each machine can be in!
-#[derive(PartialEq, Clone, Copy)]
+#[derive(Debug, PartialEq, Clone, Copy)]
 enum State {
     Candidate { num_votes: usize, start_time: Instant },
     Leader { last_heartbeat: Instant },
@@ -93,6 +93,7 @@ pub struct AppendEntriesReply {
     success: bool,
 }
 
+#[derive(PartialEq, Clone, Copy)]
 pub struct RequestVoteReply {
     term: u64,
     vote_granted: bool,
@@ -156,7 +157,7 @@ fn state_machine_thread (log: Arc<Mutex<Log>>,
 
 /// Store's the state that the server is currently in along with the current_term
 /// and current_id. These fields should all share a lock.
-#[derive(Clone, Copy)]
+#[derive(Debug, PartialEq, Clone, Copy)]
 struct ServerState {
     // TODO: state and term must be persisted to disk
     current_state: State,
@@ -419,7 +420,6 @@ fn broadcast_append_entries(info: &mut ServerInfo, state: &mut ServerState, log:
 ///
 /// Handles replies to RequestVote Rpc
 ///
-// TODO(jason): Test
 fn handle_request_vote_reply(reply: RequestVoteReply, info: &mut ServerInfo,
                              state: &mut ServerState, state_condition: &Condvar,
                              log: Arc<Mutex<Log>>) {
@@ -431,7 +431,7 @@ fn handle_request_vote_reply(reply: RequestVoteReply, info: &mut ServerInfo,
         }
     }
     if let State::Candidate{num_votes, ..} = state.current_state {
-        if num_votes > info.peers.len() / 2 {
+        if num_votes > (info.peers.len() + 1) / 2 {
             // Woo! We won the election
             state.transition_to_leader(info, log, state_condition);
         }
@@ -758,7 +758,8 @@ mod tests {
     use super::peer::{PeerThreadMessage, PeerHandle};
     use super::{ServerInfo, broadcast_append_entries, ServerState,
                 State, generate_election_timeout, update_commit_index,
-                StateMachineMessage};
+                StateMachineMessage,
+                handle_request_vote_reply};
     use super::log::{MemoryLog, random_entry};
     use std::time::{Duration, Instant};
     use std::sync::mpsc::{channel, Receiver};
@@ -766,7 +767,7 @@ mod tests {
 
     const DEFAULT_HEARTBEAT_TIMEOUT_MS: u64 = 150;
 
-    fn mock_server() -> (Receiver<PeerThreadMessage>, Receiver<StateMachineMessage>, Server) {
+    fn mock_server(num_peers: u64) -> (Receiver<PeerThreadMessage>, Receiver<StateMachineMessage>, Server) {
         let log = Arc::new(Mutex::new(MemoryLog::new()));
         let state = Arc::new((Mutex::new(ServerState {
             current_state: State::Follower,
@@ -778,8 +779,8 @@ mod tests {
         }), Condvar::new()));
         let (tx, rx) = channel();
         let (tx1, rx1) = channel();
-        let peers = vec![0, 1, 2, 3].into_iter()
-            .map(|n| PeerHandle {id:n, to_peer: tx.clone(), next_index:0})
+        let peers = (0 .. num_peers)
+            .map(|n| PeerHandle {id: n, to_peer: tx.clone(), next_index:0})
             .collect::<Vec<PeerHandle>>();
         let server = Server {
             state: state,
@@ -798,7 +799,8 @@ mod tests {
     /// when the log is appended to.
     #[test]
     fn server_sends_append_entries() {
-        let (rx, _, mut s) = mock_server();
+        const NUM_PEERS: u64 = 4;
+        let (rx, _, mut s) = mock_server(NUM_PEERS);
         let vec = vec![random_entry(); 3];
         { // Append some random entries to log
           let mut log = s.log.lock().unwrap();
@@ -826,7 +828,8 @@ mod tests {
     /// when an election is started.
     #[test]
     fn server_starts_election() {
-        let (rx, _, s) = mock_server();
+        const NUM_PEERS: u64 = 4;
+        let (rx, _, s) = mock_server(NUM_PEERS);
         let (ref state_ref, ref cvar) = *s.state;
         let mut state = state_ref.lock().unwrap();
         s.start_election(&mut state, cvar);
@@ -845,7 +848,8 @@ mod tests {
 
     #[test]
     fn server_updates_commit_index() {
-        let (_, rx2, mut s) = mock_server();
+        const NUM_PEERS: u64 = 4;
+        let (_, rx2, mut s) = mock_server(NUM_PEERS);
         let (ref state_ref, ref cvar) = *s.state;
         let mut state = state_ref.lock().unwrap();
         { // Change state
@@ -863,6 +867,151 @@ mod tests {
         }
     }
 
+    #[test]
+    fn main_thread_increments_num_votes_when_candidate() {
+        let (_rx, _, mut s) = mock_server(4);
+        // trigger an election
+        {
+            let mut state = s.state.0.lock().unwrap();
+            s.start_election(&mut state, &s.state.1);
+            assert!(matches!(state.current_state, State::Candidate{ num_votes: 1, .. }));
+        }
+
+        let request_vote_reply = RequestVoteReply {
+            term: 1,
+            vote_granted: true
+        };
+
+        let mut state = s.state.0.lock().unwrap();
+        handle_request_vote_reply(request_vote_reply, &mut s.info, &mut state, &s.state.1, s.log);
+
+        assert!(matches!(state.current_state, State::Candidate{ num_votes: 2, .. }));
+    }
+
+    // Mocks casting a vote for this server
+    fn cast_vote (s: &mut Server) {
+        let request_vote_reply = RequestVoteReply {
+            term: 1,
+            vote_granted: true
+        };
+        let mut state = s.state.0.lock().unwrap();
+        // we've already voted for ourselves
+        handle_request_vote_reply(request_vote_reply.clone(), &mut s.info, &mut state, &s.state.1, s.log.clone());
+    }
+
+    // Creates a mock sever with |num_peers| peers and send 1 too few votes to win
+    // the election
+    fn main_thread_simulate_half_votes(num_peers: u64) -> (Receiver<PeerThreadMessage>, Server) {
+        let (rx, _, mut s) = mock_server(num_peers);
+        // trigger an election
+        {
+            let mut state = s.state.0.lock().unwrap();
+            s.start_election(&mut state, &s.state.1);
+            assert!(matches!(state.current_state, State::Candidate{ num_votes: 1, .. }));
+        }
+
+        // there are peers.size() + 1 (ourself) servers in the cluster.
+        // You need exactly half plus 1 votes to win the election
+        let num_votes_required = (s.info.peers.len() + 1) / 2 + 1;
+
+        let num_votes_testing = num_votes_required - 1;
+
+        // we've already voted for ourselves
+        for _ in 0 .. num_votes_testing - 1 {
+            cast_vote (&mut s);
+        }
+
+        (rx, s)
+    }
+
+    #[test]
+    // Check that we are still a candidate after recieving one too few votes to win
+    // with an even number of peers
+    fn does_not_become_leader_early_even_num_peers() {
+        const NUM_PEERS: u64 = 20;
+        let (_, s) = main_thread_simulate_half_votes(NUM_PEERS);
+
+        let state = s.state.0.lock().unwrap();
+        let _correct_vote_count = NUM_PEERS + 1;
+        assert!(matches!(state.current_state, State::Candidate{ num_votes: _correct_vote_count, .. }));
+    }
+
+    #[test]
+    // Check that we are still a candidate after recieving one too few votes to win
+    // with an odd number of peers
+    fn does_not_become_leader_early_odd_num_peers() {
+        const NUM_PEERS: u64 = 51;
+        let (_, s) = main_thread_simulate_half_votes(NUM_PEERS);
+
+        let state = s.state.0.lock().unwrap();
+        let _correct_vote_count = NUM_PEERS + 1;
+        assert!(matches!(state.current_state, State::Candidate{ num_votes: _correct_vote_count, .. }));
+    }
+
+    // Returns a server that has mocked out being elected leader
+    fn mock_leader_server(num_peers: u64) -> (Receiver<PeerThreadMessage>, Server) {
+        let (rx, mut s) = main_thread_simulate_half_votes(num_peers);
+
+        // cast one more vote
+        cast_vote (&mut s);
+
+        (rx, s)
+    }
+
+    #[test]
+    fn becomes_leader_after_election_even_num_peers() {
+        const NUM_PEERS: u64 = 50;
+        let (_rx, mut s) = main_thread_simulate_half_votes(NUM_PEERS);
+
+        // cast one more vote
+        cast_vote (&mut s);
+        let state = s.state.0.lock().unwrap();
+        assert!(matches!(state.current_state, State::Leader{ .. }));
+    }
+
+    #[test]
+    fn becomes_leader_after_election_odd_num_peers() {
+        const NUM_PEERS: u64 = 51;
+        let (_rx, s) = mock_leader_server(NUM_PEERS);
+
+        let state = s.state.0.lock().unwrap();
+        assert!(matches!(state.current_state, State::Leader{ .. }));
+    }
+
+    #[test]
+    fn throws_away_votes_cast_after_elected() {
+        const NUM_PEERS: u64 = 86;
+
+        let (_rx, mut s) = mock_leader_server(NUM_PEERS);
+
+        let prev_state: ServerState = {
+            let state: &ServerState = &(s.state.0.lock().unwrap());
+            state.clone()
+        };
+        // cast one more vote
+        cast_vote(&mut s);
+        let state: &ServerState = &s.state.0.lock().unwrap();
+        assert_eq!(*state, prev_state);
+    }
+
+    #[test]
+    fn throws_away_votes_after_losing_election() {
+        const NUM_PEERS: u64 = 85;
+        // almost win an election
+        let (_rx, mut s) = main_thread_simulate_half_votes(NUM_PEERS);
+        // lose the election :(
+        let prev_state: ServerState = {
+            let state: &mut ServerState = &mut s.state.0.lock().unwrap();
+            state.transition_to_follower(1, &s.state.1);
+            assert!(matches!(state.current_state, State::Follower));
+            state.clone()
+        };
+        // cast one more vote
+        cast_vote(&mut s);
+        let state: &ServerState = &s.state.0.lock().unwrap();
+        assert_eq!(*state, prev_state);
+    }
+
     // TODO: Come up with a consistent way to structure modules and unit tests 
     mod server_state {
         use super::mock_server;
@@ -874,7 +1023,8 @@ mod tests {
         #[test]
         fn transition_to_candidate_normal() {
             const OUR_ID: u64 = 5;
-            let (_, _, s) = mock_server();
+            const NUM_PEERS: u64 = 4;
+            let (_, _, s) = mock_server(NUM_PEERS);
             let (ref state_ref, ref cvar) = *s.state;
             let mut state = state_ref.lock().unwrap();
             assert_eq!(state.current_term, 0);
@@ -895,7 +1045,8 @@ mod tests {
         #[test]
         fn transition_to_leader_normal() {
             const OUR_ID: u64 = 1;
-            let (rx, _, mut s) = mock_server();
+            const NUM_PEERS: u64 = 4;
+            let (rx, _, mut s) = mock_server(NUM_PEERS);
             let (ref state_ref, ref cvar) = *s.state;
             let mut state = state_ref.lock().unwrap();
             // we must be a candidate before we can become a leader
@@ -924,7 +1075,8 @@ mod tests {
         #[test]
         fn transition_to_follower_normal() {
             const OUR_ID: u64 = 1;
-            let (_, _, s) = mock_server();
+            const NUM_PEERS: u64 = 4;
+            let (_, _, s) = mock_server(NUM_PEERS);
             let (ref state_ref, ref cvar) = *s.state;
             let mut state = state_ref.lock().unwrap();
             state.transition_to_candidate(OUR_ID, cvar);
@@ -940,7 +1092,8 @@ mod tests {
         fn transition_to_follower_wipes_vote_if_new_term() {
             const OUR_ID: u64 = 1;
             const NEW_TERM: u64 = 2;
-            let (_, _, s) = mock_server();
+            const NUM_PEERS: u64 = 4;
+            let (_, _, s) = mock_server(NUM_PEERS);
             let (ref state_ref, ref cvar) = *s.state;
             let mut state = state_ref.lock().unwrap();
             state.transition_to_candidate(OUR_ID, cvar);
