@@ -22,7 +22,7 @@ pub enum Op {
 #[cfg(test)]
 use rand::{thread_rng, Rng};
 #[cfg(test)]
-fn random_entry_with_term(term: u64) -> Entry {
+pub fn random_entry_with_term(term: u64) -> Entry {
   assert_ne!(term, 0);
 
   let mut vec = vec![0; 8];
@@ -88,7 +88,7 @@ impl Entry {
     ///
     pub fn into_proto(&self, builder: &mut entry::Builder) {
         builder.set_term(self.term);
-        builder.set_term(self.index as u64);
+        builder.set_index(self.index as u64);
         builder.set_data(&self.get_data());
         builder.set_op(self.get_proto_op());
     }
@@ -274,7 +274,10 @@ impl Log for MemoryLog {
 /// type returned by the |create_log()| helper.
 #[cfg(test)]
 mod tests {
+    use super::super::super::rpc::client::Rpc;
+    use super::super::super::raft_capnp::entry;
     use super::{Log, MemoryLog, random_entry, random_entry_with_term};
+    use super::Entry;
     fn create_log() -> MemoryLog { MemoryLog::new() } // Replace with other log types as needed
 
     fn create_filled_log(length: usize) -> MemoryLog {
@@ -412,10 +415,16 @@ mod tests {
     }
 
     #[test]
-    #[ignore]
-    /// TODO (sydli): Generate a bunch of random queries on the log and make
-    ///               sure it stays consistent.
-    fn test_fuzz() {
-        unimplemented!();
+    fn entry_to_and_from_proto() {
+        let entry = random_entry_with_term(5);
+        let mut rpc = Rpc::new(1);
+        {
+            let mut entry_builder = rpc.get_param_builder()
+                                       .init_as::<entry::Builder>();
+            entry.into_proto(&mut entry_builder);
+        }
+        let reader = rpc.get_param_builder().as_reader()
+                        .get_as::<entry::Reader>().unwrap();
+        assert_eq!(entry, Entry::from_proto(reader));
     }
 }

@@ -32,13 +32,16 @@ pub struct RequestVoteMessage {
 
 ///
 /// Messages for peer background threads to push to associated machines.
+///
 pub enum PeerThreadMessage {
     AppendEntries (AppendEntriesMessage),
     RequestVote (RequestVoteMessage),
 }
 
 
-/// Handle for main thread to communicate with Peer.
+///
+/// Handle for main thread to send messages to Peer.
+///
 pub struct PeerHandle {
     pub id: u64,
     pub to_peer: Sender<PeerThreadMessage>,
@@ -46,8 +49,10 @@ pub struct PeerHandle {
 }
 
 impl PeerHandle {
+    ///
     /// Pushes a non-blocking append-entries request to this peer.
-    /// Panics if associated peer background thread is somehow down.
+    /// Panics if main thread has been deallocated.
+    ///
     pub fn append_entries_nonblocking (&self, leader_id: u64, commit_index: usize,
                                        current_term: u64, log: Arc<Mutex<Log>>) {
         let entries = {
@@ -62,12 +67,14 @@ impl PeerHandle {
             prev_log_term: last_entry.term,
             entries: entries.to_vec(),
             leader_commit: commit_index,
-        })).unwrap(); // This failing means the peer background thread is down.
+        })).unwrap(); // This failing means main thread is down.
     }
 }
 
+///
 /// A background thread whose job is to communicate and relay messages between
 /// the main thread and the peer at |addr|.
+///
 pub struct Peer {
     id: u64,
     addr: SocketAddr,
@@ -244,20 +251,86 @@ mod tests {
     use capnp::serialize::OwnedSegments;
     use std::io::BufReader;
     use super::*;
+    use super::super::constants;
+    use super::super::log::{Entry, random_entry_with_term};
     use super::super::super::rpc::client::*;
-    use super::super::super::raft_capnp::{request_vote, request_vote_reply, append_entries_reply};
+    use super::super::super::raft_capnp::{request_vote, request_vote_reply,
+                                          append_entries, append_entries_reply};
     use super::super::super::rpc_capnp::rpc_response;
 
     #[test]
-    fn peer_append_entries_normal() {
-    }
-
-#[test]
-    fn peer_constructs_valid_append_entries() {
+    fn constructs_valid_append_entries() {
+        const TERM: u64 = 13;
+        const LEADER_ID: u64 = 6;
+        const PREV_LOG_INDEX: u64 = 78;
+        const PREV_LOG_TERM: u64 = 5;
+        const LEADER_COMMIT: u64 = 10;
+        let entries = vec![random_entry_with_term(TERM); 6];
+        let mut rpc = Rpc::new(constants::APPEND_ENTRIES_OPCODE);
+        let entry = AppendEntriesMessage {
+            term: TERM,
+            leader_id: LEADER_ID,
+            prev_log_index: PREV_LOG_INDEX as usize,
+            prev_log_term: PREV_LOG_TERM,
+            leader_commit: LEADER_COMMIT as usize,
+            entries: entries.clone(),
+        };
+        Peer::construct_append_entries(&mut rpc, &entry);
+        let param_reader = rpc.get_param_builder().as_reader()
+                              .get_as::<append_entries::Reader>().unwrap();
+        assert_eq!(param_reader.get_term(), TERM);
+        assert_eq!(param_reader.get_leader_id(), LEADER_ID);
+        assert_eq!(param_reader.get_prev_log_index(), PREV_LOG_INDEX);
+        assert_eq!(param_reader.get_prev_log_term(), PREV_LOG_TERM);
+        assert_eq!(param_reader.get_leader_commit(), LEADER_COMMIT);
+        let all_true = entries.iter().zip(param_reader.get_entries().unwrap().iter())
+            .fold(true, |and, (entry1, entry2)| {
+                println!("1{:?}", entry1);
+                println!("2{:?}", Entry::from_proto(entry2));
+                and && (*entry1 == Entry::from_proto(entry2))
+            });
+        assert!(all_true);
     }
 
     #[test]
-    fn peer_constructs_valid_request_vote() {
+    fn append_entries_handles_commited_entry() {
+        const TERM: u64 = 54;
+        let mut builder = message::Builder::new_default();
+        construct_append_entries_reply(&mut builder, TERM, true);
+        let reader = get_message_reader(&builder);
+        let (term, success) = Peer::handle_append_entries_reply(TERM, reader)
+                                    .unwrap();
+        assert_eq!(term, TERM);
+        assert!(success);
+    }
+
+    #[test]
+    fn append_entries_handles_incorrect_term() {
+        const TERM: u64 = 54;
+        let mut builder = message::Builder::new_default();
+        construct_append_entries_reply(&mut builder, TERM + 1, true);
+        let reader = get_message_reader(&builder);
+        let (term, success) = Peer::handle_append_entries_reply(TERM, reader)
+                                    .unwrap();
+        assert!(term != TERM);
+        assert!(!success);
+    }
+
+    #[test]
+    fn append_entries_handles_failed_commit() {
+        const TERM: u64 = 54;
+        let mut builder = message::Builder::new_default();
+        construct_append_entries_reply(&mut builder, TERM, false);
+        let reader = get_message_reader(&builder);
+        let (term, success) = Peer::handle_append_entries_reply(TERM, reader)
+                                    .unwrap();
+        assert!(term == TERM);
+        assert!(!success);
+    }
+
+
+    #[test]
+    fn constructs_valid_request_vote() {
         const TERM: u64 = 13;
         const CANDIDATE_ID: u64 = 6;
         const LAST_LOG_INDEX: u64 = 78;
@@ -289,7 +362,7 @@ mod tests {
     }
 
     #[test]
-    fn peer_vote_reply_handles_vote_granted() {
+    fn vote_reply_handles_vote_granted() {
         const TERM: u64 = 54;
         let mut builder = message::Builder::new_default();
         construct_request_vote_reply(&mut builder, TERM, true);
@@ -299,7 +372,7 @@ mod tests {
     }
 
     #[test]
-    fn peer_vote_reply_handles_incorrect_term() {
+    fn vote_reply_handles_incorrect_term() {
         const TERM: u64 = 26;
         let mut builder = message::Builder::new_default();
         construct_request_vote_reply(&mut builder, TERM - 1, true);
@@ -309,7 +382,7 @@ mod tests {
     }
 
     #[test]
-    fn peer_vote_reply_handles_vote_rejected() {
+    fn vote_reply_handles_vote_rejected() {
         const TERM: u64 = 14;
         let mut builder = message::Builder::new_default();
         construct_request_vote_reply(&mut builder, TERM, false);
@@ -322,7 +395,7 @@ mod tests {
     // TODO: Determine what level of error checking we want on the messages
     // I have not found consistent error behavior. Even out of bounds seems to proceed
     // without error on travis...
-    fn peer_vote_reply_handles_malformed_vote_replies() {
+    fn vote_reply_handles_malformed_vote_replies() {
         /*const TERM: u64 = 14;
         let mut builder = message::Builder::new_default();
         construct_append_entries_reply(&mut builder, TERM, true);
@@ -333,7 +406,7 @@ mod tests {
     }
 
     #[test]
-    fn peer_vote_reply_handles_malformed_rpc_replies() {
+    fn vote_reply_handles_malformed_rpc_replies() {
         // TODO(jason): Figure out why this test fails on travis
         /*const TERM: u64 = 19;
         let builder = message::Builder::new_default();

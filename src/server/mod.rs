@@ -26,7 +26,7 @@ pub enum RaftError {
     ClientError(String),      // Error defined by client.
     NotLeader(Option<u64>),   // I'm not the leader; give leader id
                               // if we know it.
-                              // TODO: actually keep track of this
+                              // TODO: actually keep track of the leader
 }
 
 ///
