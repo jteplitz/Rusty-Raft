@@ -59,6 +59,7 @@ impl PeerHandle {
             log.lock().unwrap().get_entries_from(self.next_index).to_vec()
         };
         let peer_index = self.next_index;
+        println!("Trying to read {}", peer_index);
         let last_entry = entries.get(peer_index).unwrap();
         self.to_peer.send(PeerThreadMessage::AppendEntries(AppendEntriesMessage {
             term: current_term,
@@ -106,7 +107,7 @@ impl Peer {
         PeerHandle {
             id: id.0,
             to_peer: to_peer,
-            next_index: commit_index,
+            next_index: commit_index + 1,
         }
     }
 

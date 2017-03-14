@@ -11,8 +11,9 @@ use rpc::server::{RpcObject, RpcServer};
 use std::net::SocketAddr;
 use std::time::{Duration, Instant};
 use std::thread;
+use std::thread::JoinHandle;
 use std::sync::{Arc, Mutex, Condvar};
-use std::sync::mpsc::{channel, Sender};
+use std::sync::mpsc::{channel, Sender, Receiver};
 
 use self::log::{Log, MemoryLog, Entry, Op};
 use self::peer::{Peer, PeerHandle, PeerThreadMessage, RequestVoteMessage};
@@ -20,6 +21,7 @@ use std::io::Error as IoError;
 use rand::distributions::{IndependentSample, Range};
 use std::collections::HashMap;
 
+pub use self::constants::CLIENT_REQUEST_OPCODE;
 
 #[derive(Debug)]
 pub enum RaftError { 
@@ -211,12 +213,13 @@ impl ServerState {
     /// our vote tracker.
     ///
     fn transition_to_follower(&mut self, new_term: u64, cv: &Condvar) {
-        debug_assert!(matches!(self.current_state, State::Candidate{ .. }) ||
-                      matches!(self.current_state, State::Leader{ .. }));
         debug_assert!(new_term >= self.current_term);
 
         if new_term > self.current_term {
             self.voted_for = None;
+        } else {
+            debug_assert!(matches!(self.current_state, State::Candidate{ .. }) ||
+                          matches!(self.current_state, State::Leader{ .. }));
         }
         self.current_term = new_term;
         self.current_state = State::Follower;
@@ -267,84 +270,49 @@ fn update_commit_index(server_info: &ServerInfo, state: &mut ServerState, cv: &C
     cv.notify_all();
 }
 
+pub struct ServerHandle {
+    tx: Sender<MainThreadMessage>,
+    thread: JoinHandle<()>,
+    addr: SocketAddr
+}
+
+impl ServerHandle {
+    pub fn shutdown() {
+        // TODO
+        unimplemented!()
+    }
+
+    /// 
+    /// Returns the local address of the given server.
+    /// This is useful if you started a server with port 0 and want to know which port the OS
+    /// assigned to the server.
+    ///
+    pub fn get_local_addr(&self) -> SocketAddr {
+        self.addr
+    }
+}
+
 ///
 /// Starts up a new raft server with the given config.
 /// This is mostly just a bootstrapper for now. It probably won't end up in the public API
 /// As of right now this function does not return. It just runs the state machine as long as it's
 /// in a live thread.
 ///
-pub fn start_server (config: Config, load_state_machine: &(Fn() -> Box<StateMachine>)) -> ! {
+pub fn start_server<F> (config: Config, load_state_machine: F) -> Result<ServerHandle, IoError>
+    where F: FnOnce() -> Box<StateMachine> {
     let (tx, rx) = channel();
-    let mut server = Server::new(config, tx, load_state_machine()).unwrap();
+    let tx_clone = tx.clone();
+    let server = try!(Server::new(config, tx, load_state_machine()));
+    let addr = server.get_local_addr();
 
-    // NB: This thread handles all state changes EXCEPT for those that move us back into the
-    // follower state from either the candidate or leader state. Those are both handled in the
-    // AppendEntriesRpcHandler
+    // start the server
+    let join_handle = server.repl(rx);
 
-    loop {
-        let current_timeout;
-        { // state lock scope
-            // TODO(jason): Decompose and test
-            let &(ref state_ref, ref cvar) = &*server.state;
-            let mut state = state_ref.lock().unwrap();
-
-            match state.current_state {
-                State::Follower => {
-                    let now = Instant::now();
-                    current_timeout = state.election_timeout - now.duration_since(state.last_leader_contact)
-                }
-                State::Candidate{start_time, ..} => {
-                    let time_since_election = Instant::now() - start_time;
-
-                    // TODO: Replace explicit underflow checks with checked_sub once rust 1.16
-                    // is out. Scheduled for March 16th 2017
-                    if time_since_election > state.election_timeout {
-                        // We timed out in between recieving a message and blocking on the message
-                        // pipe. Start a new election
-                        current_timeout = server.start_election(&mut state, cvar);
-                    } else {
-                        current_timeout = state.election_timeout - time_since_election;
-                    }
-                },
-                State::Leader{last_heartbeat} => {
-                    let heartbeat_timeout = server.info.heartbeat_timeout;
-                    // TODO: Should last_heartbeat be in the leader state?
-                    let since_last_heartbeat = Instant::now()
-                                                   .duration_since(last_heartbeat);
-                    // TODO: Replace explicit underflow checks with checked_sub once rust 1.16
-                    // is out. Scheduled for March 16th 2017
-                    if since_last_heartbeat > heartbeat_timeout {
-                        // We timed out in between recieving a message and blocking on the message
-                        // pipe. Send a heartbeat,
-                        broadcast_append_entries(&mut server.info, &mut state, server.log.clone());
-                        current_timeout = heartbeat_timeout;
-                    } else {
-                        current_timeout = heartbeat_timeout - since_last_heartbeat;
-                    }
-                },
-            } // end match server.state
-        } // release state lock
-
-        let message = match rx.recv_timeout(current_timeout) {
-            Ok(message) => message,
-            Err(_) => {
-                handle_timeout(&mut server);
-                continue;
-            },
-        };
-
-        // Acquire state lock
-        let &(ref state_ref, ref cvar) = &*server.state;
-        let ref mut state = * state_ref.lock().unwrap();
-        match message {
-            MainThreadMessage::AppendEntriesReply(m) => 
-                handle_append_entries_reply(m, &mut server.info, state, cvar, server.log.clone()),
-            MainThreadMessage::ClientAppendRequest  => 
-                broadcast_append_entries(&mut server.info, state, server.log.clone()),
-            MainThreadMessage::RequestVoteReply(m) => 
-                handle_request_vote_reply(m, &mut server.info, state, cvar, server.log.clone())
-        };
-    } // end loop
+    Ok(ServerHandle {
+        tx: tx_clone,
+        thread: join_handle,
+        addr: addr
+    })
 }
 
 ///
@@ -474,11 +442,11 @@ impl Server {
             (constants::REQUEST_VOTE_OPCODE, request_vote_handler),
             (constants::CLIENT_REQUEST_OPCODE, client_request_handler)
         ];
-        let mut server = RpcServer::new_with_services(services);
+        let mut rpc_server = RpcServer::new_with_services(services);
         try!(
-            server.bind((config.me.1.ip(), config.me.1.port()))
+            rpc_server.bind(me.1)
             .and_then(|_| {
-                server.repl()
+                rpc_server.repl()
             })
         );
 
@@ -489,9 +457,13 @@ impl Server {
             .collect::<Vec<PeerHandle>>();
 
         // 3. Construct server state object.
+        
+        // safe to unwrap here because we should only get this far
+        // if the server is bound.
+        let bound_address = rpc_server.get_local_addr().unwrap();
         let info = ServerInfo {
             peers: peers,
-            me: me,
+            me: (me.0, bound_address),
             heartbeat_timeout: config.heartbeat_timeout,
             to_state_machine: to_state_machine,
         };
@@ -500,6 +472,98 @@ impl Server {
             state: state,
             log: log,
             info: info,
+        })
+    }
+
+    /// 
+    /// Returns the local address of the given server.
+    /// This is useful if you started a server with port 0 and want to know which port the OS
+    /// assigned to the server.
+    ///
+    pub fn get_local_addr (&self) -> SocketAddr {
+        self.info.me.1
+    }
+
+    /// Starts running the raft consensus algorithim in a background thread.
+    /// Consumes the server in the process. All future communication with this
+    /// background thread should be from a sender that is linked to the passed in receiver
+    ///
+    /// #Panics
+    /// Panics if the OS fails to spawn a thread
+    fn repl(mut self, rx: Receiver<MainThreadMessage>) -> JoinHandle<()> {
+        thread::spawn(move || {
+            // NB: This thread handles all state changes EXCEPT for those that move us back into the
+            // follower state from either the candidate or leader state. Those are both handled in the
+            // AppendEntriesRpcHandler
+
+            loop {
+                let current_timeout;
+                { // state lock scope
+                    // TODO(jason): Decompose and test
+                    let &(ref state_ref, ref cvar) = &*self.state;
+                    let mut state = state_ref.lock().unwrap();
+
+                    match state.current_state {
+                        State::Follower => {
+                            let now = Instant::now();
+                            current_timeout = state.election_timeout - now.duration_since(state.last_leader_contact)
+                        }
+                        State::Candidate{start_time, ..} => {
+                            let time_since_election = Instant::now() - start_time;
+
+                            // TODO: Replace explicit underflow checks with checked_sub once rust 1.16
+                            // is out. Scheduled for March 16th 2017
+                            if time_since_election > state.election_timeout {
+                                // We timed out in between recieving a message and blocking on the message
+                                // pipe. Start a new election
+                                current_timeout = self.start_election(&mut state, cvar);
+                            } else {
+                                current_timeout = state.election_timeout - time_since_election;
+                            }
+                        },
+                        State::Leader{last_heartbeat} => {
+                            let heartbeat_timeout = self.info.heartbeat_timeout;
+                            // TODO: Should last_heartbeat be in the leader state?
+                            let since_last_heartbeat = Instant::now()
+                                                           .duration_since(last_heartbeat);
+                            // TODO: Replace explicit underflow checks with checked_sub once rust 1.16
+                            // is out. Scheduled for March 16th 2017
+                            if since_last_heartbeat > heartbeat_timeout {
+                                // We timed out in between recieving a message and blocking on the message
+                                // pipe. Send a heartbeat,
+                                broadcast_append_entries(&mut self.info, &mut state, self.log.clone());
+                                current_timeout = heartbeat_timeout;
+                            } else {
+                                current_timeout = heartbeat_timeout - since_last_heartbeat;
+                            }
+                        },
+                    } // end match server.state
+                } // release state lock
+
+                let message = match rx.recv_timeout(current_timeout) {
+                    Ok(message) => message,
+                    Err(_) => {
+                        // TODO: Move handle_timeout into Server?
+                        handle_timeout(&mut self);
+                        continue;
+                    },
+                };
+
+                // TODO(Jason): Add a shutdown message that the client can send
+                // to gracefully shutdown the server
+                // Acquire state lock
+                let &(ref state_ref, ref cvar) = &*self.state;
+                let ref mut state = * state_ref.lock().unwrap();
+                match message {
+                    MainThreadMessage::AppendEntriesReply(m) => 
+                        handle_append_entries_reply(m, &mut self.info, state, cvar, self.log.clone()),
+                    MainThreadMessage::ClientAppendRequest  => 
+                        broadcast_append_entries(&mut self.info, state, self.log.clone()),
+                    MainThreadMessage::RequestVoteReply(m) => 
+                        handle_request_vote_reply(m, &mut self.info, state, cvar, self.log.clone())
+                };
+            } // end loop
+            ()
         })
     }
 
@@ -564,6 +628,7 @@ impl RpcObject for RequestVoteHandler {
             state.last_leader_contact = Instant::now();
 
             if term > state.current_term {
+                // transition to a follower of the new term
                 // TODO(jason): This should happen on the main thread.
                 state.transition_to_follower(term, &cvar);
             }
@@ -574,7 +639,10 @@ impl RpcObject for RequestVoteHandler {
                     vote_granted = true;
                     state.voted_for = Some(candidate_id);
                     // TODO(jason): This should happen on the main thread.
-                    state.transition_to_follower(term, &cvar);
+                    if !matches!(state.current_state, State::Follower{ .. }) {
+                        // step down
+                        state.transition_to_follower(term, &cvar);
+                    }
                 }
             }
             current_term = state.current_term;
