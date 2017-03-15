@@ -200,10 +200,10 @@ impl ServerState {
         { // Scope the log lock so we drop it immediately afterwards.
             log.lock().unwrap().append_entry(Entry::noop(self.current_term));
         }
-        self.commit_index = self.commit_index + 1;
         for peer in &mut info.peers {
             peer.next_index = self.commit_index;
         }
+        self.commit_index = self.commit_index + 1;
         broadcast_append_entries(info, self, log.clone());
         cv.notify_all();
     }
@@ -1142,7 +1142,8 @@ mod tests {
                         // Since we march forwards all the peer next_index to
                         // our commit index when the leader changes, the first broadcast
                         // should actually just be a heartbeat.
-                        assert_eq!(msg.entries.len(), 0);
+                        assert_eq!(msg.entries.len(), 1);
+                        assert_eq!(*entry, msg.entries[0]);
                     },
                     _=> panic!("Incorrect message type sent in response to transition to leader")
                 }
