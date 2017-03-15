@@ -50,6 +50,7 @@ struct ClientRequest {
 
 struct ClientRequestReply {
   success       @0   :Bool;
-  data          @1   :Data;
+  leaderAddr    @1   :Text;
+  data          @2   :Data;
 }
 

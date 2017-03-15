@@ -1,4 +1,5 @@
 use rusty_raft::server::*;
+use rusty_raft::state_machine::*;
 use std::sync::mpsc::{Sender};
 use std::sync::Mutex;
 

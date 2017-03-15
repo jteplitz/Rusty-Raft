@@ -7,6 +7,7 @@ mod mock_state_machine;
 use mock_state_machine::*;
 use relay_server::*;
 use rusty_raft::server::*;
+use rusty_raft::state_machine::*;
 use rusty_raft::rpc::client::*;
 use rusty_raft::rpc::RpcError;
 use rusty_raft::client_request;

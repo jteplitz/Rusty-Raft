@@ -4,10 +4,18 @@
 /// See the submodules for information on how to set up a server and a client.
 pub mod rpc;
 
+// /// State machine interface.
+pub mod state_machine;
+
 ///
 /// Raft Server
 ///
 pub mod server;
+
+///
+/// Raft Client libraries
+///
+pub mod client;
 extern crate capnp;
 extern crate rand;
 
