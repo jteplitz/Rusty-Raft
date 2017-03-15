@@ -200,6 +200,7 @@ impl ServerState {
         { // Scope the log lock so we drop it immediately afterwards.
             log.lock().unwrap().append_entry(Entry::noop(self.current_term));
         }
+        self.commit_index = self.commit_index + 1;
         for peer in &mut info.peers {
             peer.next_index = self.commit_index;
         }
@@ -357,11 +358,14 @@ fn handle_append_entries_reply(m: AppendEntriesReply, server_info: &mut ServerIn
                 update_commit_index(server_info, state, state_condition);
             } else {
                 let leader_id = server_info.me.0;
-                // If we failed, roll back peer index by 1 and retry
+                // If we failed, roll back peer index by 1 (if we can) and retry
                 // the append entries call.
                 server_info.get_peer_mut(m.peer.0).map(|peer| {
-                    peer.next_index = peer.next_index - 1;
-                    peer.append_entries_nonblocking(leader_id, state.commit_index,
+                    if peer.next_index > 1 {
+                        peer.next_index = peer.next_index - 1;
+                    }
+                    peer.append_entries_nonblocking(leader_id,
+                                                    state.commit_index,
                                                     state.current_term, log);
                 });
             }
@@ -828,7 +832,7 @@ mod tests {
                 State, generate_election_timeout, update_commit_index,
                 StateMachineMessage,
                 handle_request_vote_reply};
-    use super::log::{MemoryLog, random_entry};
+    use super::log::{MemoryLog, random_entry, random_entries_with_term};
     use std::time::{Duration, Instant};
     use std::sync::mpsc::{channel, Receiver};
     use std::sync::{Arc, Mutex, Condvar};
@@ -840,7 +844,7 @@ mod tests {
         let state = Arc::new((Mutex::new(ServerState {
             current_state: State::Follower,
             current_term: 0,
-            commit_index: 0,
+            commit_index: 1,
             voted_for: None,
             last_leader_contact: Instant::now(),
             election_timeout: generate_election_timeout()
@@ -848,7 +852,7 @@ mod tests {
         let (tx, rx) = channel();
         let (tx1, rx1) = channel();
         let peers = (0 .. num_peers)
-            .map(|n| PeerHandle {id: n, to_peer: tx.clone(), next_index:0})
+            .map(|n| PeerHandle {id: n, to_peer: tx.clone(), next_index: 1})
             .collect::<Vec<PeerHandle>>();
         let server = Server {
             state: state,
@@ -868,15 +872,18 @@ mod tests {
     #[test]
     fn server_sends_append_entries() {
         const NUM_PEERS: u64 = 4;
+        const TERM: u64 = 5;
+        const NUM_ENTRIES: usize = 3;
         let (rx, _, mut s) = mock_server(NUM_PEERS);
-        let vec = vec![random_entry(); 3];
-        { // Append some random entries to log
+        let vec = random_entries_with_term(NUM_ENTRIES, TERM);
+        let commit_index = { // Append some random entries to log
           let mut log = s.log.lock().unwrap();
           log.append_entries(vec.clone());
-        }
-
+          log.get_last_entry_index()
+        };
         // Send append entries to peers!
         let ref mut state = s.state.0.lock().unwrap();
+        state.commit_index = commit_index + 1;
         state.current_state = State::Leader { last_heartbeat: Instant::now() };
         broadcast_append_entries(&mut s.info, state, s.log.clone());
 
@@ -1132,8 +1139,10 @@ mod tests {
             for _ in 0..s.info.peers.len() {
                 match rx.recv().unwrap() {
                     PeerThreadMessage::AppendEntries(msg) => {
-                        assert_eq!(msg.entries.len(), 1);
-                        assert_eq!(msg.entries[0], *entry);
+                        // Since we march forwards all the peer next_index to
+                        // our commit index when the leader changes, the first broadcast
+                        // should actually just be a heartbeat.
+                        assert_eq!(msg.entries.len(), 0);
                     },
                     _=> panic!("Incorrect message type sent in response to transition to leader")
                 }

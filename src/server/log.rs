@@ -35,6 +35,12 @@ pub fn random_entry_with_term(term: u64) -> Entry {
 }
 
 #[cfg(test)]
+pub fn random_entries_with_term(size: usize, term: u64) -> Vec<Entry> {
+  assert_ne!(term, 0);
+  (0 .. size).map(|_| random_entry_with_term(term)).collect::<Vec<Entry>>()
+}
+
+#[cfg(test)]
 pub fn random_entry() -> Entry {
     random_entry_with_term(1)
 }
@@ -194,6 +200,14 @@ impl MemoryLog {
         // start index is always 1, but will be dynamic after we implement snapshotting
         MemoryLog { entries: Vec::new(), start_index: 1}
     }
+
+    #[cfg(test)]
+    pub fn new_random_with_term(size: usize, term: u64) -> MemoryLog {
+        let mut log = MemoryLog::new();
+        log.append_entries(
+            (0 .. size).map(|_| random_entry_with_term(term)).collect());
+        log
+    }
 }
 
 impl Log for MemoryLog {
@@ -253,7 +267,7 @@ impl Log for MemoryLog {
     }
 
     fn roll_back(&mut self, index: usize) -> &Log {
-        let start_index = index - self.start_index + 1;
+        let start_index = index + 1 - self.start_index;
         if start_index >= self.entries.len() {
             return self; // nothing to remove
         }

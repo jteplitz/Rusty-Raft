@@ -52,21 +52,22 @@ impl PeerHandle {
     ///
     /// Pushes a non-blocking append-entries request to this peer.
     /// Panics if main thread has been deallocated.
+    /// TODO(sydli): test
     ///
     pub fn append_entries_nonblocking (&self, leader_id: u64, commit_index: usize,
                                        current_term: u64, log: Arc<Mutex<Log>>) {
-        let entries = {
-            log.lock().unwrap().get_entries_from(self.next_index).to_vec()
-        };
-        let peer_index = self.next_index;
-        println!("Trying to read {}", peer_index);
-        let last_entry = entries.get(peer_index).unwrap();
+        let prev_log_index = self.next_index - 1;
+        let (last_entry, entries) = {
+            let log = log.lock().unwrap();
+            (log.get_entry(prev_log_index).cloned(),
+             log.get_entries_from(prev_log_index).to_vec())
+        }; 
         self.to_peer.send(PeerThreadMessage::AppendEntries(AppendEntriesMessage {
             term: current_term,
             leader_id: leader_id,
-            prev_log_index: peer_index,
-            prev_log_term: last_entry.term,
-            entries: entries.to_vec(),
+            prev_log_index: prev_log_index,
+            prev_log_term: last_entry.map(|entry| entry.term).unwrap_or(0),
+            entries: entries[.. commit_index - self.next_index].to_vec(),
             leader_commit: commit_index,
         })).unwrap(); // This failing means main thread is down.
     }
@@ -107,7 +108,7 @@ impl Peer {
         PeerHandle {
             id: id.0,
             to_peer: to_peer,
-            next_index: commit_index + 1,
+            next_index: 1,
         }
     }
 
@@ -251,9 +252,11 @@ mod tests {
     use capnp::{message, serialize_packed};
     use capnp::serialize::OwnedSegments;
     use std::io::BufReader;
+    use std::sync::mpsc::{channel};
+    use std::sync::{Arc, Mutex};
     use super::*;
     use super::super::constants;
-    use super::super::log::{Entry, random_entry_with_term};
+    use super::super::log::{Entry, random_entry_with_term, random_entries_with_term, Log, MemoryLog};
     use super::super::super::rpc::client::*;
     use super::super::super::raft_capnp::{request_vote, request_vote_reply,
                                           append_entries, append_entries_reply};
@@ -286,8 +289,6 @@ mod tests {
         assert_eq!(param_reader.get_leader_commit(), LEADER_COMMIT);
         let all_true = entries.iter().zip(param_reader.get_entries().unwrap().iter())
             .fold(true, |and, (entry1, entry2)| {
-                println!("1{:?}", entry1);
-                println!("2{:?}", Entry::from_proto(entry2));
                 and && (*entry1 == Entry::from_proto(entry2))
             });
         assert!(all_true);
@@ -329,6 +330,81 @@ mod tests {
         assert!(!success);
     }
 
+    #[test]
+    fn peerhandle_append_entries_sends_correct_entries() {
+        let (tx, rx) = channel();
+        const TERM: u64 = 5;
+        const PEER_NEXT_INDEX: usize = 3; // PEER_NEXT_INDEX <= COMMIT_INDEX
+        const COMMIT_INDEX: usize = 8; // COMMIT_INDEX <= LOG_SIZE
+        const LOG_SIZE: usize = 10;
+        const LEADER_ID: u64 = 0; // LEADER_ID != PEER_ID
+        const PEER_ID: u64 = 1;
+        // Log: 3 .. 8 .. 10
+        // 7 is committed on leader, peer has through entry 2
+        // leader should send entries 3 through 7 = 5 entries total
+        let handle = PeerHandle {
+            id: 1,
+            to_peer: tx.clone(),
+            next_index: PEER_NEXT_INDEX,
+        };
+        let log: Arc<Mutex<Log>> = Arc::new(Mutex::new(MemoryLog::new_random_with_term(LOG_SIZE, TERM)));
+        handle.append_entries_nonblocking(LEADER_ID, COMMIT_INDEX, TERM, log.clone());
+        match rx.recv().unwrap() {
+            PeerThreadMessage::AppendEntries(message) => {
+                assert_eq!(message.term, TERM);
+                assert_eq!(message.leader_id, LEADER_ID);
+                assert_eq!(message.leader_commit, COMMIT_INDEX);
+                assert_eq!(message.prev_log_index, PEER_NEXT_INDEX - 1);
+                assert_eq!(message.prev_log_term, TERM);
+                assert_eq!(message.entries.len(), COMMIT_INDEX - PEER_NEXT_INDEX);
+                let log_entries = log.lock().unwrap().get_entries_from(PEER_NEXT_INDEX - 1)
+                    [.. COMMIT_INDEX - PEER_NEXT_INDEX] .to_vec();
+                assert_eq!(message.entries.len(), log_entries.len());
+                let entries_same = message.entries.iter().zip(log_entries.iter())
+                    .fold(true, |and, (e1, e2)| and && *e1 == *e2);
+                assert!(entries_same);
+            },
+            PeerThreadMessage::RequestVote(_) => panic!(),
+        };
+    }
+
+    #[test]
+    fn peerhandle_append_entries_sends_correct_empty_message() {
+        let (tx, rx) = channel();
+        const TERM: u64 = 5;
+        const PEER_NEXT_INDEX: usize = 8; // PEER_NEXT_INDEX <= COMMIT_INDEX
+        const COMMIT_INDEX: usize = 8; // COMMIT_INDEX <= LOG_SIZE
+        const LOG_SIZE: usize = 10;
+        const LEADER_ID: u64 = 0; // LEADER_ID != PEER_ID
+        const PEER_ID: u64 = 1;
+        // Log: 8 .. 8 .. 10
+        // 7 is committed on leader, peer has through entry 7 @ TERM - 1
+        // 8 through 10 @ TERM
+        // leader should send no entires!
+        let handle = PeerHandle {
+            id: 1,
+            to_peer: tx.clone(),
+            next_index: PEER_NEXT_INDEX,
+        };
+        let log: Arc<Mutex<Log>> = Arc::new(Mutex::new(MemoryLog::new()));
+        {
+            let mut log = log.lock().unwrap();
+            log.append_entries(random_entries_with_term(COMMIT_INDEX, TERM - 1));
+            log.append_entries(random_entries_with_term(LOG_SIZE - (COMMIT_INDEX), TERM));
+        }
+        handle.append_entries_nonblocking(LEADER_ID, COMMIT_INDEX, TERM, log.clone());
+        match rx.recv().unwrap() {
+            PeerThreadMessage::AppendEntries(message) => {
+                assert_eq!(message.term, TERM);
+                assert_eq!(message.leader_id, LEADER_ID);
+                assert_eq!(message.leader_commit, COMMIT_INDEX);
+                assert_eq!(message.prev_log_index, PEER_NEXT_INDEX - 1);
+                assert_eq!(message.prev_log_term, TERM - 1);
+                assert_eq!(message.entries.len(), 0);
+            },
+            PeerThreadMessage::RequestVote(_) => panic!(),
+        };
+    }
 
     #[test]
     fn constructs_valid_request_vote() {
