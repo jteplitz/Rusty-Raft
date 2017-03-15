@@ -352,7 +352,7 @@ fn handle_append_entries_reply(m: AppendEntriesReply, server_info: &mut ServerIn
                 // On success, advance peer's index.
                 server_info.get_peer_mut(m.peer.0).map(|peer| {
                     if m.commit_index > peer.next_index {
-                        peer.next_index = m.commit_index + 1;
+                        peer.next_index = m.commit_index;
                     }
                 });
                 update_commit_index(server_info, state, state_condition);
@@ -419,7 +419,7 @@ impl Server {
         let state = Arc::new((Mutex::new(ServerState {
             current_state: State::Follower,
             current_term: 0,
-            commit_index: 0,
+            commit_index: 1,
             voted_for: None,
             last_leader_contact: Instant::now(),
             election_timeout: generate_election_timeout(),
