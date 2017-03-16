@@ -201,7 +201,7 @@ impl ServerState {
             log.lock().unwrap().append_entry(Entry::noop(self.current_term));
         }
         for peer in &mut info.peers {
-            peer.next_index = self.commit_index;
+            peer.next_index = self.commit_index + 1;
         }
         self.commit_index = self.commit_index + 1;
         broadcast_append_entries(info, self, log.clone());
@@ -261,7 +261,7 @@ impl ServerInfo {
 ///
 fn update_commit_index(server_info: &ServerInfo, state: &mut ServerState, cv: &Condvar) {
     // Find median of all peer commit indices.
-    let mut indices: Vec<usize> = server_info.peers.iter().map(|ref peer| peer.next_index.clone()).collect();
+    let mut indices: Vec<usize> = server_info.peers.iter().map(|ref peer| peer.match_index).collect();
     indices.sort();
     let new_index = *indices.get( (indices.len() - 1) / 2 ).unwrap();
     // Set new commit index if it's higher!
@@ -352,7 +352,8 @@ fn handle_append_entries_reply(m: AppendEntriesReply, server_info: &mut ServerIn
                 // On success, advance peer's index.
                 server_info.get_peer_mut(m.peer.0).map(|peer| {
                     if m.commit_index > peer.next_index {
-                        peer.next_index = m.commit_index;
+                        peer.next_index = m.commit_index + 1;
+                        peer.match_index = m.commit_index;
                     }
                 });
                 update_commit_index(server_info, state, state_condition);
@@ -362,6 +363,7 @@ fn handle_append_entries_reply(m: AppendEntriesReply, server_info: &mut ServerIn
                 // the append entries call.
                 server_info.get_peer_mut(m.peer.0).map(|peer| {
                     if peer.next_index > 1 {
+                        // can we make sure match_index never exceeds peer_index?
                         peer.next_index = peer.next_index - 1;
                     }
                     peer.append_entries_nonblocking(leader_id,
@@ -419,7 +421,7 @@ impl Server {
         let state = Arc::new((Mutex::new(ServerState {
             current_state: State::Follower,
             current_term: 0,
-            commit_index: 1,
+            commit_index: 0,
             voted_for: None,
             last_leader_contact: Instant::now(),
             election_timeout: generate_election_timeout(),
@@ -844,7 +846,7 @@ mod tests {
         let state = Arc::new((Mutex::new(ServerState {
             current_state: State::Follower,
             current_term: 0,
-            commit_index: 1,
+            commit_index: 0,
             voted_for: None,
             last_leader_contact: Instant::now(),
             election_timeout: generate_election_timeout()
@@ -852,7 +854,8 @@ mod tests {
         let (tx, rx) = channel();
         let (tx1, rx1) = channel();
         let peers = (0 .. num_peers)
-            .map(|n| PeerHandle {id: n, to_peer: tx.clone(), next_index: 1})
+            .map(|n| PeerHandle {id: n, to_peer: tx.clone(),
+                                 next_index: 1, match_index: 0})
             .collect::<Vec<PeerHandle>>();
         let server = Server {
             state: state,
@@ -880,7 +883,7 @@ mod tests {
           let mut log = s.log.lock().unwrap();
           log.append_entries(vec.clone());
           log.get_last_entry_index()
-        };
+        } - 1;
         // Send append entries to peers!
         let ref mut state = s.state.0.lock().unwrap();
         state.commit_index = commit_index + 1;
@@ -928,10 +931,10 @@ mod tests {
         let (ref state_ref, ref cvar) = *s.state;
         let mut state = state_ref.lock().unwrap();
         { // Change state
-            s.info.peers[0].next_index = 2;
-            s.info.peers[1].next_index = 1;
-            s.info.peers[2].next_index = 2;
-            s.info.peers[3].next_index = 3;
+            s.info.peers[0].match_index = 2;
+            s.info.peers[1].match_index = 1;
+            s.info.peers[2].match_index = 2;
+            s.info.peers[3].match_index = 3;
         }
         update_commit_index(&s.info, &mut state, &cvar);
         assert_eq!(state.commit_index, 2);

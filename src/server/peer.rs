@@ -46,28 +46,33 @@ pub struct PeerHandle {
     pub id: u64,
     pub to_peer: Sender<PeerThreadMessage>,
     pub next_index: usize,
+    pub match_index: usize,
 }
 
 impl PeerHandle {
     ///
     /// Pushes a non-blocking append-entries request to this peer.
+    /// copies entries (self.next_index, commit_index + 1) (inclusive, exlcusive)
     /// Panics if main thread has been deallocated.
-    /// TODO(sydli): test
     ///
     pub fn append_entries_nonblocking (&self, leader_id: u64, commit_index: usize,
                                        current_term: u64, log: Arc<Mutex<Log>>) {
+        debug_assert!(self.next_index <= commit_index + 1);
         let prev_log_index = self.next_index - 1;
         let (last_entry, entries) = {
             let log = log.lock().unwrap();
             (log.get_entry(prev_log_index).cloned(),
              log.get_entries_from(prev_log_index).to_vec())
         }; 
+        // We should never be out of bounds.
+        debug_assert!(commit_index - prev_log_index <= entries.len());
+
         self.to_peer.send(PeerThreadMessage::AppendEntries(AppendEntriesMessage {
             term: current_term,
             leader_id: leader_id,
             prev_log_index: prev_log_index,
             prev_log_term: last_entry.map(|entry| entry.term).unwrap_or(0),
-            entries: entries[.. commit_index - self.next_index].to_vec(),
+            entries: entries[.. commit_index - prev_log_index].to_vec(),
             leader_commit: commit_index,
         })).unwrap(); // This failing means main thread is down.
     }
@@ -109,6 +114,7 @@ impl Peer {
             id: id.0,
             to_peer: to_peer,
             next_index: 1,
+            match_index: 0,
         }
     }
 
@@ -334,18 +340,19 @@ mod tests {
     fn peerhandle_append_entries_sends_correct_entries() {
         let (tx, rx) = channel();
         const TERM: u64 = 5;
-        const PEER_NEXT_INDEX: usize = 3; // PEER_NEXT_INDEX <= COMMIT_INDEX
-        const COMMIT_INDEX: usize = 8; // COMMIT_INDEX <= LOG_SIZE
+        const PEER_NEXT_INDEX: usize = 3; // PEER_NEXT_INDEX <= COMMIT_INDEX + 1
+        const COMMIT_INDEX: usize = 8; // COMMIT_INDEX < LOG_SIZE
         const LOG_SIZE: usize = 10;
         const LEADER_ID: u64 = 0; // LEADER_ID != PEER_ID
         const PEER_ID: u64 = 1;
         // Log: 3 .. 8 .. 10
-        // 7 is committed on leader, peer has through entry 2
+        // 8 is committed on leader, peer has through entry 2
         // leader should send entries 3 through 7 = 5 entries total
         let handle = PeerHandle {
             id: 1,
             to_peer: tx.clone(),
             next_index: PEER_NEXT_INDEX,
+            match_index: PEER_NEXT_INDEX - 1,
         };
         let log: Arc<Mutex<Log>> = Arc::new(Mutex::new(MemoryLog::new_random_with_term(LOG_SIZE, TERM)));
         handle.append_entries_nonblocking(LEADER_ID, COMMIT_INDEX, TERM, log.clone());
@@ -356,9 +363,9 @@ mod tests {
                 assert_eq!(message.leader_commit, COMMIT_INDEX);
                 assert_eq!(message.prev_log_index, PEER_NEXT_INDEX - 1);
                 assert_eq!(message.prev_log_term, TERM);
-                assert_eq!(message.entries.len(), COMMIT_INDEX - PEER_NEXT_INDEX);
+                assert_eq!(message.entries.len(), COMMIT_INDEX - PEER_NEXT_INDEX + 1);
                 let log_entries = log.lock().unwrap().get_entries_from(PEER_NEXT_INDEX - 1)
-                    [.. COMMIT_INDEX - PEER_NEXT_INDEX] .to_vec();
+                    [.. COMMIT_INDEX - PEER_NEXT_INDEX + 1] .to_vec();
                 assert_eq!(message.entries.len(), log_entries.len());
                 let entries_same = message.entries.iter().zip(log_entries.iter())
                     .fold(true, |and, (e1, e2)| and && *e1 == *e2);
@@ -372,8 +379,8 @@ mod tests {
     fn peerhandle_append_entries_sends_correct_empty_message() {
         let (tx, rx) = channel();
         const TERM: u64 = 5;
-        const PEER_NEXT_INDEX: usize = 8; // PEER_NEXT_INDEX <= COMMIT_INDEX
-        const COMMIT_INDEX: usize = 8; // COMMIT_INDEX <= LOG_SIZE
+        const PEER_NEXT_INDEX: usize = 9; // PEER_NEXT_INDEX <= COMMIT_INDEX + 1
+        const COMMIT_INDEX: usize = 8; // COMMIT_INDEX < LOG_SIZE
         const LOG_SIZE: usize = 10;
         const LEADER_ID: u64 = 0; // LEADER_ID != PEER_ID
         const PEER_ID: u64 = 1;
@@ -385,6 +392,7 @@ mod tests {
             id: 1,
             to_peer: tx.clone(),
             next_index: PEER_NEXT_INDEX,
+            match_index: PEER_NEXT_INDEX - 1,
         };
         let log: Arc<Mutex<Log>> = Arc::new(Mutex::new(MemoryLog::new()));
         {
