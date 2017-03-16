@@ -105,6 +105,7 @@ pub enum MainThreadMessage {
     AppendEntriesReply (AppendEntriesReply),
     RequestVoteReply (RequestVoteReply),
     ClientAppendRequest,
+    ResetElectionTimeout,
 }
 
 ///
@@ -428,15 +429,17 @@ impl Server {
         let to_state_machine = state_machine_thread(log.clone(), 0, state_machine);
 
         // 1. Start RPC request handlers
+        let to_main_locked = Arc::new(Mutex::new(tx.clone()));
         let append_entries_handler: Box<RpcObject> = Box::new(
-            AppendEntriesHandler {state: state.clone(), log: log.clone()}
+            AppendEntriesHandler {state: state.clone(), log: log.clone(),
+                                  to_main: to_main_locked.clone() }
         );
         let request_vote_handler: Box<RpcObject> = Box::new(
             RequestVoteHandler {state: state.clone(), log: log.clone()}
         );
         let client_request_handler: Box<RpcObject> = Box::new(
             ClientRequestHandler {state: state.clone(), log: log.clone(),
-                                  to_main: Arc::new(Mutex::new(tx.clone())),
+                                  to_main: to_main_locked.clone(),
                                   to_state_machine: Arc::new(Mutex::new(
                                           to_state_machine.clone()))}
         );
@@ -563,7 +566,9 @@ impl Server {
                     MainThreadMessage::ClientAppendRequest  => 
                         broadcast_append_entries(&mut self.info, state, self.log.clone()),
                     MainThreadMessage::RequestVoteReply(m) => 
-                        handle_request_vote_reply(m, &mut self.info, state, cvar, self.log.clone())
+                        handle_request_vote_reply(m, &mut self.info, state, cvar,
+                                                  self.log.clone()),
+                    MainThreadMessage::ResetElectionTimeout => (),
                 };
             } // end loop
             ()
@@ -659,7 +664,8 @@ impl RpcObject for RequestVoteHandler {
 
 struct AppendEntriesHandler {
     state: Arc<(Mutex<ServerState>, Condvar)>,
-    log: Arc<Mutex<Log>>
+    log: Arc<Mutex<Log>>,
+    to_main: Arc<Mutex<Sender<MainThreadMessage>>>,
 }
 
 fn create_reply_for_append_entries(
@@ -667,44 +673,51 @@ fn create_reply_for_append_entries(
         state: Arc<(Mutex<ServerState>, Condvar)>,
         commit_index: usize, current_term: u64,
         message: append_entries::Reader,
-        reply: &mut append_entries_reply::Builder) {
+        reply: &mut append_entries_reply::Builder,
+        to_main: Arc<Mutex<Sender<MainThreadMessage>>>) {
     // Update last leader contact.
     { state.0.lock().unwrap().last_leader_contact = Instant::now() }
-    let mut success = false;
-    let prev_log_index = message.get_prev_log_index() as usize;
+    reply.set_success(false);
+    reply.set_term(current_term);
 
+    // Check: If our term doesn't match the message's term...
+    if message.get_term() < current_term { return; }
+    if message.get_term() > current_term {
+        { // Become follower for the higher term
+            let &(ref state_ref, ref cvar) = &*state;
+            state_ref.lock().unwrap().transition_to_follower(
+                message.get_term(), cvar);
+        }
+        reply.set_term(message.get_term());
+    }
+    // Reset election timer for this term.
+    { to_main.lock().unwrap().send(MainThreadMessage::ResetElectionTimeout).unwrap(); }
+    // Check: (prev_log_term, prev_log_index) exists in our log
+    let prev_log_index = message.get_prev_log_index() as usize;
     let (last_log_index, prev_log_entry) = {
         let log = log.lock().unwrap();
         (log.get_last_entry_index(), log.get_entry(prev_log_index).cloned())
     };
-    // Consistency check:
-    //   If this (term, index) doesn't exist as an entry in our log, or
-    //   the term differs, fail.
     if prev_log_index > last_log_index ||
-       prev_log_entry.map(|x| x.term).unwrap_or(0) != message.get_prev_log_term() ||
-       message.get_term() > current_term {
-            // If index matches but term differs, fail.
-            reply.set_success(false);
-            reply.set_term(current_term);
+       prev_log_entry.map(|x| x.term).unwrap_or(0)
+           != message.get_prev_log_term() {
             return;
     }
+    // Append all the entries to our log.
     let entries: Vec<Entry> = message.get_entries().unwrap().iter()
         .map(Entry::from_proto).collect();
-    let entries_len = entries.len();
-    { // Append entries to log.
+    let commit_index = { // Append entries to log.
         let mut log = log.lock().unwrap();
         log.roll_back(prev_log_index);
         log.append_entries(entries);
+        log.get_last_entry_index()
+    };
+    { // March forward the commit index.
+        state.0.lock().unwrap().commit_index = commit_index;
     }
-    { // March forward our commit index.
-        state.0.lock().unwrap().commit_index += entries_len;
-    }
-    success = true;
-    reply.set_success(success);
-    reply.set_term(current_term);
+    reply.set_success(true);
 }
 
-// TODO(sydli): Test
 impl RpcObject for AppendEntriesHandler {
 
     fn handle_rpc (&self, params: capnp::any_pointer::Reader, result: capnp::any_pointer::Builder) 
@@ -720,7 +733,8 @@ impl RpcObject for AppendEntriesHandler {
             .map(|append_entries|
                      create_reply_for_append_entries(
                          self.log.clone(), self.state.clone(), commit_index, term,
-                         append_entries, &mut reply))
+                         append_entries, &mut reply,
+                         self.to_main.clone()))
             .map_err(RpcError::Capnp)
     }
 }
