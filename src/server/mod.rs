@@ -187,6 +187,7 @@ impl ServerState {
         self.current_term += 1;
         self.voted_for = Some(my_id); // vote for ourselves
         self.election_timeout = generate_election_timeout();
+        println!("Server {}: Became candidate for term {}", my_id, self.current_term);
         cv.notify_all();
     }
 
@@ -318,27 +319,6 @@ pub fn start_server<F> (config: Config, load_state_machine: F) -> Result<ServerH
 }
 
 ///
-/// Handles timeouts on the main thread.
-/// Timeouts are handled differently based on our current state.
-/// If we're a follower or candidate we start a new election
-/// If we're the leader we send a hearbeat
-///
-/// # Panics
-/// Panics if any of the peer threads have panicked.
-///
-fn handle_timeout(server: &mut Server) {
-    let (ref state_ref, ref cvar) = *server.state;
-    let ref mut state = * state_ref.lock().unwrap();
-
-    match state.current_state {
-        State::Follower | State::Candidate{ .. } => {
-            server.start_election(state, cvar);
-        },
-        State::Leader{ .. } => broadcast_append_entries(&mut server.info, state, server.log.clone())
-    }
-}
-
-///
 /// If we're leader, handle replies from peers who respond to AppendEntries.
 /// If we hear about a term greater than ours, step down.
 /// If we're Candidate or Follower, we drop the message.
@@ -352,6 +332,7 @@ fn handle_append_entries_reply(m: AppendEntriesReply, server_info: &mut ServerIn
             } else if m.success {
                 // On success, advance peer's index.
                 server_info.get_peer_mut(m.peer.0).map(|peer| {
+                    debug_assert!(m.commit_index >= peer.next_index - 1);
                     peer.next_index = m.commit_index + 1;
                     peer.match_index = m.commit_index;
                 });
@@ -407,6 +388,7 @@ fn handle_request_vote_reply(reply: RequestVoteReply, info: &mut ServerInfo,
         if num_votes > (info.peers.len() + 1) / 2 {
             // Woo! We won the election
             state.transition_to_leader(info, log, state_condition);
+            println!("Server {}: Became leader for term {}", info.me.0, state.current_term);
         }
     }
 }
@@ -550,7 +532,7 @@ impl Server {
                     Ok(message) => message,
                     Err(_) => {
                         // TODO: Move handle_timeout into Server?
-                        handle_timeout(&mut self);
+                        self.handle_timeout();
                         continue;
                     },
                 };
@@ -561,19 +543,57 @@ impl Server {
                 let &(ref state_ref, ref cvar) = &*self.state;
                 let ref mut state = * state_ref.lock().unwrap();
                 match message {
-                    MainThreadMessage::AppendEntriesReply(m) => 
-                        handle_append_entries_reply(m, &mut self.info, state, cvar, self.log.clone()),
-                    MainThreadMessage::ClientAppendRequest  => 
-                        broadcast_append_entries(&mut self.info, state, self.log.clone()),
-                    MainThreadMessage::RequestVoteReply(m) => 
-                        handle_request_vote_reply(m, &mut self.info, state, cvar,
-                                                  self.log.clone()),
+                    MainThreadMessage::AppendEntriesReply(m) => {
+                        println!("Server {}: Got append entries reply from {} for index {} in term {} {}",
+                                 self.info.me.0, m.peer.0, m.commit_index, m.term, m.success);
+                        handle_append_entries_reply(m, &mut self.info, state, cvar, self.log.clone());
+                    },
+                    MainThreadMessage::ClientAppendRequest => {
+                        println!("Server {}: Got client append request", self.info.me.0);
+                        broadcast_append_entries(&mut self.info, state, self.log.clone());
+                    },
+                    MainThreadMessage::RequestVoteReply(m) =>  {
+                        println!("Server {}: Got vote reply", self.info.me.0);
+                        handle_request_vote_reply(m, &mut self.info, state, cvar, self.log.clone());
+                    },
                     MainThreadMessage::ResetElectionTimeout => (),
                 };
             } // end loop
             ()
         })
     }
+
+    ///
+    /// Handles timeouts on the main thread.
+    /// Timeouts are handled differently based on our current state.
+    /// If we're a follower or candidate, we check if we've recieved 
+    /// anything from the leader since we went to sleep. 
+    /// If not then we start a new election
+    /// If we're the leader we send a hearbeat
+    ///
+    /// # Panics
+    /// Panics if any of the peer threads have panicked.
+    ///
+    fn handle_timeout(&mut self) {
+        let (ref state_ref, ref cvar) = *self.state;
+        let ref mut state = * state_ref.lock().unwrap();
+
+        match state.current_state {
+            State::Follower | State::Candidate{ .. } => {
+                let now = Instant::now();
+                if now.duration_since(state.last_leader_contact) > state.election_timeout {
+                    println!("Server {}: Haven't heard from leader since {:?}", self.info.me.0, state.last_leader_contact);
+                    println!("Server {}: Haven't heard from leader. Starting election", self.info.me.0);
+                    self.start_election(state, cvar);
+                }
+            },
+            State::Leader{ .. } => {
+                println!("Server {}: sending heartbeat", self.info.me.0);
+                broadcast_append_entries(&mut self.info, state, self.log.clone());
+            }
+        }
+    }
+
 
     ///
     /// Starts a new election by requesting votes from all peers.
@@ -861,7 +881,7 @@ mod tests {
                 State, generate_election_timeout, update_commit_index,
                 StateMachineMessage,
                 handle_request_vote_reply};
-    use super::log::{MemoryLog, random_entry, random_entries_with_term};
+    use super::log::{MemoryLog, random_entries_with_term};
     use std::time::{Duration, Instant};
     use std::sync::mpsc::{channel, Receiver};
     use std::sync::{Arc, Mutex, Condvar};
