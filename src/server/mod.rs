@@ -351,10 +351,8 @@ fn handle_append_entries_reply(m: AppendEntriesReply, server_info: &mut ServerIn
             } else if m.success {
                 // On success, advance peer's index.
                 server_info.get_peer_mut(m.peer.0).map(|peer| {
-                    if m.commit_index > peer.next_index {
-                        peer.next_index = m.commit_index + 1;
-                        peer.match_index = m.commit_index;
-                    }
+                    peer.next_index = m.commit_index + 1;
+                    peer.match_index = m.commit_index;
                 });
                 update_commit_index(server_info, state, state_condition);
             } else {
@@ -411,7 +409,6 @@ fn handle_request_vote_reply(reply: RequestVoteReply, info: &mut ServerInfo,
         }
     }
 }
-
 
 impl Server {
     fn new (config: Config, tx: Sender<MainThreadMessage>, state_machine: Box<StateMachine>)
@@ -665,9 +662,51 @@ struct AppendEntriesHandler {
     log: Arc<Mutex<Log>>
 }
 
+fn create_reply_for_append_entries(
+        log: Arc<Mutex<Log>>,
+        state: Arc<(Mutex<ServerState>, Condvar)>,
+        commit_index: usize, current_term: u64,
+        message: append_entries::Reader,
+        reply: &mut append_entries_reply::Builder) {
+    // Update last leader contact.
+    { state.0.lock().unwrap().last_leader_contact = Instant::now() }
+    let mut success = false;
+    let prev_log_index = message.get_prev_log_index() as usize;
+
+    let (last_log_index, prev_log_entry) = {
+        let log = log.lock().unwrap();
+        (log.get_last_entry_index(), log.get_entry(prev_log_index).cloned())
+    };
+    // Consistency check:
+    //   If this (term, index) doesn't exist as an entry in our log, or
+    //   the term differs, fail.
+    if prev_log_index > last_log_index ||
+       prev_log_entry.map(|x| x.term).unwrap_or(0) != message.get_prev_log_term() ||
+       message.get_term() > current_term {
+            // If index matches but term differs, fail.
+            reply.set_success(false);
+            reply.set_term(current_term);
+            return;
+    }
+    let entries: Vec<Entry> = message.get_entries().unwrap().iter()
+        .map(Entry::from_proto).collect();
+    let entries_len = entries.len();
+    { // Append entries to log.
+        let mut log = log.lock().unwrap();
+        log.roll_back(prev_log_index);
+        log.append_entries(entries);
+    }
+    { // March forward our commit index.
+        state.0.lock().unwrap().commit_index += entries_len;
+    }
+    success = true;
+    reply.set_success(success);
+    reply.set_term(current_term);
+}
 
 // TODO(sydli): Test
 impl RpcObject for AppendEntriesHandler {
+
     fn handle_rpc (&self, params: capnp::any_pointer::Reader, result: capnp::any_pointer::Builder) 
         -> Result<(), RpcError>
     {
@@ -676,39 +715,13 @@ impl RpcObject for AppendEntriesHandler {
             let state = self.state.0.lock().unwrap();
             (state.commit_index, state.current_term)
         };
-        params.get_as::<append_entries::Reader>().map(|append_entries| {
-           let mut success = false;
-           let prev_log_index = append_entries.get_prev_log_index() as usize;
-           // TODO: If this is a valid rpc from the leader, update last_leader_contact
-           // TODO: If we're in the CANDIDATE state and this leader's term is
-           //       >= our current term
-
-           // If term doesn't match, something's wrong (incorrect leader).
-           if append_entries.get_term() != term {
-               return; /* TODO @Jason Wat do?? */
-           }
-           // Update last leader contact timestamp.
-           { self.state.0.lock().unwrap().last_leader_contact = Instant::now() }
-           // If term matches we're good to go... update state!
-           if prev_log_index == commit_index {
-               // Deserialize entries from RPC.
-               let entries: Vec<Entry> = append_entries.get_entries().unwrap().iter()
-                   .map(Entry::from_proto).collect();
-               let entries_len = entries.len();
-               { // Append entries to log.
-                   let mut log = self.log.lock().unwrap();
-                   log.append_entries(entries);
-               }
-               { // March forward our commit index.
-                   self.state.0.lock().unwrap().commit_index += entries_len;
-               }
-               success = true;
-           }
-           let mut reply = result.init_as::<append_entries_reply::Builder>();
-           reply.set_success(success);
-           reply.set_term(term);
-       })
-       .map_err(RpcError::Capnp)
+        let mut reply = result.init_as::<append_entries_reply::Builder>();
+        params.get_as::<append_entries::Reader>()
+            .map(|append_entries|
+                     create_reply_for_append_entries(
+                         self.log.clone(), self.state.clone(), commit_index, term,
+                         append_entries, &mut reply))
+            .map_err(RpcError::Capnp)
     }
 }
 

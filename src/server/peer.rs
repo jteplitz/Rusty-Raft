@@ -57,6 +57,7 @@ impl PeerHandle {
     ///
     pub fn append_entries_nonblocking (&self, leader_id: u64, commit_index: usize,
                                        current_term: u64, log: Arc<Mutex<Log>>) {
+        println!("{} to {}: append entry for term {}", leader_id, self.id, current_term);
         debug_assert!(self.next_index <= commit_index + 1);
         let prev_log_index = self.next_index - 1;
         let (last_entry, entries) = {
