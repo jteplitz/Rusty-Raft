@@ -94,8 +94,9 @@ fn create_client_request(op: Op, data: &[u8]) -> Rpc {
 /// and ensures that entry is recieved by all state machines
 fn it_replicates_an_entry() {
     const NUM_SERVERS: u64 = 3;
-    const REPLICATE_TIMEOUT: u64 = 500;
-    const DATA_LENGTH: usize = 810;
+    const REPLICATE_TIMEOUT: u64 = 100;
+    const DATA_LENGTH: usize = 1;
+    let replicate_timeout = Duration::from_millis(REPLICATE_TIMEOUT);
 
     let (mut relay_server, addrs) = start_relay_server(NUM_SERVERS);
     let state_machines = start_raft_servers(&mut relay_server, &addrs);
@@ -120,8 +121,14 @@ fn it_replicates_an_entry() {
         });
     // only 1 server should reply as leader
     assert_eq!(leader_reply_iter.count(), 1);
-    
-    // ensure that each state machine replicated the entry 
 
+    // ensure that all state machines replicated the entry 
+    assert!(state_machines
+                .iter()
+                .map(|handle| handle.rx.recv_timeout(replicate_timeout).unwrap())
+                .all(|vec| vec.iter()
+                              .zip(data.clone().into_bytes())
+                              .all(|(a, b)| *a == b)));
+    
     // TODO(jason): Shut down the servers
 }

@@ -6,7 +6,6 @@ use rpc::{RpcError};
 use rpc::client::Rpc;
 use std::net::SocketAddr;
 use std::thread;
-use std::time::{Instant};
 use std::sync::{Arc, Mutex};
 use std::sync::mpsc::{channel, Sender, Receiver};
 
@@ -14,6 +13,7 @@ use super::log::{Log, Entry};
 use super::constants;
 use super::{MainThreadMessage, AppendEntriesReply, RequestVoteReply};
 
+#[derive(Debug)]
 pub struct AppendEntriesMessage {
     pub term: u64,
     pub leader_id: u64,
@@ -23,7 +23,7 @@ pub struct AppendEntriesMessage {
     pub leader_commit: usize,
 }
 
-#[derive(Copy, Clone)]
+#[derive(Copy, Clone, Debug)]
 pub struct RequestVoteMessage {
     pub term: u64,
     pub candidate_id: u64,
@@ -34,6 +34,7 @@ pub struct RequestVoteMessage {
 ///
 /// Messages for peer background threads to push to associated machines.
 ///
+#[derive(Debug)]
 pub enum PeerThreadMessage {
     AppendEntries (AppendEntriesMessage),
     RequestVote (RequestVoteMessage),
@@ -57,7 +58,6 @@ impl PeerHandle {
     ///
     pub fn append_entries_nonblocking (&self, leader_id: u64, commit_index: usize,
                                        current_term: u64, log: Arc<Mutex<Log>>) {
-        println!("{} to {}: append entry for term {}", leader_id, self.id, current_term);
         debug_assert!(self.next_index <= commit_index + 1);
         let prev_log_index = self.next_index - 1;
         let (last_entry, entries) = {
@@ -68,14 +68,15 @@ impl PeerHandle {
         // We should never be out of bounds.
         debug_assert!(commit_index - prev_log_index <= entries.len());
 
-        self.to_peer.send(PeerThreadMessage::AppendEntries(AppendEntriesMessage {
+        let message = PeerThreadMessage::AppendEntries(AppendEntriesMessage {
             term: current_term,
             leader_id: leader_id,
             prev_log_index: prev_log_index,
             prev_log_term: last_entry.map(|entry| entry.term).unwrap_or(0),
-            entries: entries[.. commit_index - prev_log_index].to_vec(),
+            entries: entries.to_vec(),
             leader_commit: commit_index,
-        })).unwrap(); // This failing means main thread is down.
+        });
+        self.to_peer.send(message).unwrap(); // This failing means main thread is down.
     }
 }
 
@@ -167,11 +168,9 @@ impl Peer {
     fn append_entries_blocking (&mut self, entry: AppendEntriesMessage) {
         let mut rpc = Rpc::new(constants::APPEND_ENTRIES_OPCODE);
         Peer::construct_append_entries(&mut rpc, &entry);
-        println!("SEND AE RPC {:?} [", Instant::now());
         let (term, success) = rpc.send(self.addr)
             .and_then(|msg| Peer::handle_append_entries_reply(entry.term, msg))
             .unwrap_or((entry.term, false));
-        println!("] SEND AE RPC {:?}", Instant::now());
         let new_commit_index = entry.prev_log_index + entry.entries.len();
         let reply = AppendEntriesReply {
             term: term,
@@ -344,11 +343,8 @@ mod tests {
         const TERM: u64 = 5;
         const PEER_NEXT_INDEX: usize = 3; // PEER_NEXT_INDEX <= COMMIT_INDEX + 1
         const COMMIT_INDEX: usize = 8; // COMMIT_INDEX < LOG_SIZE
-        const LOG_SIZE: usize = 10;
+        const LOG_SIZE: usize = 9;
         const LEADER_ID: u64 = 0; // LEADER_ID != PEER_ID
-        // Log: 3 .. 8 .. 10
-        // 8 is committed on leader, peer has through entry 2
-        // leader should send entries 3 through 7 = 5 entries total
         let handle = PeerHandle {
             id: 1,
             to_peer: tx.clone(),
@@ -365,8 +361,7 @@ mod tests {
                 assert_eq!(message.prev_log_index, PEER_NEXT_INDEX - 1);
                 assert_eq!(message.prev_log_term, TERM);
                 assert_eq!(message.entries.len(), COMMIT_INDEX - PEER_NEXT_INDEX + 1);
-                let log_entries = log.lock().unwrap().get_entries_from(PEER_NEXT_INDEX - 1)
-                    [.. COMMIT_INDEX - PEER_NEXT_INDEX + 1] .to_vec();
+                let log_entries = log.lock().unwrap().get_entries_from(PEER_NEXT_INDEX - 1).to_vec();
                 assert_eq!(message.entries.len(), log_entries.len());
                 let entries_same = message.entries.iter().zip(log_entries.iter())
                     .fold(true, |and, (e1, e2)| and && *e1 == *e2);
@@ -382,12 +377,8 @@ mod tests {
         const TERM: u64 = 5;
         const PEER_NEXT_INDEX: usize = 9; // PEER_NEXT_INDEX <= COMMIT_INDEX + 1
         const COMMIT_INDEX: usize = 8; // COMMIT_INDEX < LOG_SIZE
-        const LOG_SIZE: usize = 10;
+        const LOG_SIZE: usize = 9;
         const LEADER_ID: u64 = 0; // LEADER_ID != PEER_ID
-        // Log: 8 .. 8 .. 10
-        // 7 is committed on leader, peer has through entry 7 @ TERM - 1
-        // 8 through 10 @ TERM
-        // leader should send no entires!
         let handle = PeerHandle {
             id: 1,
             to_peer: tx.clone(),
@@ -408,7 +399,7 @@ mod tests {
                 assert_eq!(message.leader_commit, COMMIT_INDEX);
                 assert_eq!(message.prev_log_index, PEER_NEXT_INDEX - 1);
                 assert_eq!(message.prev_log_term, TERM - 1);
-                assert_eq!(message.entries.len(), 0);
+                assert_eq!(message.entries.len(), 1);
             },
             PeerThreadMessage::RequestVote(_) => panic!(),
         };

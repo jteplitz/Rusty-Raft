@@ -24,7 +24,8 @@ impl StateMachine for MockStateMachine {
                                 .iter()
                                 .cloned()
                                 .collect();
-        self.commands.lock().unwrap().send(buf_clone).unwrap();
+        println!("State machine received command {:?}", buf_clone.clone());
+        self.commands.lock().unwrap().send(buf_clone.clone()).unwrap();
         Ok(())
     }
 

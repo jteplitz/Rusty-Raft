@@ -111,8 +111,26 @@ pub enum MainThreadMessage {
 /// Types of messages to be sent to the state machine thread.
 ///
 enum StateMachineMessage {
-    Command,
+    Command (usize),
     Query { buffer: Vec<u8>, response_channel: Sender<Result<Vec<u8>, RaftError>> },
+}
+
+///
+/// Applies entries (next_index, to_commit) exclusive, exclusive from |log|
+/// to the |state_machine|. Returns the new committed index.
+fn apply_commands(next_index: usize, to_commit: usize,
+                  log: Arc<Mutex<Log>>,
+                  state_machine: &Box<StateMachine>)
+        -> usize {
+    if to_commit < next_index { return next_index; }
+    let to_apply = { log.lock().unwrap().get_entries_from(next_index - 1)
+        [.. (to_commit - next_index + 1) ].to_vec() };
+    for entry in to_apply.into_iter() {
+        if let Op::Write(data) = entry.op {
+            state_machine.command(&data);
+        }
+    }
+    to_commit + 1
 }
 
 ///
@@ -134,19 +152,11 @@ fn state_machine_thread (log: Arc<Mutex<Log>>,
                          ) -> Sender<StateMachineMessage> {
     let(to_state_machine, from_main) = channel();
     thread::spawn(move || {
-        let mut append_index = start_index;
+        let mut next_index = start_index + 1;
         loop {
             match from_main.recv().unwrap() {
-                StateMachineMessage::Command => {
-                    append_index = append_index + 1;
-                    let result = { log.lock().unwrap().get_entry(append_index).cloned() };
-                    if let Some(entry) = result {
-                        if let Op::Write(data) = entry.op {
-                            // TODO: there is currently no way to forward
-                            // |command| client errors to the client
-                            state_machine.command(&data);
-                        }
-                    }
+                StateMachineMessage::Command(commit_index) => {
+                    next_index = apply_commands(next_index, commit_index, log.clone(), &state_machine);
                 },
                 StateMachineMessage::Query { buffer, response_channel } => {
                     response_channel.send(state_machine.query(&buffer)).unwrap();
@@ -186,7 +196,6 @@ impl ServerState {
         self.current_term += 1;
         self.voted_for = Some(my_id); // vote for ourselves
         self.election_timeout = generate_election_timeout();
-        println!("Server {}: Became candidate for term {}", my_id, self.current_term);
         cv.notify_all();
     }
 
@@ -264,11 +273,11 @@ fn update_commit_index(server_info: &ServerInfo, state: &mut ServerState, cv: &C
     // Find median of all peer commit indices.
     let mut indices: Vec<usize> = server_info.peers.iter().map(|ref peer| peer.match_index).collect();
     indices.sort();
-    let new_index = *indices.get( (indices.len() - 1) / 2 ).unwrap();
+    let new_index = *indices.get( indices.len() / 2 ).unwrap();
     // Set new commit index if it's higher!
-    if state.commit_index >= new_index { return; }
-    server_info.to_state_machine.send(StateMachineMessage::Command).unwrap();
+    if new_index <= state.commit_index { return; }
     state.commit_index = new_index;
+    server_info.to_state_machine.send(StateMachineMessage::Command(state.commit_index)).unwrap();
     cv.notify_all();
 }
 
@@ -332,7 +341,6 @@ fn handle_append_entries_reply(m: AppendEntriesReply, server_info: &mut ServerIn
         state.transition_to_follower(m.term, state_condition);
     } else if m.success {
         // On success, advance peer's index.
-        println!("Peer {} successfully appended entry {}", m.peer.0, m.commit_index);
         server_info.get_peer_mut(m.peer.0).map(|peer| {
             debug_assert!(m.commit_index >= peer.next_index - 1);
             peer.next_index = m.commit_index + 1;
@@ -387,7 +395,6 @@ fn handle_request_vote_reply(reply: RequestVoteReply, info: &mut ServerInfo,
         if num_votes > (info.peers.len() + 1) / 2 {
             // Woo! We won the election
             state.transition_to_leader(info, log, state_condition);
-            println!("Server {}: Became leader for term {}", info.me.0, state.current_term);
         }
     }
 }
@@ -408,12 +415,14 @@ impl Server {
 
         // 1a. Start state machine thread.
         let to_state_machine = state_machine_thread(log.clone(), 0, state_machine);
+        let to_state_machine_locked = 
+            Arc::new(Mutex::new(to_state_machine.clone()));
 
         // 1. Start RPC request handlers
         let to_main_locked = Arc::new(Mutex::new(tx.clone()));
         let append_entries_handler: Box<RpcObject> = Box::new(
             AppendEntriesHandler {state: state.clone(), log: log.clone(),
-                                  to_main: to_main_locked.clone() }
+                                  to_state_machine: to_state_machine_locked.clone() }
         );
         let request_vote_handler: Box<RpcObject> = Box::new(
             RequestVoteHandler {state: state.clone(), log: log.clone()}
@@ -421,8 +430,7 @@ impl Server {
         let client_request_handler: Box<RpcObject> = Box::new(
             ClientRequestHandler {state: state.clone(), log: log.clone(),
                                   to_main: to_main_locked.clone(),
-                                  to_state_machine: Arc::new(Mutex::new(
-                                          to_state_machine.clone()))}
+                                  to_state_machine: to_state_machine_locked.clone() }
         );
         let services = vec![
             (constants::APPEND_ENTRIES_OPCODE, append_entries_handler),
@@ -543,16 +551,12 @@ impl Server {
                 let ref mut state = * state_ref.lock().unwrap();
                 match message {
                     MainThreadMessage::AppendEntriesReply(m) => {
-                        println!("Server {}: Got append entries reply from {} for index {} in term {} {}",
-                                 self.info.me.0, m.peer.0, m.commit_index, m.term, m.success);
                         handle_append_entries_reply(m, &mut self.info, state, cvar, self.log.clone());
                     },
                     MainThreadMessage::ClientAppendRequest => {
-                        println!("Server {}: Got client append request", self.info.me.0);
                         broadcast_append_entries(&mut self.info, state, self.log.clone());
                     },
                     MainThreadMessage::RequestVoteReply(m) =>  {
-                        println!("Server {}: Got vote reply", self.info.me.0);
                         handle_request_vote_reply(m, &mut self.info, state, cvar, self.log.clone());
                     },
                 };
@@ -579,13 +583,10 @@ impl Server {
             State::Follower | State::Candidate{ .. } => {
                 let now = Instant::now();
                 if now.duration_since(state.last_leader_contact) > state.election_timeout {
-                    println!("Server {}: Haven't heard from leader since {:?}", self.info.me.0, state.last_leader_contact);
-                    println!("Server {}: Haven't heard from leader. Starting election", self.info.me.0);
                     self.start_election(state, cvar);
                 }
             },
             State::Leader{ .. } => {
-                println!("Server {}: sending heartbeat", self.info.me.0);
                 broadcast_append_entries(&mut self.info, state, self.log.clone());
             }
         }
@@ -682,8 +683,9 @@ impl RpcObject for RequestVoteHandler {
 struct AppendEntriesHandler {
     state: Arc<(Mutex<ServerState>, Condvar)>,
     log: Arc<Mutex<Log>>,
-    to_main: Arc<Mutex<Sender<MainThreadMessage>>>,
+    to_state_machine: Arc<Mutex<Sender<StateMachineMessage>>>,
 }
+
 impl AppendEntriesHandler {
     fn handle_message(&self, message: append_entries::Reader, reply: &mut append_entries_reply::Builder) {
         let &(ref state_ref, ref cvar) = &*(self.state);
@@ -723,7 +725,11 @@ impl AppendEntriesHandler {
             log.get_last_entry_index()
         };
         // March forward the commit index.
-        state.commit_index = commit_index;
+        if commit_index > state.commit_index {
+            state.commit_index = commit_index;
+            self.to_state_machine.lock().unwrap()
+                .send(StateMachineMessage::Command(state.commit_index)).unwrap();
+        }
         reply.set_success(true);
     }
 }
@@ -733,7 +739,6 @@ impl RpcObject for AppendEntriesHandler {
     fn handle_rpc (&self, params: capnp::any_pointer::Reader, result: capnp::any_pointer::Builder) 
         -> Result<(), RpcError>
     {
-        println!("\t::handle AE mssage");
         let mut reply = result.init_as::<append_entries_reply::Builder>();
         params.get_as::<append_entries::Reader>()
             .map(|append_entries| self.handle_message(append_entries, &mut reply))
@@ -808,7 +813,6 @@ fn client_write_blocking (log: Arc<Mutex<Log>>,
             op: Op::Write(command.to_vec()),
         }).get_last_entry_index()
     };
-    println!("Client thread appended to log");
     let unwrapped_to_main = to_main.lock().unwrap();
     unwrapped_to_main.send(MainThreadMessage::ClientAppendRequest).unwrap();
 
@@ -970,7 +974,7 @@ mod tests {
         assert_eq!(state.commit_index, 2);
         // make sure state machine got a command
         match rx2.recv().unwrap() {
-            StateMachineMessage::Command => (),
+            StateMachineMessage::Command(_) => (),
             StateMachineMessage::Query { .. } => panic!(),
         }
     }

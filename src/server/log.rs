@@ -205,7 +205,7 @@ impl MemoryLog {
     pub fn new_random_with_term(size: usize, term: u64) -> MemoryLog {
         let mut log = MemoryLog::new();
         log.append_entries(
-            (0 .. size).map(|_| random_entry_with_term(term)).collect());
+            (0 .. size - 1).map(|_| random_entry_with_term(term)).collect());
         log
     }
 }

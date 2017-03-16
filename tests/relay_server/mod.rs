@@ -29,6 +29,7 @@ pub struct RelayServer {
     addrs: Arc<Mutex<HashMap<SocketAddr, SocketInfo>>>
 }
 
+#[derive(Clone)]
 struct SocketInfo {
     to_addr: Option<SocketAddr>,
     online: bool
@@ -105,9 +106,8 @@ impl RelayServer {
             match stream {
                 Ok (stream) => {
                     counter += 1;
-                    println!("Relaying stream {}", counter);
-                    let addrs = addrs.lock().unwrap();
-                    match addrs.get(&local_addr) {
+                    let addr_info = { addrs.lock().unwrap().get(&local_addr).cloned() };
+                    match addr_info {
                         Some(info) => {
                             if info.online {
                                 RelayServer::relay_stream_to_addr(stream, info.to_addr.unwrap());
@@ -115,7 +115,6 @@ impl RelayServer {
                         },
                         None => {}
                     }
-                    println!("Done relaying stream {}", counter);
                 },
                 Err (_) => {
                     // currently none of our tests should cause this kind of
@@ -147,7 +146,6 @@ impl RelayServer {
     /// not be written to
     fn relay_stream_to_stream(mut from_stream: TcpStream, mut to_stream: TcpStream) {
         let mut buf = [0; 100];
-
         loop {
             let bytes_read = from_stream.read(&mut buf[..]).unwrap();
             if bytes_read == 0 {
