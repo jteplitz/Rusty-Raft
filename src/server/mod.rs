@@ -326,33 +326,33 @@ pub fn start_server<F> (config: Config, load_state_machine: F) -> Result<ServerH
 // TODO(sydli): Test
 fn handle_append_entries_reply(m: AppendEntriesReply, server_info: &mut ServerInfo, state: &mut ServerState, state_condition: &Condvar, log: Arc<Mutex<Log>>) {
     match state.current_state {
-        State::Leader{ .. } => {
-            if m.term > state.current_term {
-                state.transition_to_follower(m.term, state_condition);
-            } else if m.success {
-                // On success, advance peer's index.
-                server_info.get_peer_mut(m.peer.0).map(|peer| {
-                    debug_assert!(m.commit_index >= peer.next_index - 1);
-                    peer.next_index = m.commit_index + 1;
-                    peer.match_index = m.commit_index;
-                });
-                update_commit_index(server_info, state, state_condition);
-            } else {
-                let leader_id = server_info.me.0;
-                // If we failed, roll back peer index by 1 (if we can) and retry
-                // the append entries call.
-                server_info.get_peer_mut(m.peer.0).map(|peer| {
-                    if peer.next_index > 1 {
-                        // can we make sure match_index never exceeds peer_index?
-                        peer.next_index = peer.next_index - 1;
-                    }
-                    peer.append_entries_nonblocking(leader_id,
-                                                    state.commit_index,
-                                                    state.current_term, log);
-                });
+        State::Leader{ .. } => (),
+        State::Candidate{ .. } | State::Follower => return, // drop it like it's hot
+    }
+    if m.term > state.current_term {
+        state.transition_to_follower(m.term, state_condition);
+    } else if m.success {
+        // On success, advance peer's index.
+        println!("Peer {} successfully appended entry {}", m.peer.0, m.commit_index);
+        server_info.get_peer_mut(m.peer.0).map(|peer| {
+            debug_assert!(m.commit_index >= peer.next_index - 1);
+            peer.next_index = m.commit_index + 1;
+            peer.match_index = m.commit_index;
+        });
+        update_commit_index(server_info, state, state_condition);
+    } else {
+        let leader_id = server_info.me.0;
+        // If we failed, roll back peer index by 1 (if we can) and retry
+        // the append entries call.
+        server_info.get_peer_mut(m.peer.0).map(|peer| {
+            if peer.next_index > 1 {
+                // can we make sure match_index never exceeds peer_index?
+                peer.next_index = peer.next_index - 1;
             }
-        },
-        State::Candidate{ .. } | State::Follower => ()
+            peer.append_entries_nonblocking(leader_id,
+                                            state.commit_index,
+                                            state.current_term, log);
+        });
     }
 }
 
@@ -482,7 +482,7 @@ impl Server {
         thread::spawn(move || {
             // NB: This thread handles all state changes EXCEPT for those that move us back into the
             // follower state from either the candidate or leader state. Those are both handled in the
-            // AppendEntriesRpcHandler
+            // AppendEntriesHandler
 
             loop {
                 let current_timeout;
@@ -556,7 +556,9 @@ impl Server {
                         println!("Server {}: Got vote reply", self.info.me.0);
                         handle_request_vote_reply(m, &mut self.info, state, cvar, self.log.clone());
                     },
-                    MainThreadMessage::ResetElectionTimeout => (),
+                    MainThreadMessage::ResetElectionTimeout => {
+                        println!("Server {}: Got ping from leader", self.info.me.0);
+                    },
                 };
             } // end loop
         })
@@ -686,71 +688,60 @@ struct AppendEntriesHandler {
     log: Arc<Mutex<Log>>,
     to_main: Arc<Mutex<Sender<MainThreadMessage>>>,
 }
+impl AppendEntriesHandler {
+    fn handle_message(&self, message: append_entries::Reader, reply: &mut append_entries_reply::Builder) {
+        let &(ref state_ref, ref cvar) = &*(self.state);
+        let mut state = state_ref.lock().unwrap();
+        let current_term = state.current_term;
+        reply.set_success(false);
+        reply.set_term(current_term);
 
-fn create_reply_for_append_entries(
-        log: Arc<Mutex<Log>>,
-        state: Arc<(Mutex<ServerState>, Condvar)>,
-        current_term: u64,
-        message: append_entries::Reader,
-        reply: &mut append_entries_reply::Builder,
-        to_main: Arc<Mutex<Sender<MainThreadMessage>>>) {
-    // Update last leader contact.
-    { state.0.lock().unwrap().last_leader_contact = Instant::now() }
-    reply.set_success(false);
-    reply.set_term(current_term);
-
-    // Check: If our term doesn't match the message's term...
-    if message.get_term() < current_term { return; }
-    if message.get_term() > current_term {
-        { // Become follower for the higher term
-            let &(ref state_ref, ref cvar) = &*state;
-            state_ref.lock().unwrap().transition_to_follower(
-                message.get_term(), cvar);
+        // Check: If our term doesn't match the message's term...
+        if message.get_term() < current_term { return; }
+        if message.get_term() > current_term {
+            // Become follower for the higher term
+            state.transition_to_follower(message.get_term(), cvar);
+            reply.set_term(current_term);
         }
-        reply.set_term(message.get_term());
+
+        debug_assert!(message.get_term() == state.current_term);
+        // Reset election timer for this term.
+        { self.to_main.lock().unwrap()
+            .send(MainThreadMessage::ResetElectionTimeout).unwrap(); }
+        // Check: (prev_log_term, prev_log_index) exists in our log
+        let prev_log_index = message.get_prev_log_index() as usize;
+        let (last_log_index, prev_log_entry_term) = {
+            let log = self.log.lock().unwrap();
+            (log.get_last_entry_index(),
+             log.get_entry(prev_log_index).map(|x| x.term).unwrap_or(0))
+        };
+        // Does (term, index) exist in our log?
+        if prev_log_index > last_log_index ||
+           prev_log_entry_term != message.get_prev_log_term() { return; }
+        // Append all the entries to our log.
+        let entries: Vec<Entry> = message.get_entries().unwrap().iter()
+            .map(Entry::from_proto).collect();
+        let commit_index = { // Append entries to log.
+            let mut log = self.log.lock().unwrap();
+            log.roll_back(prev_log_index);
+            log.append_entries(entries);
+            log.get_last_entry_index()
+        };
+        // March forward the commit index.
+        state.commit_index = commit_index;
+        reply.set_success(true);
     }
-    // Reset election timer for this term.
-    { to_main.lock().unwrap().send(MainThreadMessage::ResetElectionTimeout).unwrap(); }
-    // Check: (prev_log_term, prev_log_index) exists in our log
-    let prev_log_index = message.get_prev_log_index() as usize;
-    let (last_log_index, prev_log_entry) = {
-        let log = log.lock().unwrap();
-        (log.get_last_entry_index(), log.get_entry(prev_log_index).cloned())
-    };
-    if prev_log_index > last_log_index ||
-       prev_log_entry.map(|x| x.term).unwrap_or(0)
-           != message.get_prev_log_term() {
-            return;
-    }
-    // Append all the entries to our log.
-    let entries: Vec<Entry> = message.get_entries().unwrap().iter()
-        .map(Entry::from_proto).collect();
-    let commit_index = { // Append entries to log.
-        let mut log = log.lock().unwrap();
-        log.roll_back(prev_log_index);
-        log.append_entries(entries);
-        log.get_last_entry_index()
-    };
-    { // March forward the commit index.
-        state.0.lock().unwrap().commit_index = commit_index;
-    }
-    reply.set_success(true);
 }
+
 
 impl RpcObject for AppendEntriesHandler {
 
     fn handle_rpc (&self, params: capnp::any_pointer::Reader, result: capnp::any_pointer::Builder) 
         -> Result<(), RpcError>
     {
-        // Let's read some state first :D
-        let term = { self.state.0.lock().unwrap().current_term };
         let mut reply = result.init_as::<append_entries_reply::Builder>();
         params.get_as::<append_entries::Reader>()
-            .map(|append_entries|
-                     create_reply_for_append_entries(
-                         self.log.clone(), self.state.clone(), term,
-                         append_entries, &mut reply,
-                         self.to_main.clone()))
+            .map(|append_entries| self.handle_message(append_entries, &mut reply))
             .map_err(RpcError::Capnp)
     }
 }
