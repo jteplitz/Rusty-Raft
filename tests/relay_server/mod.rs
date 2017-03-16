@@ -100,9 +100,12 @@ impl RelayServer {
     /// Runs in a background thread, and relays messages according to the hash map.
     fn relay_messages(listener: TcpListener, addrs: Arc<Mutex<HashMap<SocketAddr, SocketInfo>>>) {
         let local_addr = listener.local_addr().unwrap();
+        let mut counter = 0;
         for stream in listener.incoming() {
             match stream {
                 Ok (stream) => {
+                    counter += 1;
+                    println!("Relaying stream {}", counter);
                     let addrs = addrs.lock().unwrap();
                     match addrs.get(&local_addr) {
                         Some(info) => {
@@ -112,9 +115,12 @@ impl RelayServer {
                         },
                         None => {}
                     }
+                    println!("Done relaying stream {}", counter);
                 },
                 Err (_) => {
-                    // conection errors are dropped. We might want to panic instead?
+                    // currently none of our tests should cause this kind of
+                    // connection error
+                    panic!("Connection error");
                 }
             }
         }
