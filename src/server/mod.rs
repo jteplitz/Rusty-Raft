@@ -254,6 +254,7 @@ struct ServerInfo {
     to_state_machine: Sender<StateMachineMessage>,
     me: (u64, SocketAddr),
     heartbeat_timeout: Duration,
+    rpc_server: RpcServer
 }
 
 impl ServerInfo {
@@ -461,8 +462,9 @@ impl Server {
             me: (me.0, bound_address),
             heartbeat_timeout: config.heartbeat_timeout,
             to_state_machine: to_state_machine,
+            rpc_server: rpc_server
         };
-        
+
         Ok(Server {
             state: state,
             log: log,
@@ -538,7 +540,6 @@ impl Server {
                 let message = match rx.recv_timeout(current_timeout) {
                     Ok(message) => message,
                     Err(_) => {
-                        // TODO: Move handle_timeout into Server?
                         self.handle_timeout();
                         continue;
                     },
@@ -872,6 +873,7 @@ mod tests {
     use std::time::{Duration, Instant};
     use std::sync::mpsc::{channel, Receiver};
     use std::sync::{Arc, Mutex, Condvar};
+    use rpc::server::{RpcServer};
 
     const DEFAULT_HEARTBEAT_TIMEOUT_MS: u64 = 150;
 
@@ -899,6 +901,7 @@ mod tests {
                 me: (0, SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 8080)),
                 heartbeat_timeout: Duration::from_millis(DEFAULT_HEARTBEAT_TIMEOUT_MS),
                 to_state_machine: tx1,
+                rpc_server: RpcServer::new_with_services(vec![])
             },
         };
         (rx, rx1, server)

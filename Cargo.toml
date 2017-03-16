@@ -8,6 +8,7 @@ build = "src/build.rs"
 capnp = "0.8.0"
 rand = "0.3"
 matches = "0.1.4"
+mio="0.6.5"
 
 [build-dependencies]
 capnpc = "*"

@@ -23,7 +23,14 @@ use std::collections::HashMap;
 use std::net::{SocketAddr, TcpListener, TcpStream, Shutdown};
 use std::thread;
 use std::sync::{Arc, Mutex};
-use std::io::{Read, Write};
+use std::io::{Read, Write, Error};
+
+macro_rules! println_stderr(
+    ($($arg:tt)*) => { {
+        let r = writeln!(&mut ::std::io::stderr(), $($arg)*);
+        r.expect("failed printing to stderr");
+    } }
+);
 
 pub struct RelayServer {
     addrs: Arc<Mutex<HashMap<SocketAddr, SocketInfo>>>
@@ -110,7 +117,12 @@ impl RelayServer {
                     match addr_info {
                         Some(info) => {
                             if info.online {
-                                RelayServer::relay_stream_to_addr(stream, info.to_addr.unwrap());
+                                match RelayServer::relay_stream_to_addr(stream, info.to_addr.unwrap()) {
+                                    Ok(_) => {},
+                                    Err(e) => {
+                                        println_stderr!("IO Error when connecting to Raft Server! {}", e);
+                                    }
+                                }
                             }
                         },
                         None => {}
@@ -126,15 +138,20 @@ impl RelayServer {
     }
 
     /// Relays the given stream to the to_addr and sends the result back to the stream.
-    fn relay_stream_to_addr(stream: TcpStream, to_addr: SocketAddr) {
+    ///
+    /// #Panics
+    /// Panics if the OS does not allow cloning the tcp streams
+    fn relay_stream_to_addr(stream: TcpStream, to_addr: SocketAddr) -> Result<(), Error> {
         // Open a connection to to_addr
-        let outgoing = TcpStream::connect(to_addr).unwrap();
+        let outgoing = try!(TcpStream::connect(to_addr));
 
         let outgoing_clone = outgoing.try_clone().unwrap();
         let stream_clone = stream.try_clone().unwrap();
         thread::spawn (move || RelayServer::relay_stream_to_stream(outgoing_clone, stream_clone));
 
         thread::spawn (move || RelayServer::relay_stream_to_stream(stream, outgoing));
+
+        Ok(())
     }
 
     /// Relays messages from from_stream to to_stream until

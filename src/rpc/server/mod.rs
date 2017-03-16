@@ -1,17 +1,28 @@
+// TODO: Figure out a replacement for mio deprecated apis
+#![allow(deprecated)]
+
 extern crate capnp; 
+extern crate mio;
 #[cfg(test)]
 mod test;
 
+use std::mem;
 use std::sync::{Arc};
 use std::error::Error;
+use std::sync::mpsc::TryRecvError;
 use super::{RpcError, RpcClientError, RpcClientErrorKind};
 
+use self::mio::tcp::{TcpListener, TcpStream};
+use self::mio::{channel, Events, Ready, Poll, Token, PollOpt};
+use self::mio::channel::{Receiver, Sender};
 use capnp::{serialize_packed, message};
 use capnp::serialize::OwnedSegments;
 use rpc_capnp::{rpc_request, rpc_response, rpc_error};
-use std::net::{TcpListener, TcpStream, ToSocketAddrs, SocketAddr};
+
+use std::net::{ToSocketAddrs, SocketAddr};
 use std::io::{Write, Error as IoError, ErrorKind, BufReader, BufWriter};
 use std::thread;
+use std::thread::{JoinHandle};
 use std::collections::HashMap;
 
 macro_rules! println_stderr(
@@ -47,6 +58,8 @@ type ServicesMap = HashMap<i16, Box<RpcObject>>;
 pub struct RpcServer {
     services: Arc<ServicesMap>,
     listener: Option<TcpListener>,
+    repl_thread: Option<JoinHandle<()>>,
+    shutdown_tx: Option<Sender<()>>
 }
 
 impl RpcServer {
@@ -58,11 +71,11 @@ impl RpcServer {
             map.insert(opcode.clone(), rpc_object);
         }
 
-        RpcServer {services: Arc::new(map), listener: None}
+        RpcServer {services: Arc::new(map), listener: None, repl_thread: None, shutdown_tx: None}
     }
 
     ///
-    /// Binds this server to the given address(es)
+    /// Binds this server to the given address
     /// At this point the server is accepting requests but you MUST call repl to execute them
     ///
     /// # Panics
@@ -77,8 +90,15 @@ impl RpcServer {
             panic!("Bind should only be called once.");
         }
 
-        self.listener = Some(try!(TcpListener::bind(addr)));
-        Ok(())
+        let invalid_input_err = IoError::new(ErrorKind::InvalidInput, "You must supply an address to bind to");
+        try!(addr.to_socket_addrs()).next()
+        .ok_or(invalid_input_err)
+        .and_then(|addr| {
+            TcpListener::bind(&addr)
+        })
+        .map(|l| {
+            self.listener = Some(l);
+        })
     }
 
     ///
@@ -102,27 +122,100 @@ impl RpcServer {
         };
         let listener = try!(l.try_clone());
 
-        // TODO #1: Thread pool
         let services = self.services.clone();
+        let (tx, rx) = channel::channel();
+        self.repl_thread = Some(RpcServer::repl_thread(services, listener, rx));
+        self.shutdown_tx = Some(tx);
+
+        Ok(())
+    }
+
+    /// Spawns a new thread that listens for incoming connections on the TcpListener and
+    /// spawns background threads to respond to them.
+    /// Shuts down the server gracefully after receiving a message on the shutdown channel.
+    /// The threads waits for all background threads to finish and then shuts down.
+    ///
+    /// # Panics
+    /// This function does not panic, but the background thread will panic if it is unable to
+    /// perform syscalls to listen on the socket
+    fn repl_thread(services: Arc<ServicesMap>, listener: TcpListener, shutdown_rx: Receiver<()>) -> JoinHandle<()> {
+        // TODO #1: Thread pool
         thread::spawn(move || {
-            loop {
+            const MAX_PENDING_CONNECTIONS: usize = 128;
+            const TCP_TOKEN: Token = Token(0);
+            const SHUTDOWN_TOKEN: Token = Token(1);
 
-                let stream = listener.accept();
-                let opcode_map = services.clone();
+            // TODO #1: Thread pool
+            let mut background_threads: Vec<JoinHandle<()>> = vec![];
 
-                match stream {
-                    Ok((stream, _)) => {
-                        RpcServer::handle_incoming_connection(opcode_map, stream);
-                    }
+            let poll = Poll::new().unwrap();
+            let mut events = Events::with_capacity(MAX_PENDING_CONNECTIONS);
+            // register the TCP listener
+            poll.register(&listener, TCP_TOKEN, Ready::writable() | Ready::readable(), 
+                          PollOpt::edge()).unwrap();
+            // register the shutdown receiver
+            poll.register(&shutdown_rx, SHUTDOWN_TOKEN, Ready::readable(), PollOpt::edge()).unwrap();
+
+            'socket: loop {
+                match poll.poll(&mut events, None) {
+                    Ok(_) => {
+                        for event in &events {
+                            if event.token() == TCP_TOKEN {
+                                RpcServer::try_accept(services.clone(), &listener, &mut background_threads);
+                            }
+                            else {
+                                debug_assert!(event.token() == SHUTDOWN_TOKEN);
+                                match shutdown_rx.try_recv() {
+                                    Ok(_) => break 'socket,
+                                    Err(e) => debug_assert!(e == TryRecvError::Empty, "Shutdown channel hung up")
+                                }
+                            }
+                        }
+                    }, 
                     Err(e) => {
-                        // TODO: Handle TCP errors. Though that may end up meaning being better logging
+                        println_stderr!("Mio encounted an error {}", e);
+                    }
+                }
+            }
+
+            // TODO #1 Thread pool
+            // Join each background thread and then exit
+            for thread in background_threads {
+                match thread.join() {
+                    Ok(_) => {},
+                    Err(_) => {
+                        println_stderr!("Background RPC thread panicked");
+                    }
+                }
+            }
+
+            ()
+        })
+    }
+
+    /// Tries to accept all  incoming connections on this socket and spawn a thread for each of
+    /// them. If sucesfull places that thread in the background threads vec.
+    fn try_accept(services: Arc<ServicesMap>, listener: &TcpListener, background_threads: &mut Vec<JoinHandle<()>>) {
+        // keep accepting until WouldBlock
+        loop {
+            let stream = listener.accept();
+
+            match stream {
+                Ok((stream, _)) => {
+                    let opcode_map = services.clone();
+                    background_threads.push(RpcServer::handle_incoming_connection(opcode_map, stream));
+                }
+                Err(e) => {
+                    if e.kind() == ErrorKind::WouldBlock {
+                        break;
+                    } else {
+                        // TODO: Handle TCP errors. 
+                        // Though that probably just means better logging
                         println_stderr!("Error on incoming TCP stream. {}", e)
                     }
                 }
             }
-        });
-
-        Ok(())
+        }
     }
 
     /// 
@@ -140,18 +233,21 @@ impl RpcServer {
         }
     }
 
-
-    // TODO #2: Handle shutdown
-    #[allow(dead_code)]
-	fn shutdown (&mut self) {
-        unimplemented!();
+    /// Consumes the RpcServer and blocks until all background threads have been shutdown
+    /// and the socket has been released.
+    ///
+    /// # Panics
+    /// Panics if the background thread has panicked
+    /// Or if the OS prevents us from waking up the background thread
+	pub fn shutdown (self) {
+        // Drop self. The drop trait blocks until the server shuts down.
 	}
     
     ///
     /// Spawns a new thread to run the function
     /// and sends the result (or error) back to the caller
     ///
-    fn handle_incoming_connection (opcode_map: Arc<ServicesMap>, mut stream: TcpStream) {
+    fn handle_incoming_connection (opcode_map: Arc<ServicesMap>, mut stream: TcpStream) -> JoinHandle<()> {
         thread::spawn(move || {
             let mut response_msg = message::Builder::new_default();
             let rpc_result;
@@ -172,7 +268,7 @@ impl RpcServer {
                 // TODO: Handle TCP errors. Though that may end up meaning being better logging
                 println_stderr!("Error sending Rpc response: {}", e);
             })
-        });
+        })
     }
 
     ///
@@ -277,4 +373,22 @@ impl RpcServer {
         })
     }
 
+}
+
+impl Drop for RpcServer {
+    /// Gracefully shuts down the RpcServer blocking until all conections are closed
+    /// # Panics
+    /// Panics if the background thread has panicked
+    /// Or if the OS prevents us from waking up the background thread
+    fn drop (&mut self) {
+        let repl_thread = mem::replace(&mut self.repl_thread, None);
+        match repl_thread {
+            Some(t) => {
+                    // It shouldn't be possible to have a repl_thread and not have a shutdown_rx
+                self.shutdown_tx.as_ref().unwrap().send(()).unwrap();
+                t.join().unwrap();
+            },
+            None => {/* Nothing to shutdown */}
+        }
+    }
 }

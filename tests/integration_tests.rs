@@ -70,7 +70,7 @@ fn start_raft_servers(relay_server: &mut RelayServer, addrs: &HashMap<u64, Socke
 /// This test is as much a sanity check on our testing code as on the raft code.
 /// It just makes sure we can start up a static cluster of servers without crashing
 fn it_starts_up_a_cluster() {
-    const NUM_SERVERS: u64 = 5;
+    const NUM_SERVERS: u64 = 3;
 
     let (mut relay_server, addrs) = start_relay_server(NUM_SERVERS);
     let state_machines = start_raft_servers(&mut relay_server, &addrs);
