@@ -105,7 +105,6 @@ pub enum MainThreadMessage {
     AppendEntriesReply (AppendEntriesReply),
     RequestVoteReply (RequestVoteReply),
     ClientAppendRequest,
-    ResetElectionTimeout,
 }
 
 ///
@@ -556,9 +555,6 @@ impl Server {
                         println!("Server {}: Got vote reply", self.info.me.0);
                         handle_request_vote_reply(m, &mut self.info, state, cvar, self.log.clone());
                     },
-                    MainThreadMessage::ResetElectionTimeout => {
-                        println!("Server {}: Got ping from leader", self.info.me.0);
-                    },
                 };
             } // end loop
         })
@@ -706,8 +702,7 @@ impl AppendEntriesHandler {
 
         debug_assert!(message.get_term() == state.current_term);
         // Reset election timer for this term.
-        { self.to_main.lock().unwrap()
-            .send(MainThreadMessage::ResetElectionTimeout).unwrap(); }
+        state.last_leader_contact = Instant::now();
         // Check: (prev_log_term, prev_log_index) exists in our log
         let prev_log_index = message.get_prev_log_index() as usize;
         let (last_log_index, prev_log_entry_term) = {
@@ -735,10 +730,10 @@ impl AppendEntriesHandler {
 
 
 impl RpcObject for AppendEntriesHandler {
-
     fn handle_rpc (&self, params: capnp::any_pointer::Reader, result: capnp::any_pointer::Builder) 
         -> Result<(), RpcError>
     {
+        println!("\t::handle AE mssage");
         let mut reply = result.init_as::<append_entries_reply::Builder>();
         params.get_as::<append_entries::Reader>()
             .map(|append_entries| self.handle_message(append_entries, &mut reply))
@@ -813,6 +808,7 @@ fn client_write_blocking (log: Arc<Mutex<Log>>,
             op: Op::Write(command.to_vec()),
         }).get_last_entry_index()
     };
+    println!("Client thread appended to log");
     let unwrapped_to_main = to_main.lock().unwrap();
     unwrapped_to_main.send(MainThreadMessage::ClientAppendRequest).unwrap();
 

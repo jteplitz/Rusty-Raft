@@ -6,6 +6,7 @@ use rpc::{RpcError};
 use rpc::client::Rpc;
 use std::net::SocketAddr;
 use std::thread;
+use std::time::{Instant};
 use std::sync::{Arc, Mutex};
 use std::sync::mpsc::{channel, Sender, Receiver};
 
@@ -37,7 +38,6 @@ pub enum PeerThreadMessage {
     AppendEntries (AppendEntriesMessage),
     RequestVote (RequestVoteMessage),
 }
-
 
 ///
 /// Handle for main thread to send messages to Peer.
@@ -167,9 +167,11 @@ impl Peer {
     fn append_entries_blocking (&mut self, entry: AppendEntriesMessage) {
         let mut rpc = Rpc::new(constants::APPEND_ENTRIES_OPCODE);
         Peer::construct_append_entries(&mut rpc, &entry);
+        println!("SEND AE RPC {:?} [", Instant::now());
         let (term, success) = rpc.send(self.addr)
             .and_then(|msg| Peer::handle_append_entries_reply(entry.term, msg))
             .unwrap_or((entry.term, false));
+        println!("] SEND AE RPC {:?}", Instant::now());
         let new_commit_index = entry.prev_log_index + entry.entries.len();
         let reply = AppendEntriesReply {
             term: term,
