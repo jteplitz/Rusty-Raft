@@ -99,7 +99,6 @@ impl Peer {
     ///
     pub fn start (id: (u64, SocketAddr), to_main: Sender<MainThreadMessage>) -> PeerHandle {
         let (to_peer, from_main) = channel();
-        let commit_index = 0;
         
         thread::spawn(move || {
             let peer = Peer {
@@ -345,7 +344,6 @@ mod tests {
         const COMMIT_INDEX: usize = 8; // COMMIT_INDEX < LOG_SIZE
         const LOG_SIZE: usize = 10;
         const LEADER_ID: u64 = 0; // LEADER_ID != PEER_ID
-        const PEER_ID: u64 = 1;
         // Log: 3 .. 8 .. 10
         // 8 is committed on leader, peer has through entry 2
         // leader should send entries 3 through 7 = 5 entries total
@@ -384,7 +382,6 @@ mod tests {
         const COMMIT_INDEX: usize = 8; // COMMIT_INDEX < LOG_SIZE
         const LOG_SIZE: usize = 10;
         const LEADER_ID: u64 = 0; // LEADER_ID != PEER_ID
-        const PEER_ID: u64 = 1;
         // Log: 8 .. 8 .. 10
         // 7 is committed on leader, peer has through entry 7 @ TERM - 1
         // 8 through 10 @ TERM

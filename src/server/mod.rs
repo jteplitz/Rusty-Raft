@@ -559,7 +559,6 @@ impl Server {
                     MainThreadMessage::ResetElectionTimeout => (),
                 };
             } // end loop
-            ()
         })
     }
 
@@ -691,7 +690,7 @@ struct AppendEntriesHandler {
 fn create_reply_for_append_entries(
         log: Arc<Mutex<Log>>,
         state: Arc<(Mutex<ServerState>, Condvar)>,
-        commit_index: usize, current_term: u64,
+        current_term: u64,
         message: append_entries::Reader,
         reply: &mut append_entries_reply::Builder,
         to_main: Arc<Mutex<Sender<MainThreadMessage>>>) {
@@ -744,15 +743,12 @@ impl RpcObject for AppendEntriesHandler {
         -> Result<(), RpcError>
     {
         // Let's read some state first :D
-        let (commit_index, term) = { 
-            let state = self.state.0.lock().unwrap();
-            (state.commit_index, state.current_term)
-        };
+        let term = { self.state.0.lock().unwrap().current_term };
         let mut reply = result.init_as::<append_entries_reply::Builder>();
         params.get_as::<append_entries::Reader>()
             .map(|append_entries|
                      create_reply_for_append_entries(
-                         self.log.clone(), self.state.clone(), commit_index, term,
+                         self.log.clone(), self.state.clone(), term,
                          append_entries, &mut reply,
                          self.to_main.clone()))
             .map_err(RpcError::Capnp)
