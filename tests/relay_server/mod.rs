@@ -134,7 +134,7 @@ impl RelayServer {
         let stream_clone = stream.try_clone().unwrap();
         thread::spawn (move || RelayServer::relay_stream_to_stream(outgoing_clone, stream_clone));
 
-        RelayServer::relay_stream_to_stream(stream, outgoing);
+        thread::spawn (move || RelayServer::relay_stream_to_stream(stream, outgoing));
     }
 
     /// Relays messages from from_stream to to_stream until
