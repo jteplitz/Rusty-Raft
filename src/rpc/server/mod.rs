@@ -2,7 +2,9 @@ extern crate capnp;
 #[cfg(test)]
 mod test;
 
+use std::mem;
 use std::sync::{Arc};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::error::Error;
 use super::{RpcError, RpcClientError, RpcClientErrorKind};
 
@@ -12,6 +14,7 @@ use rpc_capnp::{rpc_request, rpc_response, rpc_error};
 use std::net::{TcpListener, TcpStream, ToSocketAddrs, SocketAddr};
 use std::io::{Write, Error as IoError, ErrorKind, BufReader, BufWriter};
 use std::thread;
+use std::thread::{JoinHandle};
 use std::collections::HashMap;
 
 macro_rules! println_stderr(
@@ -47,6 +50,8 @@ type ServicesMap = HashMap<i16, Box<RpcObject>>;
 pub struct RpcServer {
     services: Arc<ServicesMap>,
     listener: Option<TcpListener>,
+    repl_thread: Option<JoinHandle<()>>,
+    shutting_down: Arc<AtomicBool>
 }
 
 impl RpcServer {
@@ -58,7 +63,7 @@ impl RpcServer {
             map.insert(opcode.clone(), rpc_object);
         }
 
-        RpcServer {services: Arc::new(map), listener: None}
+        RpcServer {services: Arc::new(map), listener: None, repl_thread: None, shutting_down: Arc::new(AtomicBool::new(false))}
     }
 
     ///
@@ -104,22 +109,42 @@ impl RpcServer {
 
         // TODO #1: Thread pool
         let services = self.services.clone();
+        let shutting_down_ref = self.shutting_down.clone();
         thread::spawn(move || {
+            // TODO #1: Thread pool
+            let mut background_threads = vec![];
             loop {
-
                 let stream = listener.accept();
-                let opcode_map = services.clone();
 
                 match stream {
                     Ok((stream, _)) => {
-                        RpcServer::handle_incoming_connection(opcode_map, stream);
+                        let opcode_map = services.clone();
+                        background_threads.push(RpcServer::handle_incoming_connection(opcode_map, stream));
                     }
                     Err(e) => {
+                        // shutdown puts the socket in nonblocking mode which will manifest as an
+                        // error on accept
+                        if shutting_down_ref.load(Ordering::Acquire) {
+                            break;
+                        }
                         // TODO: Handle TCP errors. Though that may end up meaning being better logging
                         println_stderr!("Error on incoming TCP stream. {}", e)
                     }
                 }
             }
+
+            // TODO #1 Thread pool
+            // Join each background thread and then exit
+            for thread in background_threads {
+                match thread.join() {
+                    Ok(_) => {},
+                    Err(_) => {
+                        println_stderr!("Background RPC thread panicked");
+                    }
+                }
+            }
+
+            ()
         });
 
         Ok(())
@@ -140,18 +165,21 @@ impl RpcServer {
         }
     }
 
-
-    // TODO #2: Handle shutdown
-    #[allow(dead_code)]
-	fn shutdown (&mut self) {
-        unimplemented!();
+    /// Consumes the RpcServer and blocks until all background threads have been shutdown
+    /// and the socket has been released.
+    ///
+    /// # Panics
+    /// Panics if the background thread has panicked
+    /// Or if the OS prevents us from waking up the background thread
+	pub fn shutdown (self) {
+        // Drop self. The drop trait blocks until the server shuts down.
 	}
     
     ///
     /// Spawns a new thread to run the function
     /// and sends the result (or error) back to the caller
     ///
-    fn handle_incoming_connection (opcode_map: Arc<ServicesMap>, mut stream: TcpStream) {
+    fn handle_incoming_connection (opcode_map: Arc<ServicesMap>, mut stream: TcpStream) -> JoinHandle<()> {
         thread::spawn(move || {
             let mut response_msg = message::Builder::new_default();
             let rpc_result;
@@ -172,7 +200,7 @@ impl RpcServer {
                 // TODO: Handle TCP errors. Though that may end up meaning being better logging
                 println_stderr!("Error sending Rpc response: {}", e);
             })
-        });
+        })
     }
 
     ///
@@ -277,4 +305,23 @@ impl RpcServer {
         })
     }
 
+}
+
+impl Drop for RpcServer {
+    /// Gracefully shuts down the RpcServer blocking until all conections are closed
+    /// # Panics
+    /// Panics if the background thread has panicked
+    /// Or if the OS prevents us from waking up the background thread
+    fn drop (&mut self) {
+        let repl_thread = mem::replace(&mut self.repl_thread, None);
+        match repl_thread {
+            Some(t) => {
+                self.shutting_down.store(true, Ordering::Release);
+                // it's not possible to have a repl thread and no tcp listener
+                self.listener.as_ref().unwrap().set_nonblocking(true).unwrap();
+                t.join().unwrap();
+            },
+            None => {/* Nothing to shutdown */}
+        }
+    }
 }

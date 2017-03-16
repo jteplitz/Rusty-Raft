@@ -9,6 +9,8 @@ use rpc_capnp::{rpc_request, rpc_response, math_result, math_params};
 use capnp::{serialize_packed, message};
 use super::super::test::{AdditionRpcHandler, start_test_rpc_server};
 use std::collections::HashMap;
+use std::sync::mpsc::channel;
+use std::thread;
 
 /************************/
 /*   BEGIN UNIT TESTS   */
@@ -182,6 +184,39 @@ fn it_sends_back_the_result() {
     assert_eq!(response.get_error(), false);
     let result = response.get_result().get_as::<math_result::Reader>().unwrap();
     assert_eq!(result.get_num(), RESULT);
+}
+
+#[test]
+fn it_shutsdown_gracefully() {
+    const COUNTER: i64 = 231267i64;
+    const OPCODE: i16  = 0i16;
+    const NUM1: i32    = 14;
+    const NUM2: i32    = 789;
+    const RESULT: i32  = NUM1 + NUM2;
+    let server = start_test_rpc_server(("localhost", 0));
+    let port = server.get_local_addr().unwrap().port();
+
+    // connect to the server 
+    let client = TcpStream::connect(("localhost", port)).unwrap();
+    let (tx, rx) = channel();
+
+    // move the server into a background thread that immediatly tries to drop it
+    thread::spawn(move || {
+        tx.send(());
+        server
+    });
+
+    // wait for background thread to spawn
+    rx.recv().unwrap();
+
+    // TODO: This test is imperfect because it's possible (although unlikely)
+    // that the rpc is sent, received, and dealt with before the server shutdown starts blocking
+
+    // send the rpc
+    let rpc_message = create_test_addition_rpc(COUNTER, OPCODE, NUM1, NUM2);
+    let mut writer = BufWriter::new(client.try_clone().unwrap());
+    serialize_packed::write_message(&mut writer, &rpc_message).unwrap();
+    writer.flush().unwrap();
 }
 
 /***************************/
