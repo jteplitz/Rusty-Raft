@@ -1,8 +1,8 @@
 extern crate capnp;
 
 use std::sync::{atomic, Arc};
-use std::net::{TcpStream};
-use std::io::{Write, BufWriter, BufReader, ErrorKind};
+use std::net::{TcpStream, Shutdown};
+use std::io::{Read, Write, BufWriter, BufReader, ErrorKind};
 use super::{RpcServer, RpcObject};
 use super::super::{RpcError, RpcClientErrorKind};
 use rpc_capnp::{rpc_request, rpc_response, math_result, math_params};
@@ -173,6 +173,7 @@ fn it_sends_back_the_result() {
     let mut writer = BufWriter::new(client.try_clone().unwrap());
     serialize_packed::write_message(&mut writer, &rpc_message).unwrap();
     writer.flush().unwrap();
+    client.shutdown(Shutdown::Write);
 
     // create a response message to store the response value and metadata
     let mut reader = BufReader::new(client);
@@ -192,7 +193,10 @@ fn it_shutsdown_when_dropped() {
     let port = server.get_local_addr().unwrap().port();
     {
         // ensure the server can accept connections before shutting down
-        let client = TcpStream::connect(("localhost", port)).unwrap();
+        let mut client = TcpStream::connect(("localhost", port)).unwrap();
+        client.shutdown(Shutdown::Write);
+        let mut buf = Vec::new();
+        client.read_to_end(&mut buf).unwrap();
     }
 
     drop(server);
@@ -210,7 +214,7 @@ fn it_shutsdown_gracefully() {
     let port = server.get_local_addr().unwrap().port();
 
     // connect to the server 
-    let client = TcpStream::connect(("localhost", port)).unwrap();
+    let mut client = TcpStream::connect(("localhost", port)).unwrap();
     let (tx, rx) = channel();
 
     // move the server into a background thread that immediatly tries to drop it
@@ -230,6 +234,9 @@ fn it_shutsdown_gracefully() {
     let mut writer = BufWriter::new(client.try_clone().unwrap());
     serialize_packed::write_message(&mut writer, &rpc_message).unwrap();
     writer.flush().unwrap();
+    client.shutdown(Shutdown::Write);
+    let mut buf = Vec::new();
+    client.read_to_end(&mut buf).unwrap();
 }
 
 /***************************/

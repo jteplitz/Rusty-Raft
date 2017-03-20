@@ -1,6 +1,6 @@
 extern crate capnp;
 
-use std::net::{TcpStream, ToSocketAddrs};
+use std::net::{TcpStream, ToSocketAddrs, Shutdown};
 use std::io::{BufWriter, BufReader, Write};
 use rpc_capnp::{rpc_request, rpc_response};
 use capnp::{serialize_packed, message};
@@ -60,7 +60,10 @@ impl Rpc {
             .and_then(move |_| {
                 writer.flush()
             })
-            .map(move |_| {
+            .and_then(|_| {
+                s.shutdown(Shutdown::Write)
+            })
+            .map(|_| {
                 s
             })
         })

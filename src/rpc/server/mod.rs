@@ -20,7 +20,7 @@ use capnp::serialize::OwnedSegments;
 use rpc_capnp::{rpc_request, rpc_response, rpc_error};
 
 use std::net::{ToSocketAddrs, SocketAddr};
-use std::io::{Write, Error as IoError, ErrorKind, BufReader, BufWriter};
+use std::io::{Read, Write, Error as IoError, ErrorKind, BufWriter, Cursor};
 use std::thread;
 use std::thread::{JoinHandle};
 use std::collections::HashMap;
@@ -251,19 +251,25 @@ impl RpcServer {
         thread::spawn(move || {
             let mut response_msg = message::Builder::new_default();
             let rpc_result;
+
+            // write the full buffer to the non-blocking stream
+            let poll = Poll::new().unwrap();
+            // register the stream
+            poll.register(&stream, Token(0), Ready::writable() | Ready::readable(), PollOpt::edge()).unwrap();
+
             
             { // response_msg_ref scope
                 let response_msg_ref = &mut response_msg;
                 // TODO(jason) #5: Handle multiple RPCs on the same stream
-                rpc_result = RpcServer::wait_for_rpc(&mut stream)
+                rpc_result = RpcServer::wait_for_rpc(&mut stream, &poll)
                 .and_then(move |reader| {
                     RpcServer::do_rpc(opcode_map, reader, response_msg_ref)
                 });
             }
 
             match rpc_result {
-                Ok(_) => RpcServer::send_message(&mut stream, &response_msg),
-                Err(e) => RpcServer::send_error(e, &mut stream, &mut response_msg)
+                Ok(_) => RpcServer::send_message(&mut stream, &response_msg, &poll),
+                Err(e) => RpcServer::send_error(e, &mut stream, &mut response_msg, &poll)
             }.unwrap_or_else(|e| {
                 // TODO: Handle TCP errors. Though that may end up meaning being better logging
                 println_stderr!("Error sending Rpc response: {}", e);
@@ -274,19 +280,49 @@ impl RpcServer {
     ///
     /// Sends the given message over the tcp stream.
     ///
-    fn send_message<A: message::Allocator> (stream: &mut TcpStream, msg: &message::Builder<A>)
+    fn send_message<A: message::Allocator> (stream: &mut TcpStream, msg: &message::Builder<A>, poll: &Poll)
         -> Result<(), IoError>
     {
-        // use a buffered writer to avoid extra syscalls.
-        let mut writer = BufWriter::new(stream);
-        try!(serialize_packed::write_message(&mut writer, msg));
-        writer.flush()
+        // Naivly write the message to a buffer. See #7 for details.
+        let mut buffer = Vec::new();
+        {
+            let mut writer = BufWriter::new(&mut buffer);
+            try!(serialize_packed::write_message(&mut writer, msg));
+            try!(writer.flush());
+        }
+
+        let mut events = Events::with_capacity(10);
+        let mut position = 0;
+        'polling: loop {
+            loop {
+                // call write until we write all bytes from the buffer
+                // or we recieve a WouldBlock
+                match stream.write(&buffer[position..]) {
+                    Ok(bytes_written) => {
+                        position += bytes_written;
+                        if position == buffer.len() {
+                            break 'polling;
+                        }
+                    },
+                    Err(e) => {
+                        if e.kind() == ErrorKind::WouldBlock {
+                            break;
+                        } else {
+                            return Err(e);
+                        }
+                    }
+                }
+            }
+            try!(poll.poll(&mut events, None));
+        }
+
+        Ok(())
     }
 
     ///
     /// Sends the given error over the tcp stream.
     ///
-    fn send_error<A: message::Allocator> (err: RpcError, stream: &mut TcpStream, msg: &mut message::Builder<A>)
+    fn send_error<A: message::Allocator> (err: RpcError, stream: &mut TcpStream, msg: &mut message::Builder<A>, poll: &Poll)
             -> Result<(), IoError>
     {
         // The message should already have the counter set, so we get the root and set the error flag
@@ -301,16 +337,33 @@ impl RpcServer {
             // TODO #3: Errors shuold be more than just text
             result_builder.set_msg(err.description());
         }
-        RpcServer::send_message(stream, msg)
+        RpcServer::send_message(stream, msg, poll)
     }
 
     ///
     /// Waits for an RPC message on the given TCP stream and returns a message reader
     ///
-    fn wait_for_rpc(stream: &mut TcpStream) -> Result<message::Reader<OwnedSegments>, RpcError> {
-        let mut reader = BufReader::new(stream);
+    fn wait_for_rpc(stream: &mut TcpStream, poll: &Poll) -> Result<message::Reader<OwnedSegments>, RpcError> {
+        let mut events = Events::with_capacity(10);
+
+        let mut buffer = Vec::new();
+        loop {
+            match stream.read_to_end(&mut buffer) {
+                Ok(_) => {
+                    break;
+                },
+                Err(e) => {
+                    if e.kind() != ErrorKind::WouldBlock {
+                        return Err(e).map_err(RpcError::Io)
+                    }
+                }
+            }
+            try!(poll.poll(&mut events, None)
+                .map_err(RpcError::Io));
+        }
         // create a message reader from the stream
-        serialize_packed::read_message(&mut reader, capnp::message::ReaderOptions::new())
+        let mut c = Cursor::new(buffer);
+        serialize_packed::read_message(&mut c, capnp::message::ReaderOptions::new())
         .map_err(RpcError::Capnp)
     }
 
@@ -384,7 +437,7 @@ impl Drop for RpcServer {
         let repl_thread = mem::replace(&mut self.repl_thread, None);
         match repl_thread {
             Some(t) => {
-                    // It shouldn't be possible to have a repl_thread and not have a shutdown_rx
+                // It shouldn't be possible to have a repl_thread and not have a shutdown_rx
                 self.shutdown_tx.as_ref().unwrap().send(()).unwrap();
                 t.join().unwrap();
             },
