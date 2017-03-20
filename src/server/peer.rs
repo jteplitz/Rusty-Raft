@@ -12,9 +12,11 @@ use std::sync::mpsc::{channel, Sender, Receiver};
 use std::mem;
 
 use super::log::{Log, Entry};
-use super::constants;
+use super::super::common::constants;
 use super::{MainThreadMessage, AppendEntriesReply, RequestVoteReply};
 
+
+/// Messages received by peer thread
 #[derive(Debug)]
 pub struct AppendEntriesMessage {
     pub term: u64,

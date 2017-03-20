@@ -1,6 +1,6 @@
 use std::fmt;
 use raft_capnp::{entry, Op as ProtoOp};
-use super::super::state_machine::{SessionInfo};
+use super::super::common::{SessionInfo};
 
 ///
 /// Abstraction for a single Entry for our log.

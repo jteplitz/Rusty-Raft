@@ -1,6 +1,5 @@
 mod log;
 mod peer;
-mod constants;
 mod state_machine;
 use capnp;
 use rand;
@@ -9,7 +8,9 @@ use raft_capnp::{append_entries, append_entries_reply,
                  client_request, client_request_reply, Op as ProtoOp};
 use rpc::{RpcError};
 use rpc::server::{RpcObject, RpcServer};
-use state_machine::{ExactlyOnceStateMachine, SessionInfo, Config, RaftError};
+use client::state_machine::{ExactlyOnceStateMachine};
+use common::{SessionInfo, Config, RaftError};
+use common::constants;
 use std::net::SocketAddr;
 use std::time::{Duration, Instant};
 use std::thread;
@@ -24,17 +25,6 @@ use self::peer::{Peer, PeerHandle, PeerThreadMessage, RequestVoteMessage};
 use std::io::Error as IoError;
 use rand::distributions::{IndependentSample, Range};
 
-pub use self::constants::CLIENT_REQUEST_OPCODE;
-
-// States that each machine can be in!
-#[derive(Debug, PartialEq, Clone, Copy)]
-enum State {
-    Candidate { num_votes: usize, start_time: Instant },
-    Leader { last_heartbeat: Instant },
-    Follower,
-}
-
-// TODO: Move messages into seperate file
 
 ///
 /// Messages that can be sent to the main thread.
@@ -59,6 +49,17 @@ pub enum MainThreadMessage {
     ClientAppendRequest,
     Shutdown
 }
+
+
+// States that each machine can be in!
+#[derive(Debug, PartialEq, Clone, Copy)]
+enum State {
+    Candidate { num_votes: usize, start_time: Instant },
+    Leader { last_heartbeat: Instant },
+    Follower,
+}
+
+// TODO: Move messages into seperate file
 
 /// Store's the state that the server is currently in along with the current_term
 /// and current_id. These fields should all share a lock.

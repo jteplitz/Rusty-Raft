@@ -4,18 +4,18 @@ use std::sync::mpsc::{channel, Sender};
 use std::thread;
 use std::thread::JoinHandle;
 
-use super::super::state_machine::{ExactlyOnceStateMachine, RaftError};
+use super::super::client::state_machine::{ExactlyOnceStateMachine};
+use super::super::common::{RaftError};
 use super::log::{Log, Op};
 
 ///
-/// Types of messages to be sent to the state machine thread.
+/// Messages to be sent to the state machine thread.
 ///
 pub enum StateMachineMessage {
     Command (usize),
     Query { buffer: Vec<u8>, response_channel: Sender<Result<Vec<u8>, RaftError>> },
     Shutdown
 }
-
 ///
 /// Starts thread responsible for performing operations on state machine.
 /// Loops waiting on a channel for operations to perform.

@@ -1,9 +1,10 @@
+pub mod state_machine;
 use capnp::serialize::OwnedSegments;
 use capnp::message::Reader;
 use raft_capnp::{client_request, client_request_reply, Op};
 use rpc::client::Rpc;
 use rpc::RpcError;
-use state_machine::{Config, RaftError, SessionInfo};
+use common::{Config, RaftError, SessionInfo};
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -245,7 +246,7 @@ mod tests {
     use super::{RaftConnection, BACKOFF_TIME_MS};
     use super::super::rpc::server::{RpcObject, RpcServer};
     use super::super::rpc::RpcError;
-    use super::super::state_machine::Config;
+    use super::super::common::Config;
     use super::super::raft_capnp::{client_request_reply};
     use capnp;
     use std::collections::HashMap;
