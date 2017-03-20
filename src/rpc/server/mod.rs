@@ -9,7 +9,6 @@ mod test;
 use std::mem;
 use std::sync::{Arc};
 use std::error::Error;
-use std::sync::mpsc;
 use std::sync::mpsc::{TryRecvError};
 use super::{RpcError, RpcClientError, RpcClientErrorKind};
 

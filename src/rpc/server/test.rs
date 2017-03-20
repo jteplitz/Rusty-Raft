@@ -216,16 +216,14 @@ fn it_shutsdown_gracefully() {
     // connect to the server 
     let mut client = TcpStream::connect(("localhost", port)).unwrap();
     let (tx, rx) = channel();
-
     // move the server into a background thread that immediatly tries to drop it
-    thread::spawn(move || {
-        tx.send(());
-        server
+    let t = thread::spawn(move || {
+        tx.clone().send(()).unwrap();
+        server;
     });
 
     // wait for background thread to spawn
     rx.recv().unwrap();
-
     // TODO: This test is imperfect because it's possible (although unlikely)
     // that the rpc is sent, received, and dealt with before the server shutdown starts blocking
 

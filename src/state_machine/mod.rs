@@ -111,8 +111,8 @@ impl ExactlyOnceStateMachine {
 
     pub fn command (&self, buffer: &[u8], session: SessionInfo)
         -> Result<(), RaftError> {
-        self.client_state_machine.command(buffer);
-        Ok(())
+            // TODO (sydli) impl
+        self.client_state_machine.command(buffer)
     }
 
     pub fn query (&self, buffer: &[u8]) -> Result<Vec<u8>, RaftError> {
