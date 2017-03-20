@@ -71,7 +71,7 @@ fn start_raft_servers(relay_server: &mut RelayServer, addrs: &HashMap<u64, Socke
 /// This test is as much a sanity check on our testing code as on the raft code.
 /// It just makes sure we can start up a static cluster of servers without crashing
 fn it_starts_up_a_cluster() {
-    const NUM_SERVERS: u64 = 1;
+    const NUM_SERVERS: u64 = 3;
 
     {
         let (mut relay_server, addrs) = start_relay_server(NUM_SERVERS);
@@ -97,7 +97,7 @@ fn create_client_request(op: Op, data: &[u8]) -> Rpc {
 /// Simple normal case test that starts up a static cluster, sends an entry,
 /// and ensures that entry is recieved by all state machines
 fn it_replicates_an_entry() {
-    const NUM_SERVERS: u64 = 5;
+    const NUM_SERVERS: u64 = 8;
     const REPLICATE_TIMEOUT: u64 = 100;
     const DATA_LENGTH: usize = 1;
     let replicate_timeout = Duration::from_millis(REPLICATE_TIMEOUT);
