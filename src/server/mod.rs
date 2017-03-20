@@ -13,7 +13,7 @@ use std::time::{Duration, Instant};
 use std::thread;
 use std::thread::JoinHandle;
 use std::sync::{Arc, Mutex, Condvar};
-use std::sync::mpsc::{channel, Sender, Receiver};
+use std::sync::mpsc::{channel, Sender, Receiver, RecvTimeoutError};
 
 use self::log::{Log, MemoryLog, Entry, Op};
 use self::peer::{Peer, PeerHandle, PeerThreadMessage, RequestVoteMessage};
@@ -396,7 +396,8 @@ fn handle_request_vote_reply(reply: RequestVoteReply, info: &mut ServerInfo,
         if num_votes > (info.peers.len() + 1) / 2 {
             // Woo! We won the election
             state.transition_to_leader(info, log, state_condition);
-            println!("Server {}: Became leader for term {}", info.me.0, state.current_term);
+            println!("Server {}: Became leader for term {} with {} votes out of {} peers", info.me.0, state.current_term, num_votes,
+                     info.peers.len());
         }
     }
 }
@@ -499,69 +500,60 @@ impl Server {
                 { // state lock scope
                     // TODO(jason): Decompose and test
                     let &(ref state_ref, ref cvar) = &*self.state;
-                    let mut state = state_ref.lock().unwrap();
+                    let state = state_ref.lock().unwrap();
 
                     match state.current_state {
                         State::Follower => {
                             let now = Instant::now();
-                            current_timeout = state.election_timeout - now.duration_since(state.last_leader_contact)
+                            current_timeout = state.election_timeout.checked_sub(now.duration_since(state.last_leader_contact));
+                                                                                 
                         }
                         State::Candidate{start_time, ..} => {
                             let time_since_election = Instant::now() - start_time;
 
-                            // TODO: Replace explicit underflow checks with checked_sub once rust 1.16
-                            // is out. Scheduled for March 16th 2017
-                            if time_since_election > state.election_timeout {
-                                // We timed out in between recieving a message and blocking on the message
-                                // pipe. Start a new election
-                                current_timeout = self.start_election(&mut state, cvar);
-                            } else {
-                                current_timeout = state.election_timeout - time_since_election;
-                            }
+                            current_timeout = state.election_timeout.checked_sub(time_since_election);
                         },
                         State::Leader{last_heartbeat} => {
                             let heartbeat_timeout = self.info.heartbeat_timeout;
                             // TODO: Should last_heartbeat be in the leader state?
                             let since_last_heartbeat = Instant::now()
                                                            .duration_since(last_heartbeat);
-                            // TODO: Replace explicit underflow checks with checked_sub once rust 1.16
-                            // is out. Scheduled for March 16th 2017
-                            if since_last_heartbeat > heartbeat_timeout {
-                                // We timed out in between recieving a message and blocking on the message
-                                // pipe. Send a heartbeat,
-                                broadcast_append_entries(&mut self.info, &mut state, self.log.clone());
-                                current_timeout = heartbeat_timeout;
-                            } else {
-                                current_timeout = heartbeat_timeout - since_last_heartbeat;
-                            }
+                            current_timeout = heartbeat_timeout.checked_sub(since_last_heartbeat);
                         },
                     } // end match server.state
                 } // release state lock
 
-                let message = match rx.recv_timeout(current_timeout) {
-                    Ok(message) => message,
+                // Acquire state lock
+                let message = current_timeout
+                .ok_or(RecvTimeoutError::Timeout)
+                .and_then(|timeout| {
+                    rx.recv_timeout(timeout)
+                });
+
+                match message {
+                    Ok(m) => {
+                        let &(ref state_ref, ref cvar) = &*self.state;
+                        let ref mut state = * state_ref.lock().unwrap();
+                        // TODO(Jason): Add a shutdown message that the client can send
+                        // to gracefully shutdown the server
+                        match m {
+                            MainThreadMessage::AppendEntriesReply(m) => {
+                                handle_append_entries_reply(m, &mut self.info, state, cvar, self.log.clone());
+                            },
+                            MainThreadMessage::ClientAppendRequest => {
+                                broadcast_append_entries(&mut self.info, state, self.log.clone());
+                            },
+                            MainThreadMessage::RequestVoteReply(m) =>  {
+                                handle_request_vote_reply(m, &mut self.info, state, cvar, self.log.clone());
+                            },
+                        };
+                    },
                     Err(_) => {
                         self.handle_timeout();
                         continue;
-                    },
-                };
-
-                // TODO(Jason): Add a shutdown message that the client can send
-                // to gracefully shutdown the server
-                // Acquire state lock
-                let &(ref state_ref, ref cvar) = &*self.state;
-                let ref mut state = * state_ref.lock().unwrap();
-                match message {
-                    MainThreadMessage::AppendEntriesReply(m) => {
-                        handle_append_entries_reply(m, &mut self.info, state, cvar, self.log.clone());
-                    },
-                    MainThreadMessage::ClientAppendRequest => {
-                        broadcast_append_entries(&mut self.info, state, self.log.clone());
-                    },
-                    MainThreadMessage::RequestVoteReply(m) =>  {
-                        handle_request_vote_reply(m, &mut self.info, state, cvar, self.log.clone());
-                    },
-                };
+                    }
+                }
+                
             } // end loop
         })
     }

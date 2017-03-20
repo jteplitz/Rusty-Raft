@@ -49,6 +49,7 @@ fn start_relay_server (num_servers: u64) -> (RelayServer, HashMap<u64, SocketAdd
 /// ServerHandle) or check on the state of the MockStateMachine
 fn start_raft_servers(relay_server: &mut RelayServer, addrs: &HashMap<u64, SocketAddr>) -> Vec<StateMachineHandle> {
     const HEARTBEAT_TIMEOUT: u64 = 75;
+    println!("Starting {} raft servers", addrs.len());
 
     (0..addrs.len() as u64)
     .map(|i| {
