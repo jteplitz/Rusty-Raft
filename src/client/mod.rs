@@ -1,9 +1,9 @@
 use capnp::serialize::OwnedSegments;
 use capnp::message::Reader;
-use raft_capnp::{client_request, client_request_reply};
+use raft_capnp::{client_request, client_request_reply, Op};
 use rpc::client::Rpc;
 use rpc::RpcError;
-use state_machine::{Config, RaftError};
+use state_machine::{Config, RaftError, SessionInfo};
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -19,7 +19,7 @@ const BACKOFF_TIME_MS:u64 = 50;
 
 ///
 /// # Usage
-/// let raft_db = RaftConnection::start_session(Config::from_file("config"));
+/// let raft_db = RaftConnection::new_session(Config::from_file("config"));
 /// raft_db.command( ... );
 /// let result = raft_db.query( ... );
 ///
@@ -27,40 +27,102 @@ const BACKOFF_TIME_MS:u64 = 50;
 /// until the request succeeds (with an increasing backoff timeout). They are
 /// implicitly guaranteed to terminate due to the properties of the Raft protocol.
 ///
+/// Note: not thread-safe. Wrap object in Mutex if shared across threads.
+///
 pub struct RaftConnection {
     cluster: HashMap<u64, SocketAddr>,  // Known peers
     leader_guess: SocketAddr,           // Current guess for leader.
     backoff_time: Duration,             // Base backoff time.
-    backoff_multiplier: u32,            // Multiplier for backoff time (init to 0).
+    client_id: Option<u64>,             // client id for current session
+    sequence_number: u64,               // client id for current session
 }
 
 impl RaftConnection {
     ///
-    /// Creates a mock (sessionless) RaftConnection from a Config file.
+    /// Simply constructs a RaftConnection object from cluster in |config|.
     ///
-    #[cfg(test)]
-    fn new_mock(config: Config) -> Option<RaftConnection> {
-        Some(RaftConnection { 
+    fn new(config: Config, client_id: Option<u64>) -> RaftConnection {
+        RaftConnection { 
             cluster: config.cluster.clone(),
             leader_guess: config.cluster.iter().next().map(|(_, b)| *b).unwrap(),
             backoff_time: Duration::from_millis(BACKOFF_TIME_MS),
-            backoff_multiplier: 0,
+            client_id: client_id,
+            sequence_number: 0,
+        }
+    }
+
+    fn get_session(&mut self) -> SessionInfo {
+        if self.client_id.is_none() {
+            self.open_session();
+        }
+        SessionInfo {
+            client_id: self.client_id.unwrap(),
+            sequence_number: self.sequence_number,
+        }
+    }
+
+    ///
+    /// Creates a mock (sessionless) RaftConnection from a Config file.
+    ///
+    fn new_mock(config: Config) -> RaftConnection {
+        RaftConnection::new(config, Some(0))
+    }
+
+    fn handle_register_client_reply(msg: Reader<OwnedSegments>) -> Result<u64, RaftError> {
+        Rpc::get_result_reader(&msg)
+            .and_then(|result| {
+                result.get_as::<client_request_reply::Reader>()
+                      .map_err(RpcError::Capnp)
+            })
+            .map_err(RaftError::RpcError)
+            .and_then(|reply| {
+                if !reply.get_success() {
+                    let leader_guess = reply.get_leader_addr().ok()
+                                            .map(|s| SocketAddr::from_str(s).unwrap());
+                    Err(RaftError::NotLeader(leader_guess))
+                } else {
+                    Ok(reply.get_client_id())
+                }
+            })
+    }
+
+    ///
+    /// Registers this client with the current leader.
+    ///
+    fn register_client(&mut self) -> Result<u64, RaftError> {
+        self.perform_leader_op(|leader_addr|  {
+            let mut rpc = Rpc::new(2); // TODO: make constants accessible
+                       // Rpc::new(constants::CLIENT_REQUEST_OPCODE);
+            {
+                let mut params = rpc.get_param_builder().init_as::<client_request::Builder>();
+                params.set_op(Op::OpenSession);
+            }
+            rpc.send(leader_addr)
+               .map_err(RaftError::RpcError)
+               .and_then(RaftConnection::handle_register_client_reply)
+        })
+    }
+
+    fn open_session(&mut self) -> Result<(), RaftError> {
+        self.register_client().map(|client_id| {
+            self.client_id = Some(client_id);
         })
     }
 
     ///
     /// Opens a new session with the Raft cluster specified by |config|.
     ///
-    pub fn new_session(config: Config) -> Option<RaftConnection> {
-        // TODO (sydli)
-        None
+    pub fn new_with_session(config: Config) -> Option<RaftConnection> {
+        let mut conn = RaftConnection::new(config, None);
+        conn.open_session();
+        Some(conn)
     }
 
     ///
     /// Helper to construct a ClientRequest rpc from |buffer| (the data to pass
     /// to the request) and |op| (the type of the request).
     ///
-    fn construct_client_request_rpc(buffer: &[u8], op: client_request::Op) -> Rpc {
+    fn construct_client_request_rpc(buffer: &[u8], op: Op, session: SessionInfo) -> Rpc {
         let mut rpc = Rpc::new(2); // TODO: make constants accessible
                    // Rpc::new(constants::CLIENT_REQUEST_OPCODE);
         {
@@ -68,6 +130,10 @@ impl RaftConnection {
                                 .init_as::<client_request::Builder>();
             params.set_op(op);
             params.set_data(buffer.clone());
+            {
+                let mut session_builder = params.borrow().get_session().unwrap();
+                session.into_proto(&mut session_builder);
+            }
         }
         rpc
     }
@@ -111,26 +177,41 @@ impl RaftConnection {
     }
 
     ///
-    /// Helper function
-    fn send_client_request(&mut self, buffer: &[u8], op: client_request::Op)
-        -> Result<Option<Vec<u8>>, RaftError> {
+    /// Performs |leader_op| on guessed leader address. If |leader_op| results in
+    /// a |NotLeader| error, try again with either a random new leader or
+    /// the leader hint in the error reply. Otherwise return the result of |leader_op|.
+    ///
+    fn perform_leader_op<T, F>(&mut self, leader_op: F) -> Result<T, RaftError>
+        where F: Fn(SocketAddr) -> Result<T, RaftError> {
+        let mut backoff_multiplier = 0;
         loop {
-            let rpc = RaftConnection::construct_client_request_rpc(buffer, op);
-            let result =  rpc.send(self.leader_guess)
-                             .map_err(RaftError::RpcError)
-                             .and_then(RaftConnection::handle_client_reply);
+            let result = leader_op(self.leader_guess);
             // If "not leader," retry with new leader.
             if let Err(ref err) = result {
                 if let RaftError::NotLeader(leader) = *err {
                     self.leader_guess = leader.unwrap_or(self.choose_random_leader());
-                    self.backoff_multiplier += 1;
-                    thread::sleep(self.backoff_time * self.backoff_multiplier);
+                    backoff_multiplier += 1;
+                    thread::sleep(self.backoff_time * backoff_multiplier);
                     continue;
                 }
             }
-            self.backoff_multiplier = 0;
             return result;
         }
+    }
+
+    ///
+    /// Sends a client request to the leader of a cluster.
+    /// TODO (sydli): what if request failed due to expired session...
+    ///
+    fn send_client_request(&mut self, buffer: &[u8], op: Op)
+        -> Result<Option<Vec<u8>>, RaftError> {
+        let session = self.get_session();
+        self.perform_leader_op(move |leader_addr|  {
+            RaftConnection::construct_client_request_rpc(buffer, op, session)
+                .send(leader_addr)
+                .map_err(RaftError::RpcError)
+                .and_then(RaftConnection::handle_client_reply)
+        })
     }
 
     ///
@@ -138,7 +219,7 @@ impl RaftConnection {
     /// RaftError if Rpc or Client's state machine fails.
     ///
     pub fn command(&mut self, buffer: &[u8]) -> Result<(), RaftError> {
-        self.send_client_request(buffer, client_request::Op::Write)
+        self.send_client_request(buffer, Op::Write)
             .map(|_| {}) // Command to client should not return data...
     }
 
@@ -149,7 +230,7 @@ impl RaftConnection {
     /// RaftError if Rpc or Client's state machine fails.
     ///
     pub fn query(&mut self, buffer: &[u8]) -> Result<Vec<u8>, RaftError> {
-        self.send_client_request(buffer, client_request::Op::Read)
+        self.send_client_request(buffer, Op::Read)
             .and_then(|option| {
                 match option {
                     // If this succeeded, we should always get data back...
@@ -284,7 +365,7 @@ mod tests {
         }
         // Create and operate on RaftConnection ...
         let start_time = Instant::now();
-        let mut db = RaftConnection::new_mock(get_dummy_config(cluster)).unwrap();
+        let mut db = RaftConnection::new_mock(get_dummy_config(cluster));
         db_op(&mut db);
         // Make sure the db_op computed within the expected backoff time
         // of the chain.
@@ -310,6 +391,12 @@ mod tests {
     }
 
     #[test]
+    fn open_session_redirects_to_leader() {
+        client_request_redirects_to_leader(3, 
+            |db| { assert!((*db).open_session().is_ok()); });
+    }
+
+    #[test]
     fn command_sends() {
         let data = vec![];
         client_request_redirects_to_leader(0,
@@ -321,5 +408,12 @@ mod tests {
         let data = vec![];
         client_request_redirects_to_leader(0,
             |db| { assert!((*db).query(&data).is_ok()); });
+    }
+
+
+    #[test]
+    fn open_session_sends() {
+        client_request_redirects_to_leader(0, 
+            |db| { assert!((*db).open_session().is_ok()); });
     }
 }

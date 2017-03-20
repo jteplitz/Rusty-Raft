@@ -1,5 +1,6 @@
 use std::fmt;
-use raft_capnp::entry;
+use raft_capnp::{entry, Op as ProtoOp};
+use super::super::state_machine::{SessionInfo};
 
 ///
 /// Abstraction for a single Entry for our log.
@@ -13,8 +14,9 @@ pub struct Entry {
 
 #[derive(Clone)]
 pub enum Op {
-    Write (Vec<u8>),
+    Write {data: Vec<u8>, session:SessionInfo},
     Read  (Vec<u8>),
+    OpenSession,
     Noop,
     Unknown,
 }
@@ -30,7 +32,7 @@ pub fn random_entry_with_term(term: u64) -> Entry {
   Entry {
       index: 0,
       term: term,
-      op: Op::Write(vec),
+      op: Op::Write{data: vec, session: SessionInfo::new_empty()},
   }
 }
 
@@ -65,10 +67,12 @@ impl Entry {
     ///
     pub fn from_proto(entry_proto: entry::Reader) -> Entry {
         let op = match entry_proto.get_op().unwrap() {
-            entry::Op::Write => Op::Write(entry_proto.get_data().unwrap().to_vec()),
-            entry::Op::Read => Op::Read(entry_proto.get_data().unwrap().to_vec()),
-            entry::Op::Noop => Op::Noop,
-            entry::Op::Unknown => Op::Unknown,
+            ProtoOp::Write => Op::Write{data: entry_proto.get_data().unwrap().to_vec(),
+            session: SessionInfo::from_proto(entry_proto.get_session().unwrap())},
+            ProtoOp::Read => Op::Read(entry_proto.get_data().unwrap().to_vec()),
+            ProtoOp::OpenSession => Op::OpenSession,
+            ProtoOp::Noop => Op::Noop,
+            ProtoOp::Unknown => Op::Unknown,
         };
         Entry {
             index: entry_proto.get_index() as usize,
@@ -80,12 +84,13 @@ impl Entry {
     ///
     /// Retrieves the appropriate proto "Op" enum for this entry's |op|.
     ///
-    fn get_proto_op(&self) -> entry::Op {
+    fn get_proto_op(&self) -> ProtoOp {
         match self.op {
-            Op::Write(_) => entry::Op::Write,
-            Op::Read(_) => entry::Op::Read,
-            Op::Noop => entry::Op::Noop,
-            Op::Unknown => entry::Op::Unknown,
+            Op::Write{..} => ProtoOp::Write,
+            Op::Read(_) => ProtoOp::Read,
+            Op::OpenSession => ProtoOp::OpenSession,
+            Op::Noop => ProtoOp::Noop,
+            Op::Unknown => ProtoOp::Unknown,
         }
     }
 
@@ -104,10 +109,9 @@ impl Entry {
     ///
     fn get_data(&self) -> Vec<u8> {
         match self.op {
-            Op::Write(ref data) => data.clone(),
+            Op::Write{ref data, .. } => data.clone(),
             Op::Read(ref data) => data.clone(),
-            Op::Noop => vec![],
-            Op::Unknown => vec![],
+            Op::OpenSession | Op::Noop | Op::Unknown  => vec![],
         }
     }
 }

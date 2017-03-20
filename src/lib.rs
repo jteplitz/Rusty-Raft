@@ -33,4 +33,5 @@ mod raft_capnp {
 }
 
 pub use raft_capnp::client_request;
+pub use raft_capnp::Op;
 pub use raft_capnp::client_request_reply;

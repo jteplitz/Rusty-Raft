@@ -11,7 +11,7 @@ use rusty_raft::state_machine::*;
 use rusty_raft::rpc::client::*;
 use rusty_raft::rpc::RpcError;
 use rusty_raft::client_request;
-use rusty_raft::client_request::Op;
+use rusty_raft::Op;
 use rusty_raft::client_request_reply;
 
 use rand::{thread_rng, Rng};
@@ -85,11 +85,16 @@ fn create_client_request(op: Op, data: &[u8]) -> Rpc {
     {
         let mut param_builder = rpc.get_param_builder().init_as::<client_request::Builder>();
         param_builder.set_op(op);
+        {
+            let mut session_builder = param_builder.borrow().get_session().unwrap();
+            SessionInfo::new_empty().into_proto(&mut session_builder);
+        }
         param_builder.set_data(data);
     }
     rpc
 }
 
+#[ignore]
 #[test]
 /// Simple normal case test that starts up a static cluster, sends an entry,
 /// and ensures that entry is recieved by all state machines
@@ -126,7 +131,7 @@ fn it_replicates_an_entry() {
     // ensure that all state machines replicated the entry 
     assert!(state_machines
                 .iter()
-                .map(|handle| handle.rx.recv_timeout(replicate_timeout).unwrap())
+                .map(|handle|handle.rx.recv_timeout(replicate_timeout).unwrap())
                 .all(|vec| vec.iter()
                               .zip(data.clone().into_bytes())
                               .all(|(a, b)| *a == b)));

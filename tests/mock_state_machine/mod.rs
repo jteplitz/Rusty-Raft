@@ -10,8 +10,9 @@ pub struct MockStateMachine {
 }
 
 impl MockStateMachine {
-    pub fn new_with_sender(sender: Sender<Vec<u8>>) -> MockStateMachine {
-        MockStateMachine {commands: Mutex::new(sender)}
+    pub fn new_with_sender(sender: Sender<Vec<u8>>) -> ExactlyOnceStateMachine {
+        ExactlyOnceStateMachine::new(Box::new(
+                MockStateMachine {commands: Mutex::new(sender)}))
     }
 }
 
