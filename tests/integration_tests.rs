@@ -94,7 +94,7 @@ fn create_client_request(op: Op, data: &[u8]) -> Rpc {
 /// Simple normal case test that starts up a static cluster, sends an entry,
 /// and ensures that entry is recieved by all state machines
 fn it_replicates_an_entry() {
-    const NUM_SERVERS: u64 = 10;
+    const NUM_SERVERS: u64 = 5;
     const REPLICATE_TIMEOUT: u64 = 100;
     const DATA_LENGTH: usize = 1;
     let replicate_timeout = Duration::from_millis(REPLICATE_TIMEOUT);
@@ -103,7 +103,8 @@ fn it_replicates_an_entry() {
     let state_machines = start_raft_servers(&mut relay_server, &addrs);
 
     // TODO: We need a better way of sleeping until a leader is elected
-    thread::sleep_ms(300);
+    // Currently we just allow for 3 rounds of split votes...
+    thread::sleep_ms(1000);
 
     // generate the client append RPC and send it to each server
     // only one should respond that they're the leader
