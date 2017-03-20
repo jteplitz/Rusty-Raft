@@ -14,6 +14,7 @@ use std::thread;
 use std::thread::JoinHandle;
 use std::sync::{Arc, Mutex, Condvar};
 use std::sync::mpsc::{channel, Sender, Receiver, RecvTimeoutError};
+use std::mem;
 
 use self::log::{Log, MemoryLog, Entry, Op};
 use self::peer::{Peer, PeerHandle, PeerThreadMessage, RequestVoteMessage};
@@ -84,6 +85,8 @@ enum State {
     Follower,
 }
 
+// TODO: Move messages into seperate file
+
 ///
 /// Messages that can be sent to the main thread.
 /// *Reply messages encapsulate replies from peer machines, and
@@ -105,6 +108,7 @@ pub enum MainThreadMessage {
     AppendEntriesReply (AppendEntriesReply),
     RequestVoteReply (RequestVoteReply),
     ClientAppendRequest,
+    Shutdown
 }
 
 ///
@@ -113,6 +117,7 @@ pub enum MainThreadMessage {
 enum StateMachineMessage {
     Command (usize),
     Query { buffer: Vec<u8>, response_channel: Sender<Result<Vec<u8>, RaftError>> },
+    Shutdown
 }
 
 ///
@@ -133,6 +138,29 @@ fn apply_commands(next_index: usize, to_commit: usize,
     to_commit + 1
 }
 
+// TODO Move StateMachine logic to seperate file
+struct StateMachineHandle {
+    thread: Option<JoinHandle<()>>,
+    pub tx: Sender<StateMachineMessage>
+}
+
+impl Drop for StateMachineHandle {
+    /// Signals the state machine to shutdown and blocks until it does.
+    ///
+    /// #Panics
+    /// Panics if the state machine has panicked
+    fn drop (&mut self) {
+        let thread = mem::replace(&mut self.thread, None);
+        match thread {
+            Some(t) => {
+                self.tx.send(StateMachineMessage::Shutdown).unwrap();
+                t.join().unwrap();
+            },
+            None => {/* Nothing to drop*/}
+        }
+    }
+}
+
 ///
 /// Starts thread responsible for performing operations on state machine.
 /// Loops waiting on a channel for operations to perform.
@@ -149,9 +177,9 @@ fn apply_commands(next_index: usize, to_commit: usize,
 fn state_machine_thread (log: Arc<Mutex<Log>>,
                          start_index: usize,
                          state_machine: Box<StateMachine>,
-                         ) -> Sender<StateMachineMessage> {
+                         ) -> StateMachineHandle {
     let(to_state_machine, from_main) = channel();
-    thread::spawn(move || {
+    let t = thread::spawn(move || {
         let mut next_index = start_index + 1;
         loop {
             match from_main.recv().unwrap() {
@@ -161,10 +189,12 @@ fn state_machine_thread (log: Arc<Mutex<Log>>,
                 StateMachineMessage::Query { buffer, response_channel } => {
                     response_channel.send(state_machine.query(&buffer)).unwrap();
                 },
+                // TODO: Allow state machines to provide custom shutdown logic?
+                StateMachineMessage::Shutdown => break
             }
         }
     });
-    to_state_machine
+    StateMachineHandle {thread: Some(t), tx: to_state_machine}
 }
 
 /// Store's the state that the server is currently in along with the current_term
@@ -251,10 +281,9 @@ pub struct Server {
 
 struct ServerInfo {
     peers: Vec<PeerHandle>,
-    to_state_machine: Sender<StateMachineMessage>,
+    state_machine: StateMachineHandle,
     me: (u64, SocketAddr),
     heartbeat_timeout: Duration,
-    rpc_server: RpcServer
 }
 
 impl ServerInfo {
@@ -278,20 +307,19 @@ fn update_commit_index(server_info: &ServerInfo, state: &mut ServerState, cv: &C
     // Set new commit index if it's higher!
     if new_index <= state.commit_index { return; }
     state.commit_index = new_index;
-    server_info.to_state_machine.send(StateMachineMessage::Command(state.commit_index)).unwrap();
+    server_info.state_machine.tx.send(StateMachineMessage::Command(state.commit_index)).unwrap();
     cv.notify_all();
 }
 
 pub struct ServerHandle {
     tx: Sender<MainThreadMessage>,
-    thread: JoinHandle<()>,
-    addr: SocketAddr
+    thread: Option<JoinHandle<()>>,
+    addr: SocketAddr,
+    rpc_server: Option<RpcServer>
 }
 
 impl ServerHandle {
-    pub fn shutdown() {
-        // TODO
-        unimplemented!()
+    pub fn shutdown(self) {
     }
 
     /// 
@@ -301,6 +329,33 @@ impl ServerHandle {
     ///
     pub fn get_local_addr(&self) -> SocketAddr {
         self.addr
+    }
+}
+
+impl Drop for ServerHandle {
+    /// Gracefully shuts down the raft server. Blocking until all incoming connections
+    /// have been dealt with.
+    ///
+    /// This should not be called from a thread that would deal with an incoming conncetion or else
+    /// it could deadlock
+    ///
+    /// #Panics
+    /// Panics if the main server thread has panicked
+    fn drop (&mut self) {
+        let thread = mem::replace(&mut self.thread, None);
+        match thread {
+            Some(t) => {
+                {
+                    // drop the rpc server (if it exists)
+                    let rpc_server = mem::replace(&mut self.rpc_server, None);
+                }
+                // send the shutdown message to the main thread
+                self.tx.send(MainThreadMessage::Shutdown).unwrap();
+                // join the main thread
+                t.join().unwrap();
+            },
+            None => {/* Nothing to shutdown*/}
+        };
     }
 }
 
@@ -314,16 +369,17 @@ pub fn start_server<F> (config: Config, load_state_machine: F) -> Result<ServerH
     where F: FnOnce() -> Box<StateMachine> {
     let (tx, rx) = channel();
     let tx_clone = tx.clone();
-    let server = try!(Server::new(config, tx, load_state_machine()));
-    let addr = server.get_local_addr();
+    let (server, rpc_server) = try!(Server::new(config, tx, load_state_machine()));
+    let addr = try!(rpc_server.get_local_addr());
 
     // start the server
     let join_handle = server.repl(rx);
 
     Ok(ServerHandle {
         tx: tx_clone,
-        thread: join_handle,
-        addr: addr
+        thread: Some(join_handle),
+        addr: addr,
+        rpc_server: Some(rpc_server)
     })
 }
 
@@ -404,7 +460,7 @@ fn handle_request_vote_reply(reply: RequestVoteReply, info: &mut ServerInfo,
 
 impl Server {
     fn new (config: Config, tx: Sender<MainThreadMessage>, state_machine: Box<StateMachine>)
-        -> Result<Server, IoError> {
+        -> Result<(Server, RpcServer), IoError> {
         let me = config.me;
         let log = Arc::new(Mutex::new(MemoryLog::new()));
         let state = Arc::new((Mutex::new(ServerState {
@@ -417,9 +473,9 @@ impl Server {
         }), Condvar::new()));
 
         // 1a. Start state machine thread.
-        let to_state_machine = state_machine_thread(log.clone(), 0, state_machine);
+        let state_machine_handle = state_machine_thread(log.clone(), 0, state_machine);
         let to_state_machine_locked = 
-            Arc::new(Mutex::new(to_state_machine.clone()));
+            Arc::new(Mutex::new(state_machine_handle.tx.clone()));
 
         // 1. Start RPC request handlers
         let to_main_locked = Arc::new(Mutex::new(tx.clone()));
@@ -463,24 +519,14 @@ impl Server {
             peers: peers,
             me: (me.0, bound_address),
             heartbeat_timeout: config.heartbeat_timeout,
-            to_state_machine: to_state_machine,
-            rpc_server: rpc_server
+            state_machine: state_machine_handle 
         };
 
-        Ok(Server {
+        Ok((Server {
             state: state,
             log: log,
             info: info,
-        })
-    }
-
-    /// 
-    /// Returns the local address of the given server.
-    /// This is useful if you started a server with port 0 and want to know which port the OS
-    /// assigned to the server.
-    ///
-    pub fn get_local_addr (&self) -> SocketAddr {
-        self.info.me.1
+        }, rpc_server))
     }
 
     /// Starts running the raft consensus algorithim in a background thread.
@@ -506,7 +552,6 @@ impl Server {
                         State::Follower => {
                             let now = Instant::now();
                             current_timeout = state.election_timeout.checked_sub(now.duration_since(state.last_leader_contact));
-                                                                                 
                         }
                         State::Candidate{start_time, ..} => {
                             let time_since_election = Instant::now() - start_time;
@@ -546,6 +591,9 @@ impl Server {
                             MainThreadMessage::RequestVoteReply(m) =>  {
                                 handle_request_vote_reply(m, &mut self.info, state, cvar, self.log.clone());
                             },
+                            MainThreadMessage::Shutdown => {
+                                break;
+                            }
                         };
                     },
                     Err(_) => {
@@ -555,6 +603,9 @@ impl Server {
                 }
                 
             } // end loop
+            
+            // shutdown the peers by dropping their handles
+            self.info.peers.clear();
         })
     }
 
@@ -869,7 +920,6 @@ mod tests {
     use std::time::{Duration, Instant};
     use std::sync::mpsc::{channel, Receiver};
     use std::sync::{Arc, Mutex, Condvar};
-    use rpc::server::{RpcServer};
 
     const DEFAULT_HEARTBEAT_TIMEOUT_MS: u64 = 150;
 
@@ -887,7 +937,7 @@ mod tests {
         let (tx1, rx1) = channel();
         let peers = (0 .. num_peers)
             .map(|n| PeerHandle {id: n, to_peer: tx.clone(),
-                                 next_index: 1, match_index: 0})
+                                 next_index: 1, match_index: 0, thread: None})
             .collect::<Vec<PeerHandle>>();
         let server = Server {
             state: state,
@@ -896,8 +946,7 @@ mod tests {
                 peers: peers,
                 me: (0, SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 8080)),
                 heartbeat_timeout: Duration::from_millis(DEFAULT_HEARTBEAT_TIMEOUT_MS),
-                to_state_machine: tx1,
-                rpc_server: RpcServer::new_with_services(vec![])
+                state_machine: StateMachineHandle {tx: tx1, thread: None}
             },
         };
         (rx, rx1, server)
@@ -930,7 +979,7 @@ mod tests {
                     assert_eq!(entry.entries.len(), vec.len());
                     assert_eq!(entry.entries, vec);
                 },
-                PeerThreadMessage::RequestVote(_) => panic!()
+                _ => panic!()
             }
         }
     }
@@ -948,11 +997,11 @@ mod tests {
         // Each peer should have received a RequestVote message.
         for _ in 0..s.info.peers.len() {
             match rx.recv().unwrap() {
-                PeerThreadMessage::AppendEntries(_) => panic!(),
                 PeerThreadMessage::RequestVote(vote) => {
                     assert_eq!(vote.term, state.current_term);
                     assert_eq!(vote.candidate_id, s.info.me.0);
                 },
+                _ => panic!()
             }
         }
     }
@@ -974,7 +1023,7 @@ mod tests {
         // make sure state machine got a command
         match rx2.recv().unwrap() {
             StateMachineMessage::Command(_) => (),
-            StateMachineMessage::Query { .. } => panic!(),
+            _ => panic!(),
         }
     }
 

@@ -9,7 +9,8 @@ mod test;
 use std::mem;
 use std::sync::{Arc};
 use std::error::Error;
-use std::sync::mpsc::TryRecvError;
+use std::sync::mpsc;
+use std::sync::mpsc::{TryRecvError};
 use super::{RpcError, RpcClientError, RpcClientErrorKind};
 
 use self::mio::tcp::{TcpListener, TcpStream};
@@ -242,7 +243,7 @@ impl RpcServer {
 	pub fn shutdown (self) {
         // Drop self. The drop trait blocks until the server shuts down.
 	}
-    
+
     ///
     /// Spawns a new thread to run the function
     /// and sends the result (or error) back to the caller

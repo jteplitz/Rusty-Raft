@@ -6,8 +6,10 @@ use rpc::{RpcError};
 use rpc::client::Rpc;
 use std::net::SocketAddr;
 use std::thread;
+use std::thread::JoinHandle;
 use std::sync::{Arc, Mutex};
 use std::sync::mpsc::{channel, Sender, Receiver};
+use std::mem;
 
 use super::log::{Log, Entry};
 use super::constants;
@@ -38,23 +40,28 @@ pub struct RequestVoteMessage {
 pub enum PeerThreadMessage {
     AppendEntries (AppendEntriesMessage),
     RequestVote (RequestVoteMessage),
+    Shutdown
 }
 
 ///
 /// Handle for main thread to send messages to Peer.
 ///
 pub struct PeerHandle {
+    // TODO: These don't need to be public
     pub id: u64,
     pub to_peer: Sender<PeerThreadMessage>,
     pub next_index: usize,
     pub match_index: usize,
+    pub thread: Option<JoinHandle<()>>
 }
 
 impl PeerHandle {
     ///
     /// Pushes a non-blocking append-entries request to this peer.
     /// copies entries (self.next_index, commit_index + 1) (inclusive, exlcusive)
-    /// Panics if main thread has been deallocated.
+    ///
+    /// #Panics
+    /// Panics if the peer thread has panicked.
     ///
     pub fn append_entries_nonblocking (&self, leader_id: u64, commit_index: usize,
                                        current_term: u64, log: Arc<Mutex<Log>>) {
@@ -76,7 +83,25 @@ impl PeerHandle {
             entries: entries.to_vec(),
             leader_commit: commit_index,
         });
-        self.to_peer.send(message).unwrap(); // This failing means main thread is down.
+        self.to_peer.send(message).unwrap(); //panics if the peer thread has panicked
+    }
+}
+
+impl Drop for PeerHandle {
+    /// Blocks until the background peer thread exits
+    /// Can potentially block for a long time if this peer is unresponsive
+    ///
+    /// #Panics
+    /// Panics if the peer thread has panicked
+    fn drop (&mut self) {
+        let thread = mem::replace(&mut self.thread, None);
+        match thread {
+            Some(t) => {
+                self.to_peer.send(PeerThreadMessage::Shutdown).unwrap();
+                t.join().unwrap();
+            },
+            None => {/* Nothing to drop */}
+        }
     }
 }
 
@@ -101,7 +126,7 @@ impl Peer {
     pub fn start (id: (u64, SocketAddr), to_main: Sender<MainThreadMessage>) -> PeerHandle {
         let (to_peer, from_main) = channel();
         
-        thread::spawn(move || {
+        let t = thread::spawn(move || {
             let peer = Peer {
                 id: id.0,
                 addr: id.1,
@@ -116,6 +141,7 @@ impl Peer {
             to_peer: to_peer,
             next_index: 1,
             match_index: 0,
+            thread: Some(t)
         }
     }
 
@@ -247,7 +273,8 @@ impl Peer {
         loop {
             match self.from_main.recv().unwrap() {
                 PeerThreadMessage::AppendEntries(entry) => self.append_entries_blocking(entry),
-                PeerThreadMessage::RequestVote(vote) => self.send_request_vote(vote)
+                PeerThreadMessage::RequestVote(vote) => self.send_request_vote(vote),
+                PeerThreadMessage::Shutdown => break
             }
         }
     }
@@ -350,6 +377,7 @@ mod tests {
             to_peer: tx.clone(),
             next_index: PEER_NEXT_INDEX,
             match_index: PEER_NEXT_INDEX - 1,
+            thread: None
         };
         let log: Arc<Mutex<Log>> = Arc::new(Mutex::new(MemoryLog::new_random_with_term(LOG_SIZE, TERM)));
         handle.append_entries_nonblocking(LEADER_ID, COMMIT_INDEX, TERM, log.clone());
@@ -367,7 +395,7 @@ mod tests {
                     .fold(true, |and, (e1, e2)| and && *e1 == *e2);
                 assert!(entries_same);
             },
-            PeerThreadMessage::RequestVote(_) => panic!(),
+            _ => panic!(),
         };
     }
 
@@ -384,6 +412,7 @@ mod tests {
             to_peer: tx.clone(),
             next_index: PEER_NEXT_INDEX,
             match_index: PEER_NEXT_INDEX - 1,
+            thread: None
         };
         let log: Arc<Mutex<Log>> = Arc::new(Mutex::new(MemoryLog::new()));
         {
@@ -401,7 +430,7 @@ mod tests {
                 assert_eq!(message.prev_log_term, TERM - 1);
                 assert_eq!(message.entries.len(), 1);
             },
-            PeerThreadMessage::RequestVote(_) => panic!(),
+            _ => panic!(),
         };
     }
 
