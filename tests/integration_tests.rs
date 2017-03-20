@@ -93,7 +93,7 @@ fn create_client_request(op: Op, data: &[u8]) -> Rpc {
 /// Simple normal case test that starts up a static cluster, sends an entry,
 /// and ensures that entry is recieved by all state machines
 fn it_replicates_an_entry() {
-    const NUM_SERVERS: u64 = 3;
+    const NUM_SERVERS: u64 = 10;
     const REPLICATE_TIMEOUT: u64 = 100;
     const DATA_LENGTH: usize = 1;
     let replicate_timeout = Duration::from_millis(REPLICATE_TIMEOUT);

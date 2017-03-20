@@ -396,6 +396,7 @@ fn handle_request_vote_reply(reply: RequestVoteReply, info: &mut ServerInfo,
         if num_votes > (info.peers.len() + 1) / 2 {
             // Woo! We won the election
             state.transition_to_leader(info, log, state_condition);
+            println!("Server {}: Became leader for term {}", info.me.0, state.current_term);
         }
     }
 }
@@ -606,6 +607,8 @@ impl Server {
     /// Panics if any other thread has panicked while holding the log lock
     ///
     fn start_election(&self, state: &mut ServerState, state_condition: &Condvar) -> Duration {
+        println!("Server {} in state {:?}: Starting election for term {}. Previously voted for {:?}", self.info.me.0, state.current_state,
+                 state.current_term + 1, state.voted_for);
         // transition to the candidate state
         state.transition_to_candidate(self.info.me.0, state_condition);
 
@@ -697,7 +700,8 @@ impl AppendEntriesHandler {
 
         // Check: If our term doesn't match the message's term...
         if message.get_term() < current_term { return; }
-        if message.get_term() > current_term {
+        if message.get_term() > current_term || 
+            (message.get_term() == current_term && matches!(state.current_state, State::Candidate{..})) {
             // Become follower for the higher term
             state.transition_to_follower(message.get_term(), cvar);
             reply.set_term(current_term);
