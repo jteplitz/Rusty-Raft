@@ -1,4 +1,5 @@
 use rusty_raft::server::*;
+use rusty_raft::state_machine::*;
 use std::sync::mpsc::{Sender};
 use std::sync::Mutex;
 
@@ -9,8 +10,9 @@ pub struct MockStateMachine {
 }
 
 impl MockStateMachine {
-    pub fn new_with_sender(sender: Sender<Vec<u8>>) -> MockStateMachine {
-        MockStateMachine {commands: Mutex::new(sender)}
+    pub fn new_with_sender(sender: Sender<Vec<u8>>) -> ExactlyOnceStateMachine {
+        ExactlyOnceStateMachine::new(Box::new(
+                MockStateMachine {commands: Mutex::new(sender)}))
     }
 }
 

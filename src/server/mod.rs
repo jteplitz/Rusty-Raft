@@ -5,9 +5,10 @@ use capnp;
 use rand;
 use raft_capnp::{append_entries, append_entries_reply,
                  request_vote, request_vote_reply,
-                 client_request, client_request_reply};
+                 client_request, client_request_reply, Op as ProtoOp};
 use rpc::{RpcError};
 use rpc::server::{RpcObject, RpcServer};
+use state_machine::{ExactlyOnceStateMachine, SessionInfo, Config, RaftError};
 use std::net::SocketAddr;
 use std::time::{Duration, Instant};
 use std::thread;
@@ -20,62 +21,8 @@ use self::log::{Log, MemoryLog, Entry, Op};
 use self::peer::{Peer, PeerHandle, PeerThreadMessage, RequestVoteMessage};
 use std::io::Error as IoError;
 use rand::distributions::{IndependentSample, Range};
-use std::collections::HashMap;
 
 pub use self::constants::CLIENT_REQUEST_OPCODE;
-
-#[derive(Debug)]
-pub enum RaftError { 
-    ClientError(String),      // Error defined by client.
-    NotLeader(Option<u64>),   // I'm not the leader; give leader id
-                              // if we know it.
-                              // TODO: actually keep track of the leader
-}
-
-///
-/// State machine trait for clients to implement. Client should define
-/// their own deserialization/serialization for the |buffer| that
-/// Raft passes around as an anonymous blob.
-/// TODO : implement StateMachineError trait instead of using IoError
-///
-pub trait StateMachine: Sync + Send {
-    /// 
-    /// Perform the command defined by |buffer| on this state machine.
-    ///
-    /// # Returns
-    /// Returns an Ok if command successfully executes; otherwise
-    /// results in an IoError.
-    ///
-    fn command(&self, buffer: &[u8]) -> Result<(), RaftError> ;
-
-    ///
-    /// Performs the query defined by |buffer| on this state machine.
-    ///
-    /// # Returns
-    /// Returns a |buffer| (to be interpreted by client) wrapped in Result if
-    /// query successfully executes. Otherwise, results in an IoError.
-    ///
-    fn query(&self, buffer: &[u8]) -> Result<Vec<u8>, RaftError>;
-}
-
-pub struct Config {
-    // Each server has a unique 64bit integer id that and a socket address
-    // These mappings MUST be identical for eaah server in the cluster
-    cluster: HashMap<u64, SocketAddr>,
-    me: (u64, SocketAddr),
-    heartbeat_timeout: Duration,
-}
-
-impl Config {
-    pub fn new (cluster: HashMap<u64, SocketAddr>, my_id: u64,
-                my_addr: SocketAddr, heartbeat_timeout: Duration) -> Config {
-        Config {
-            cluster: cluster,
-            me: (my_id, my_addr),
-            heartbeat_timeout: heartbeat_timeout,
-        }
-    }
-}
 
 // States that each machine can be in!
 #[derive(Debug, PartialEq, Clone, Copy)]
@@ -125,15 +72,19 @@ enum StateMachineMessage {
 /// to the |state_machine|. Returns the new committed index.
 fn apply_commands(next_index: usize, to_commit: usize,
                   log: Arc<Mutex<Log>>,
-                  state_machine: &Box<StateMachine>)
+                  state_machine: &Box<ExactlyOnceStateMachine>)
         -> usize {
     if to_commit < next_index { return next_index; }
     let to_apply = { log.lock().unwrap().get_entries_from(next_index - 1)
         [.. (to_commit - next_index + 1) ].to_vec() };
     for entry in to_apply.into_iter() {
-        if let Op::Write(data) = entry.op {
-            state_machine.command(&data);
-        }
+        match entry.op {
+            Op::Write{data, session} => {
+                state_machine.command(&data, session);
+            },
+            Op::OpenSession => {state_machine.new_session();},
+            Op::Read(_) | Op::Noop | Op::Unknown => {},
+        };
     }
     to_commit + 1
 }
@@ -176,7 +127,7 @@ impl Drop for StateMachineHandle {
 ///
 fn state_machine_thread (log: Arc<Mutex<Log>>,
                          start_index: usize,
-                         state_machine: Box<StateMachine>,
+                         state_machine: Box<ExactlyOnceStateMachine>,
                          ) -> StateMachineHandle {
     let(to_state_machine, from_main) = channel();
     let t = thread::spawn(move || {
@@ -366,7 +317,7 @@ impl Drop for ServerHandle {
 /// in a live thread.
 ///
 pub fn start_server<F> (config: Config, load_state_machine: F) -> Result<ServerHandle, IoError>
-    where F: FnOnce() -> Box<StateMachine> {
+    where F: FnOnce() -> Box<ExactlyOnceStateMachine> {
     let (tx, rx) = channel();
     let tx_clone = tx.clone();
     let (server, rpc_server) = try!(Server::new(config, tx, load_state_machine()));
@@ -459,7 +410,7 @@ fn handle_request_vote_reply(reply: RequestVoteReply, info: &mut ServerInfo,
 }
 
 impl Server {
-    fn new (config: Config, tx: Sender<MainThreadMessage>, state_machine: Box<StateMachine>)
+    fn new (config: Config, tx: Sender<MainThreadMessage>, state_machine: Box<ExactlyOnceStateMachine>)
         -> Result<(Server, RpcServer), IoError> {
         let me = config.me;
         let log = Arc::new(Mutex::new(MemoryLog::new()));
@@ -841,8 +792,8 @@ fn wait_for_commit(term: u64, index: usize, state: Arc<(Mutex<ServerState>, Cond
 /// Returns true if client write succeeds; false if term changes and the write failed.
 ///
 fn client_write_blocking (log: Arc<Mutex<Log>>,
+                          op: Op,
                           state: Arc<(Mutex<ServerState>, Condvar)>,
-                          command: &[u8],
                           to_main: Arc<Mutex<Sender<MainThreadMessage>>>)
                           -> Result<(), RaftError> {
     // TODO (sydli): it may not be 100% safe to drop the state lock here.
@@ -855,15 +806,10 @@ fn client_write_blocking (log: Arc<Mutex<Log>>,
     }
     let index = { // Scope the log lock so we drop it immediately afterwards.
         let mut log = log.lock().unwrap();
-        log.append_entry(Entry {
-            index: 0,
-            term: current_term,
-            op: Op::Write(command.to_vec()),
-        }).get_last_entry_index()
+        log.append_entry(Entry {index: 0, term: current_term, op: op}).get_last_entry_index()
     };
     let unwrapped_to_main = to_main.lock().unwrap();
     unwrapped_to_main.send(MainThreadMessage::ClientAppendRequest).unwrap();
-
     // wait for commit index to update or term to change
     if wait_for_commit(current_term, index, state.clone()) {
         Ok(())
@@ -878,20 +824,35 @@ struct ClientRequestHandler {
     to_main: Arc<Mutex<Sender<MainThreadMessage>>>,
     to_state_machine: Arc<Mutex<Sender<StateMachineMessage>>>,
 }
+impl ClientRequestHandler {
+    fn client_write_blocking(&self, op: Op)
+        -> Result<(), RaftError>
+    {
+        client_write_blocking(
+            self.log.clone(),
+            op,
+            self.state.clone(),
+            self.to_main.clone())
+    }
+}
 
 impl RpcObject for ClientRequestHandler {
     fn handle_rpc (&self, params: capnp::any_pointer::Reader,
                    result: capnp::any_pointer::Builder) -> Result<(), RpcError> {
         params.get_as::<client_request::Reader>().map(|client_request| {
             let op_result = match client_request.get_op().unwrap() {
-                client_request::Op::Write => client_write_blocking(
-                        self.log.clone(),
-                        self.state.clone(),
+                ProtoOp::Write => self.client_write_blocking(
+                        Op::Write {
+                            data: client_request.get_data().unwrap().to_vec(),
+                            session: SessionInfo::from_proto(
+                                client_request.get_session().unwrap()),
+                        }).map(|_| vec![]),
+                ProtoOp::OpenSession => self.client_write_blocking(Op::OpenSession)
+                                            .map(|_| vec![]),
+                ProtoOp::Read => client_read_blocking(
                         client_request.get_data().unwrap(),
-                        self.to_main.clone()).map(|_| vec![]),
-                client_request::Op::Read => client_read_blocking(
-                        client_request.get_data().unwrap(),
-                        self.to_state_machine.clone())
+                        self.to_state_machine.clone()),
+                ProtoOp::Noop | ProtoOp::Unknown => Ok(vec![]), 
             };
             let mut reply = result.init_as::<client_request_reply::Builder>();
             match op_result {
