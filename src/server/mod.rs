@@ -514,7 +514,7 @@ impl Server {
     /// Panics if any other thread has panicked while holding the log lock
     ///
     fn start_election(&self, state: &mut ServerState, state_condition: &Condvar) -> Duration {
-        println!("Server {} in state {:?}: Starting election for term {}. Previously voted for {:?}", self.info.me.0, state.current_state,
+        println!("Server {}: Starting election for term {}. Previously voted for {:?}", self.info.me.0,
                  state.current_term + 1, state.voted_for);
         // transition to the candidate state
         state.transition_to_candidate(self.info.me.0, state_condition);

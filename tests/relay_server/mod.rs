@@ -19,7 +19,7 @@
 //!
 
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::net::{SocketAddr, TcpListener, TcpStream, Shutdown};
 use std::thread;
 use std::sync::{Arc, Mutex};
@@ -44,7 +44,9 @@ struct SocketInfo {
 
 impl RelayServer {
     pub fn new() -> RelayServer {
-        RelayServer {addrs: Arc::new(Mutex::new(HashMap::new()))}
+        RelayServer {
+            addrs: Arc::new(Mutex::new(HashMap::new()))
+        }
     }
 
     pub fn new_with_random_addresses(num_addresses: u64) -> RelayServer {
@@ -102,25 +104,26 @@ impl RelayServer {
     /// Also panics if any of the server's background threads have panicked.
     pub fn set_address_active(&mut self, from_address: SocketAddr, online: bool) {
         let mut addrs = self.addrs.lock().unwrap();
-        addrs.get_mut(&from_address).unwrap().online = online;
+        let addr_info = addrs.get_mut(&from_address).unwrap();
+        addr_info.online = online;
     }
 
     /// Runs in a background thread, and relays messages according to the hash map.
     fn relay_messages(listener: TcpListener, addrs: Arc<Mutex<HashMap<SocketAddr, SocketInfo>>>) {
         let local_addr = listener.local_addr().unwrap();
-        let mut counter = 0;
         for stream in listener.incoming() {
             match stream {
                 Ok (stream) => {
-                    counter += 1;
-                    let addr_info = { addrs.lock().unwrap().get(&local_addr).cloned() };
-                    match addr_info {
+                    let outgoing_addr_info = { addrs.lock().unwrap().get(&local_addr).cloned() };
+                    match outgoing_addr_info {
                         Some(info) => {
                             if info.online {
                                 match RelayServer::relay_stream_to_addr(stream, info.to_addr.unwrap()) {
                                     Ok(_) => {},
                                     Err(e) => {
-                                        println_stderr!("IO Error when connecting to Raft Server! {}", e);
+                                        // this is a fairly common error in our tests because it
+                                        // just means the receiver has failed so we drop it
+                                        // silently for now
                                     }
                                 }
                             }
