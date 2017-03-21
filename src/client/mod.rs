@@ -210,7 +210,6 @@ impl RaftConnection {
         self.perform_leader_op(move |leader_addr|  {
             RaftConnection::construct_client_request_rpc(buffer, op, session)
                 .send(leader_addr)
-                .map_err(|err| {println!("!!!{:?}, {}", err, leader_addr); err})
                 .map_err(RaftError::RpcError)
                 .and_then(RaftConnection::handle_client_reply)
         })
@@ -294,7 +293,7 @@ mod tests {
     /// Starts Rpc server for |rpc_handler| and returns the port it
     /// was attached to.
     ///
-    fn start_client_handler(rpc_handler: Box<RpcObject>) -> u16 {
+    fn start_client_handler(rpc_handler: Box<RpcObject>) -> (u16, RpcServer) {
         let services = vec![(2, rpc_handler)];
         let mut server = RpcServer::new_with_services(services);
         let mut port = 8000;
@@ -304,15 +303,15 @@ mod tests {
             port += 1;
         }
         server.repl().unwrap();
-        port
+        (port, server)
     }
 
-    fn start_redirect_client_rpc_handler(redirect_port: u16) -> u16 {
+    fn start_redirect_client_rpc_handler(redirect_port: u16) -> (u16, RpcServer) {
         start_client_handler(Box::new(RedirectClientRequestHandler 
                                       { redirect_port: redirect_port }))
     }
 
-    fn start_leader_client_rpc_handler(reply: &[u8]) -> u16 {
+    fn start_leader_client_rpc_handler(reply: &[u8]) -> (u16, RpcServer) {
         start_client_handler(Box::new(LeaderClientRequestHandler
                                       { reply: reply.to_vec() }))
     }
@@ -350,16 +349,17 @@ mod tests {
     where F: Fn(&mut RaftConnection) -> () {
         let data = vec![];
         // Create leader ...
-        let leader_port = start_leader_client_rpc_handler(&data);
+        let (leader_port, server) = start_leader_client_rpc_handler(&data);
         let leader_socket = format!("{}:{}", LOCALHOST, leader_port);
-        println!("LEADER @ {}", leader_socket);
         let mut chain_port = leader_port;
         let mut cluster = HashMap::new();
         let mut backoff_bound = (0, BACKOFF_TIME_MS);
+        let mut redirect_servers = Vec::new();
         cluster.insert(0, SocketAddr::from_str(&*leader_socket).unwrap());
         // Construct redirect chain of clients ...
         for i in 0 .. chain_size {
-            let redirect_port = start_redirect_client_rpc_handler(chain_port);
+            let (redirect_port, server) = start_redirect_client_rpc_handler(chain_port);
+            redirect_servers.push(server);
             let redirect_socket = format!("{}:{}", LOCALHOST, redirect_port);
             cluster.insert(0, SocketAddr::from_str(&*redirect_socket).unwrap());
             chain_port = redirect_port;
@@ -379,11 +379,6 @@ mod tests {
                    format!("{}:{}", LOCALHOST, leader_port));
     }
 
-
-    // TODO (sydli): un-ignore these tests once you figure out why Tcp::connect
-    // is failing
-
-    #[ignore]
     #[test]
     fn command_redirects_to_leader() {
         let data = vec![];
@@ -391,7 +386,6 @@ mod tests {
             |db| { assert!((*db).command(&data).is_ok()); });
     }
 
-    #[ignore]
     #[test]
     fn query_redirects_to_leader() {
         let data = vec![];
@@ -399,14 +393,12 @@ mod tests {
             |db| { assert!((*db).query(&data).is_ok()); });
     }
 
-    #[ignore]
     #[test]
     fn open_session_redirects_to_leader() {
         client_request_redirects_to_leader(3, 
             |db| { assert!((*db).open_session().is_ok()); });
     }
 
-    #[ignore]
     #[test]
     fn command_sends() {
         let data = vec![];
@@ -414,19 +406,13 @@ mod tests {
             |db| { assert!((*db).command(&data).is_ok()); });
     }
 
-    #[ignore]
     #[test]
     fn query_sends() {
         let data = vec![];
         client_request_redirects_to_leader(0,
-            |db| {
-                let result = (*db).query(&data);
-                println!("{:?}", result);
-                assert!((*db).query(&data).is_ok());
-            });
+            |db| { assert!((*db).query(&data).is_ok()); });
     }
 
-    #[ignore]
     #[test]
     fn open_session_sends() {
         client_request_redirects_to_leader(0, 
