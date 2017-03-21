@@ -1,6 +1,7 @@
 mod log;
 mod peer;
 mod state_machine;
+mod metadata_file;
 use capnp;
 use rand;
 use raft_capnp::{append_entries, append_entries_reply,
@@ -91,6 +92,7 @@ impl ServerState {
         self.voted_for = Some(my_id); // vote for ourselves
         self.election_timeout = generate_election_timeout();
         cv.notify_all();
+        // TODO: Block on writing new state to disk
     }
 
     ///
@@ -117,19 +119,16 @@ impl ServerState {
     /// If the new term is greater than our current term this also resets
     /// our vote tracker.
     ///
-    fn transition_to_follower(&mut self, new_term: u64, cv: &Condvar) {
+    fn transition_to_follower(&mut self, new_term: u64, cv: &Condvar, voted_for: Option<u64>) {
         debug_assert!(new_term >= self.current_term);
 
-        if new_term > self.current_term {
-            self.voted_for = None;
-        } else {
-            debug_assert!(matches!(self.current_state, State::Candidate{ .. }) ||
-                          matches!(self.current_state, State::Leader{ .. }));
-        }
+        self.voted_for = voted_for;
         self.current_term = new_term;
         self.current_state = State::Follower;
         self.election_timeout = generate_election_timeout();
         cv.notify_all();
+        // TODO: Block on writing new state to disk
+        
         // TODO: We need to stop the peers from continuing to send AppendEntries here.
     }
 }
@@ -259,7 +258,7 @@ fn handle_append_entries_reply(m: AppendEntriesReply, server_info: &mut ServerIn
         State::Candidate{ .. } | State::Follower => return, // drop it like it's hot
     }
     if m.term > state.current_term {
-        state.transition_to_follower(m.term, state_condition);
+        state.transition_to_follower(m.term, state_condition, None);
     } else if m.success {
         // On success, advance peer's index.
         server_info.get_peer_mut(m.peer.0).map(|peer| {
@@ -564,24 +563,32 @@ impl RpcObject for RequestVoteHandler {
             let mut state = state_ref.lock().unwrap(); // panics if mutex is poisoned
             state.last_leader_contact = Instant::now();
 
+            // We may transition to a new term, but we want to avoid doing multiple
+            // state transitions since we flush the information to disk each time.
+            // So we save the new_term in a local variable and transition after we know
+            // if we've voted for this candidate or not
+            let new_term;
             if term > state.current_term {
-                // transition to a follower of the new term
-                // TODO(jason): This should happen on the main thread.
-                state.transition_to_follower(term, &cvar);
+                new_term = term;
+            } else {
+                new_term = state.current_term;
             }
 
             if state.voted_for == None || state.voted_for == Some(candidate_id) {
                 let log = self.log.lock().unwrap(); // panics if mutex is poisoned
-                if term == state.current_term && log.is_other_log_valid(last_log_index, last_log_term) {
+                if term == new_term && log.is_other_log_valid(last_log_index, last_log_term) {
+                    // grant vote and become a follower of this candidate
                     vote_granted = true;
-                    state.voted_for = Some(candidate_id);
-                    // TODO(jason): This should happen on the main thread.
-                    if !matches!(state.current_state, State::Follower{ .. }) {
-                        // step down
-                        state.transition_to_follower(term, &cvar);
-                    }
+                    state.transition_to_follower(new_term, &cvar, Some(candidate_id));
                 }
             }
+
+            if new_term > state.current_term {
+                // We did not vote for this leader, but did learn of a new term
+                // so potentially need to step down and we need to persist this information to disk
+                state.transition_to_follower(new_term, &cvar, None);
+            }
+
             current_term = state.current_term;
         }
         let mut result_builder = result.init_as::<request_vote_reply::Builder>();
@@ -610,7 +617,7 @@ impl AppendEntriesHandler {
         if message.get_term() > current_term || 
             (message.get_term() == current_term && matches!(state.current_state, State::Candidate{..})) {
             // Become follower for the higher term
-            state.transition_to_follower(message.get_term(), cvar);
+            state.transition_to_follower(message.get_term(), cvar, None);
             reply.set_term(current_term);
         }
 
@@ -1036,7 +1043,7 @@ mod tests {
         // lose the election :(
         let prev_state: ServerState = {
             let state: &mut ServerState = &mut s.state.0.lock().unwrap();
-            state.transition_to_follower(1, &s.state.1);
+            state.transition_to_follower(1, &s.state.1, Some(s.info.me.0));
             assert!(matches!(state.current_state, State::Follower));
             state.clone()
         };
@@ -1119,7 +1126,7 @@ mod tests {
             state.transition_to_candidate(OUR_ID, cvar);
             assert_eq!(state.current_term, 1);
             assert_eq!(state.voted_for, Some(OUR_ID));
-            state.transition_to_follower(1, cvar);
+            state.transition_to_follower(1, cvar, Some(OUR_ID));
             assert_eq!(state.current_term, 1);
             assert_eq!(state.voted_for, Some(OUR_ID));
             assert!(matches!(state.current_state, State::Follower));
@@ -1136,7 +1143,7 @@ mod tests {
             state.transition_to_candidate(OUR_ID, cvar);
             assert_eq!(state.current_term, 1);
             assert_eq!(state.voted_for, Some(OUR_ID));
-            state.transition_to_follower(NEW_TERM, cvar);
+            state.transition_to_follower(NEW_TERM, cvar, None);
             assert_eq!(state.current_term, NEW_TERM);
             assert_eq!(state.voted_for, None);
             assert!(matches!(state.current_state, State::Follower));
