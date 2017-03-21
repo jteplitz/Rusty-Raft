@@ -315,6 +315,7 @@ mod tests {
             // dummy "me" entry
             me: (1, SocketAddr::from_str("127.0.0.1:8005").unwrap()),
             heartbeat_timeout: Duration::from_millis(100),
+            state_filename: String::from("")
         }
     }
 

@@ -266,19 +266,21 @@ pub fn client_request_to_proto(op: ClientRequest, builder: &mut client_request::
 
 pub struct Config {
     // Each server has a unique 64bit integer id that and a socket address
-    // These mappings MUST be identical for eaah server in the cluster
+    // These mappings MUST be identical for each server in the cluster
     pub cluster: HashMap<u64, SocketAddr>,
     pub me: (u64, SocketAddr),
     pub heartbeat_timeout: Duration,
+    pub state_filename: String
 }
 
 impl Config {
     pub fn new (cluster: HashMap<u64, SocketAddr>, my_id: u64,
-                my_addr: SocketAddr, heartbeat_timeout: Duration) -> Config {
+                my_addr: SocketAddr, heartbeat_timeout: Duration, state_filename: String) -> Config {
         Config {
             cluster: cluster,
             me: (my_id, my_addr),
             heartbeat_timeout: heartbeat_timeout,
+            state_filename: state_filename
         }
     }
 }
