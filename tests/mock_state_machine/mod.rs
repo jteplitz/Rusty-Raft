@@ -22,7 +22,7 @@ impl StateMachine for MockStateMachine {
     ///
     /// #Panics
     /// Panics if the commands reciever has been deallocated
-    fn command (&self, buffer: &[u8]) -> Result<(), RaftError> {
+    fn command (&mut self, buffer: &[u8]) -> Result<(), RaftError> {
         let buf_clone: Vec<u8> = buffer
                                 .iter()
                                 .cloned()

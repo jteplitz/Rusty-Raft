@@ -31,6 +31,7 @@ use self::state_machine::{StateMachineMessage, state_machine_thread, StateMachin
 use self::peer::{Peer, PeerHandle, PeerThreadMessage, RequestVoteMessage};
 use self::state_file::StateFile;
 use std::io::Error as IoError;
+use std::str::FromStr;
 use rand::distributions::{IndependentSample, Range};
 
 
@@ -70,11 +71,11 @@ enum State {
 /// Store's the state that the server is currently in along with the current_term
 /// and current_id. These fields should all share a lock.
 #[derive(Debug)]
-struct ServerState {
+pub struct ServerState {
     current_state: State,
     current_term: u64,
     commit_index: usize,
-    last_leader_contact: Instant,
+    last_leader_contact: (Instant, Option<SocketAddr>),
     voted_for: Option<u64>,
     election_timeout: Duration,
     state_file: StateFile
@@ -177,7 +178,8 @@ fn update_commit_index(server_info: &ServerInfo, state: &mut ServerState) {
     // Set new commit index if it's higher!
     if new_index <= state.commit_index { return; }
     state.commit_index = new_index;
-    server_info.state_machine.tx.send(StateMachineMessage::Commit(state.commit_index)).unwrap();
+    server_info.state_machine.tx.send(
+        StateMachineMessage::Commit(state.commit_index)).unwrap();
 }
 
 pub struct ServerHandle {
@@ -277,6 +279,7 @@ fn handle_append_entries_reply(m: AppendEntriesReply, server_info: &mut ServerIn
         update_commit_index(server_info, state);
     } else {
         let leader_id = server_info.me.0;
+        let leader_addr = server_info.me.1;
         // If we failed, roll back peer index by 1 (if we can) and retry
         // the append entries call.
         server_info.get_peer_mut(m.peer.0).map(|peer| {
@@ -284,7 +287,7 @@ fn handle_append_entries_reply(m: AppendEntriesReply, server_info: &mut ServerIn
                 // can we make sure match_index never exceeds peer_index?
                 peer.next_index = peer.next_index - 1;
             }
-            peer.append_entries_nonblocking(leader_id,
+            peer.append_entries_nonblocking(leader_id, leader_addr,
                                             state.commit_index,
                                             state.current_term, log);
         });
@@ -310,7 +313,7 @@ fn broadcast_append_entries(info: &mut ServerInfo, state: &mut ServerState, log:
     debug_assert!(matches!(state.current_state, State::Leader{ .. }));
     for peer in &info.peers {
         // Perf: each call copies the needed |entries| from |log| to send along to the peer.
-        peer.append_entries_nonblocking(info.me.0, state.commit_index,
+        peer.append_entries_nonblocking(info.me.0, info.me.1, state.commit_index,
                                         state.current_term, log.clone());
     }
     state.current_state = State::Leader { last_heartbeat: Instant::now() };
@@ -350,14 +353,14 @@ impl Server {
             current_term: persisted_state.term,
             commit_index: 0,
             voted_for: persisted_state.voted_for,
-            last_leader_contact: Instant::now(),
+            last_leader_contact: (Instant::now(), None),
             election_timeout: generate_election_timeout(),
             state_file: state_file
         }));
 
         // 1a. Start state machine thread.
         let state_machine_handle = state_machine_thread(
-            log.clone(), 0, state_machine, tx.clone());
+            log.clone(), 0, state_machine, state.clone(), tx.clone());
         let to_state_machine_locked = 
             Arc::new(Mutex::new(state_machine_handle.tx.clone()));
 
@@ -433,7 +436,8 @@ impl Server {
                     match state.current_state {
                         State::Follower => {
                             let now = Instant::now();
-                            current_timeout = state.election_timeout.checked_sub(now.duration_since(state.last_leader_contact));
+                            current_timeout = state.election_timeout.checked_sub(
+                                now.duration_since(state.last_leader_contact.0));
                         }
                         State::Candidate{start_time, ..} => {
                             let time_since_election = Instant::now() - start_time;
@@ -507,7 +511,8 @@ impl Server {
         match state.current_state {
             State::Follower | State::Candidate{ .. } => {
                 let now = Instant::now();
-                if now.duration_since(state.last_leader_contact) > state.election_timeout {
+                if now.duration_since(state.last_leader_contact.0)
+                    > state.election_timeout {
                     self.start_election(state);
                 }
             },
@@ -544,6 +549,7 @@ impl Server {
         let request_vote_message = RequestVoteMessage {
             term: state.current_term,
             candidate_id: self.info.me.0,
+            candidate_addr: self.info.me.1,
             last_log_index: last_log_index,
             last_log_term: last_log_term
         };
@@ -567,18 +573,21 @@ impl RpcObject for RequestVoteHandler {
     fn handle_rpc (&self, params: capnp::any_pointer::Reader, result: capnp::any_pointer::Builder) 
         ->Result<(), RpcError>
     {
-        let (candidate_id, term, last_log_index, last_log_term) = try!(
+        let (candidate_addr, candidate_id, term, last_log_index, last_log_term) = try!(
             params.get_as::<request_vote::Reader>()
             .map_err(RpcError::Capnp)
             .map(|params| {
-                (params.get_candidate_id(), params.get_term(), params.get_last_log_index() as usize,
+                (params.get_candidate_addr().unwrap(),
+                 params.get_candidate_id(), params.get_term(),
+                 params.get_last_log_index() as usize,
                  params.get_last_log_term())
             }));
         let mut vote_granted = false;
         let current_term;
         {
             let ref mut state = self.state.lock().unwrap(); // panics if mutex is poisoned
-            state.last_leader_contact = Instant::now();
+            state.last_leader_contact = (Instant::now(), Some(
+                    SocketAddr::from_str(candidate_addr).unwrap()));
 
             // We may transition to a new term, but we want to avoid doing multiple
             // state transitions since we flush the information to disk each time.
@@ -645,7 +654,8 @@ impl AppendEntriesHandler {
 
         debug_assert!(message.get_term() == state.current_term);
         // Reset election timer for this term.
-        state.last_leader_contact = Instant::now();
+        state.last_leader_contact = (Instant::now(),
+            Some(SocketAddr::from_str(message.get_leader_addr().unwrap()).unwrap()));
         // Check: (prev_log_term, prev_log_index) exists in our log
         let prev_log_index = message.get_prev_log_index() as usize;
         let (last_log_index, prev_log_entry_term) = {
@@ -716,7 +726,6 @@ impl ClientRequestHandler {
         from_sm.recv().unwrap()
     }
 
-
     ///
     /// Client read. Blocks until most recent write is properly committed to the log,
     /// then returns result from client state machine query.
@@ -740,9 +749,8 @@ impl RpcObject for ClientRequestHandler {
                    result: capnp::any_pointer::Builder) -> Result<(), RpcError> {
         params.get_as::<client_request::Reader>().map(|client_request| {
             let current_state = { self.state.lock().unwrap().current_state };
-            // TODO (sydli): is it safe to drop the state lock...
-            // TODO (sydli): store leader
-            let mut reply = Err(RaftError::NotLeader(None));
+            let mut reply = Err(RaftError::NotLeader(
+                    {self.state.lock().unwrap().last_leader_contact.1}));
             if matches!(current_state, State::Leader { .. }) { 
                 let op = client_request_from_proto(client_request);
                 reply = match op {
@@ -803,7 +811,7 @@ mod tests {
             current_term: 0,
             commit_index: 0,
             voted_for: None,
-            last_leader_contact: Instant::now(),
+            last_leader_contact: (Instant::now(), None),
             election_timeout: generate_election_timeout(),
             state_file: StateFile::new_from_filename(&state_filename).unwrap()
         }));
@@ -1069,7 +1077,6 @@ mod tests {
         use super::super::super::common::{RaftCommand};
         use super::super::StateFile;
 
-        // TODO (sydli) make sure cv is called
         #[test]
         fn transition_to_candidate_normal() {
             const OUR_ID: u64 = 5;

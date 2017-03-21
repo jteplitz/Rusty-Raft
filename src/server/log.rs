@@ -1,6 +1,6 @@
 use std::fmt;
 use raft_capnp::{entry};
-use super::super::common::{RaftCommand,
+use super::super::common::{RaftCommand, SessionInfo, mock_session,
                            raft_command_from_proto, raft_command_to_proto};
 
 ///
@@ -24,8 +24,8 @@ pub fn random_entry_with_term(term: u64) -> Entry {
   Entry {
       index: 0,
       term: term,
-      op: RaftCommand::StateMachineCommand { data: vec, session:
-          SessionInfo::new_empty()},
+      op: RaftCommand::StateMachineCommand {
+              data: vec, session: mock_session()},
   }
 }
 

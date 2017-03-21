@@ -109,6 +109,7 @@ fn create_client_request(request: ClientRequest) -> Rpc {
 /// nodes and returns a vector over the succesfull responses.
 /// You should only have one response from the leader
 /// Optionally skips sending to the skip id
+#[cfg(test)]
 fn send_client_request(addrs: &HashMap<u64, SocketAddr>, data: &[u8], skip_id: Option<u64>) 
     -> Vec<Reader<OwnedSegments>> 
 {
@@ -121,7 +122,8 @@ fn send_client_request(addrs: &HashMap<u64, SocketAddr>, data: &[u8], skip_id: O
             ClientRequest::Command(
                 RaftCommand::StateMachineCommand{
                     data: data.to_vec(),
-                    session: SessionInfo::new_empty()}));
+                    // TODO (sydli): Actually ask for a real session here
+                    session: mock_session()}));
         rpc.send(to_addr)
     })
     .collect::<Result<Vec<Reader<OwnedSegments>>, RpcError>>()

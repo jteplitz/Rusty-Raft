@@ -94,13 +94,14 @@ impl RaftConnection {
         self.perform_leader_op(|leader_addr|  {
             let mut rpc = Rpc::new(constants::CLIENT_REQUEST_OPCODE);
             {
-                let mut params = rpc.get_param_builder().init_as::<client_request::Builder>();
+                let mut params = rpc.get_param_builder()
+                                    .init_as::<client_request::Builder>();
                 client_request_to_proto(
                     ClientRequest::Command(RaftCommand::OpenSession),
                     &mut params);
             }
             rpc.send(leader_addr)
-                .map_err(|x| RaftError::ClientError(format!("{:?}", x)))// jank
+               .map_err(|x| RaftError::ClientError(format!("{:?}", x)))// jank
                .and_then(RaftConnection::handle_register_client_reply)
         })
     }
@@ -184,7 +185,6 @@ impl RaftConnection {
 
     ///
     /// Sends a client request to the leader of a cluster.
-    /// TODO (sydli): what if request failed due to expired session...
     ///
     fn send_client_request(&mut self, op: ClientRequest)
         -> Result<ClientRequestReply, RaftError> {

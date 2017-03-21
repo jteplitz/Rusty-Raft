@@ -6,13 +6,13 @@ use std::time::Duration;
 use raft_capnp::{session_info, client_request, raft_command, raft_query, raft_error};
 use rpc::RpcError;
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum RaftError { 
     ClientError(String),      // Error defined by client.
     NotLeader(Option<SocketAddr>),   // I'm not the leader; give leader id
                               // if we know it.
                               // TODO: actually keep track of the leader
-    RpcError(RpcError),
+    RpcError(String),
     SessionError,
     Unknown,
 }
@@ -53,7 +53,6 @@ pub enum RaftQueryReply {
 pub enum ClientRequest {
     Command(RaftCommand),
     Query(RaftQuery),
-    Noop, // TODO (sydli) delete
     Unknown,
 }
 
@@ -125,7 +124,6 @@ pub fn client_request_from_proto(proto: client_request::Reader) -> ClientRequest
             ClientRequest::Query(
                 raft_query_from_proto(raft_query.unwrap()))
         },
-        client_request::Noop(_) => ClientRequest::Noop,
         client_request::Unknown(_) => ClientRequest::Unknown,
     }
 }
@@ -259,7 +257,6 @@ pub fn client_request_to_proto(op: ClientRequest, builder: &mut client_request::
             raft_query_to_proto(raft_query,
                                 &mut builder.borrow().init_query());
         },
-        ClientRequest::Noop => builder.set_noop(()),
         ClientRequest::Unknown => builder.set_unknown(()),
     }
 }
@@ -291,11 +288,14 @@ pub struct SessionInfo {
     pub sequence_number: u64,
 }
 
-impl SessionInfo {
-    pub fn new_empty() -> SessionInfo{
-        SessionInfo { client_id:0,
-        sequence_number:0 }
+pub fn mock_session() -> SessionInfo {
+    SessionInfo {
+        client_id:0,
+        sequence_number:0
     }
+}
+
+impl SessionInfo {
 
     pub fn from_proto(proto: session_info::Reader) -> SessionInfo {
         SessionInfo {

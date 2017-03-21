@@ -21,6 +21,7 @@ use super::{MainThreadMessage, AppendEntriesReply, RequestVoteReply};
 pub struct AppendEntriesMessage {
     pub term: u64,
     pub leader_id: u64,
+    pub leader_addr: SocketAddr,
     pub prev_log_index: usize,
     pub prev_log_term: u64,
     pub entries: Vec<Entry>,
@@ -31,6 +32,7 @@ pub struct AppendEntriesMessage {
 pub struct RequestVoteMessage {
     pub term: u64,
     pub candidate_id: u64,
+    pub candidate_addr: SocketAddr,
     pub last_log_index: usize,
     pub last_log_term: u64,
 }
@@ -49,7 +51,6 @@ pub enum PeerThreadMessage {
 /// Handle for main thread to send messages to Peer.
 ///
 pub struct PeerHandle {
-    // TODO: These don't need to be public
     pub id: u64,
     pub to_peer: Sender<PeerThreadMessage>,
     pub next_index: usize,
@@ -65,8 +66,9 @@ impl PeerHandle {
     /// #Panics
     /// Panics if the peer thread has panicked.
     ///
-    pub fn append_entries_nonblocking (&self, leader_id: u64, commit_index: usize,
-                                       current_term: u64, log: Arc<Mutex<Log>>) {
+    pub fn append_entries_nonblocking (&self, leader_id: u64, leader_addr: SocketAddr,
+                                       commit_index: usize, current_term: u64,
+                                       log: Arc<Mutex<Log>>) {
         let prev_log_index = self.next_index - 1;
         let (last_entry, entries) = {
             let log = log.lock().unwrap();
@@ -81,6 +83,7 @@ impl PeerHandle {
         let message = PeerThreadMessage::AppendEntries(AppendEntriesMessage {
             term: current_term,
             leader_id: leader_id,
+            leader_addr: leader_addr,
             prev_log_index: prev_log_index,
             prev_log_term: last_entry.map(|entry| entry.term).unwrap_or(0),
             entries: entries.to_vec(),
@@ -156,6 +159,7 @@ impl Peer {
         let mut params = rpc.get_param_builder().init_as::<append_entries::Builder>();
         params.set_term(entry.term);
         params.set_leader_id(entry.leader_id);
+        params.set_leader_addr(&*entry.leader_addr.to_string());
         params.set_prev_log_index(entry.prev_log_index as u64);
         params.set_prev_log_term(entry.prev_log_term);
         params.set_leader_commit(entry.leader_commit as u64);
@@ -241,6 +245,7 @@ impl Peer {
         let mut params = rpc.get_param_builder().init_as::<request_vote::Builder>();
         params.set_term(vote.term);
         params.set_candidate_id(vote.candidate_id);
+        params.set_candidate_addr(&*vote.candidate_addr.to_string());
         params.set_last_log_index(vote.last_log_index as u64);
         params.set_last_log_term(vote.last_log_term);
     }
@@ -289,6 +294,8 @@ mod tests {
     use capnp::{message, serialize_packed};
     use capnp::serialize::OwnedSegments;
     use std::io::BufReader;
+    use std::net::SocketAddr;
+    use std::str::FromStr;
     use std::sync::mpsc::{channel};
     use std::sync::{Arc, Mutex};
     use super::*;
@@ -305,11 +312,13 @@ mod tests {
         const PREV_LOG_INDEX: u64 = 78;
         const PREV_LOG_TERM: u64 = 5;
         const LEADER_COMMIT: u64 = 10;
+        let leader_addr = SocketAddr::from_str("127.0.0.1:0").unwrap();
         let entries = vec![random_entry_with_term(TERM); 6];
         let mut rpc = Rpc::new(constants::APPEND_ENTRIES_OPCODE);
         let entry = AppendEntriesMessage {
             term: TERM,
             leader_id: LEADER_ID,
+            leader_addr: leader_addr,
             prev_log_index: PREV_LOG_INDEX as usize,
             prev_log_term: PREV_LOG_TERM,
             leader_commit: LEADER_COMMIT as usize,
@@ -320,6 +329,7 @@ mod tests {
                               .get_as::<append_entries::Reader>().unwrap();
         assert_eq!(param_reader.get_term(), TERM);
         assert_eq!(param_reader.get_leader_id(), LEADER_ID);
+        assert_eq!(param_reader.get_leader_addr().unwrap(), &*leader_addr.to_string());
         assert_eq!(param_reader.get_prev_log_index(), PREV_LOG_INDEX);
         assert_eq!(param_reader.get_prev_log_term(), PREV_LOG_TERM);
         assert_eq!(param_reader.get_leader_commit(), LEADER_COMMIT);
@@ -374,6 +384,7 @@ mod tests {
         const COMMIT_INDEX: usize = 8; // COMMIT_INDEX < LOG_SIZE
         const LOG_SIZE: usize = 9;
         const LEADER_ID: u64 = 0; // LEADER_ID != PEER_ID
+        let leader_addr = SocketAddr::from_str("127.0.0.1:0").unwrap();
         let handle = PeerHandle {
             id: 1,
             to_peer: tx.clone(),
@@ -382,11 +393,13 @@ mod tests {
             thread: None
         };
         let log: Arc<Mutex<Log>> = Arc::new(Mutex::new(MemoryLog::new_random_with_term(LOG_SIZE, TERM)));
-        handle.append_entries_nonblocking(LEADER_ID, COMMIT_INDEX, TERM, log.clone());
+        handle.append_entries_nonblocking(LEADER_ID, leader_addr,
+                                          COMMIT_INDEX, TERM, log.clone());
         match rx.recv().unwrap() {
             PeerThreadMessage::AppendEntries(message) => {
                 assert_eq!(message.term, TERM);
                 assert_eq!(message.leader_id, LEADER_ID);
+                assert_eq!(message.leader_addr, leader_addr);
                 assert_eq!(message.leader_commit, COMMIT_INDEX);
                 assert_eq!(message.prev_log_index, PEER_NEXT_INDEX - 1);
                 assert_eq!(message.prev_log_term, TERM);
@@ -409,6 +422,7 @@ mod tests {
         const COMMIT_INDEX: usize = 8; // COMMIT_INDEX < LOG_SIZE
         const LOG_SIZE: usize = 9;
         const LEADER_ID: u64 = 0; // LEADER_ID != PEER_ID
+        let leader_addr = SocketAddr::from_str("127.0.0.1:0").unwrap();
         let handle = PeerHandle {
             id: 1,
             to_peer: tx.clone(),
@@ -422,11 +436,12 @@ mod tests {
             log.append_entries(random_entries_with_term(COMMIT_INDEX, TERM - 1));
             log.append_entries(random_entries_with_term(LOG_SIZE - (COMMIT_INDEX), TERM));
         }
-        handle.append_entries_nonblocking(LEADER_ID, COMMIT_INDEX, TERM, log.clone());
+        handle.append_entries_nonblocking(LEADER_ID, leader_addr, COMMIT_INDEX, TERM, log.clone());
         match rx.recv().unwrap() {
             PeerThreadMessage::AppendEntries(message) => {
                 assert_eq!(message.term, TERM);
                 assert_eq!(message.leader_id, LEADER_ID);
+                assert_eq!(message.leader_addr, leader_addr);
                 assert_eq!(message.leader_commit, COMMIT_INDEX);
                 assert_eq!(message.prev_log_index, PEER_NEXT_INDEX - 1);
                 assert_eq!(message.prev_log_term, TERM - 1);
@@ -442,10 +457,12 @@ mod tests {
         const CANDIDATE_ID: u64 = 6;
         const LAST_LOG_INDEX: u64 = 78;
         const LAST_LOG_TERM: u64 = 5;
+        let candidate_addr = SocketAddr::from_str("127.0.0.1:0").unwrap();
         let mut rpc = Rpc::new(1);
         let vote = RequestVoteMessage {
             term: TERM,
             candidate_id: CANDIDATE_ID,
+            candidate_addr: candidate_addr,
             last_log_index: LAST_LOG_INDEX as usize,
             last_log_term: LAST_LOG_TERM
         };
@@ -454,6 +471,8 @@ mod tests {
         let param_reader = rpc.get_param_builder().as_reader().get_as::<request_vote::Reader>().unwrap();
         assert_eq!(param_reader.get_term(), TERM);
         assert_eq!(param_reader.get_candidate_id(), CANDIDATE_ID);
+        assert_eq!(param_reader.get_candidate_addr().unwrap(),
+                   candidate_addr.to_string());
         assert_eq!(param_reader.get_last_log_index(), LAST_LOG_INDEX);
         assert_eq!(param_reader.get_last_log_term(), LAST_LOG_TERM);
     }

@@ -40,8 +40,7 @@ struct ClientRequest {
   union {
     command     @0   :RaftCommand;
     query       @1   :RaftQuery;
-    noop        @2   :Void; # TODO move into command
-    unknown     @3   :Void;
+    unknown     @2   :Void;
   }
   struct Reply {
     union {
@@ -61,10 +60,11 @@ struct Entry {
 struct AppendEntries {
   term          @0   :UInt64;
   leaderId      @1   :UInt64;
-  prevLogIndex  @2   :UInt64;
-  prevLogTerm   @3   :UInt64;
-  entries       @4   :List(Entry);
-  leaderCommit  @5   :UInt64;
+  leaderAddr    @2   :Text;
+  prevLogIndex  @3   :UInt64;
+  prevLogTerm   @4   :UInt64;
+  entries       @5   :List(Entry);
+  leaderCommit  @6   :UInt64;
 }
 
 struct AppendEntriesReply {
@@ -75,8 +75,9 @@ struct AppendEntriesReply {
 struct RequestVote {
   term          @0   :UInt64;
   candidateId   @1   :UInt64;
-  lastLogIndex  @2   :UInt64;
-  lastLogTerm   @3   :UInt64;
+  candidateAddr @2   :Text;
+  lastLogIndex  @3   :UInt64;
+  lastLogTerm   @4   :UInt64;
 }
 
 struct SessionInfo {
@@ -97,5 +98,4 @@ struct RaftError {
     unknown       @3  :Void;
   }
 }
-
 

@@ -1,3 +1,5 @@
+use rand;
+use rand::Rng;
 use std::collections::HashMap;
 use super::super::common::{RaftError, RaftCommandReply,
                            RaftQueryReply, RaftCommand, RaftQuery};
@@ -6,7 +8,6 @@ use super::super::common::{RaftError, RaftCommandReply,
 /// State machine trait for clients to implement. Client should define
 /// their own deserialization/serialization for the |buffer| that
 /// Raft passes around as an anonymous blob.
-/// TODO : implement StateMachineError trait instead of using IoError
 ///
 pub trait StateMachine: Sync + Send {
     /// 
@@ -16,7 +17,7 @@ pub trait StateMachine: Sync + Send {
     /// Returns an Ok if command successfully executes; otherwise
     /// results in an IoError.
     ///
-    fn command(&self, buffer: &[u8]) -> Result<(), RaftError>;
+    fn command(&mut self, buffer: &[u8]) -> Result<(), RaftError>;
 
     ///
     /// Performs the query defined by |buffer| on this state machine.
@@ -28,10 +29,9 @@ pub trait StateMachine: Sync + Send {
     fn query(&self, buffer: &[u8]) -> Result<Vec<u8>, RaftError>;
 }
 
+#[derive(Clone)]
 pub struct Session {
-    last_updated: u64,
-    last_outstanding_op: u64,
-    responses: HashMap<u64, Result<(), RaftError>>,
+    responses: HashMap<u64, Result<RaftCommandReply, RaftError>>,
 }
 
 pub struct ExactlyOnceStateMachine {
@@ -43,26 +43,45 @@ pub struct ExactlyOnceStateMachine {
 
 impl ExactlyOnceStateMachine {
     pub fn new(client_state_machine: Box<StateMachine>) -> ExactlyOnceStateMachine {
+        let mut sessions = HashMap::new();
+        // NOTE: CLIENT ID OF 0 SHOULD BE USED FOR SESSIONLESS TESTING ONLY
+        sessions.insert(0, Session {responses: HashMap::new()});
         ExactlyOnceStateMachine {
             client_state_machine: client_state_machine,
-            sessions: HashMap::new(),
+            sessions: sessions,
         }
     }
 
-    pub fn new_session(&self) {
+    fn get_session(&self, client_id: u64) -> Option<Session> {
+        self.sessions.get(&client_id).cloned()
     }
 
-    pub fn command (&self, data: &RaftCommand)
+    // TODO(sydli): Expire sessions
+    fn new_session(&mut self) -> u64 {
+        let session_id = rand::thread_rng().next_u64();
+        self.sessions.insert(session_id, Session {
+            responses: HashMap::new(),
+        });
+        session_id
+    }
+
+    pub fn command (&mut self, data: &RaftCommand)
         -> Result<RaftCommandReply, RaftError> {
         match *data {
             RaftCommand::StateMachineCommand{ref data, session} => {
-        // TODO (sydli) verify session
-            self.client_state_machine.command(data)
-                .map(|_| RaftCommandReply::StateMachineCommand)
+                self.get_session(session.client_id)
+                    .ok_or(RaftError::SessionError)
+                    .and_then(|this_session| {
+                        this_session.responses
+                            .get(&session.sequence_number).cloned()
+                            .unwrap_or_else(||
+                                self.client_state_machine.command(data)
+                                    .map(|_| RaftCommandReply::StateMachineCommand)
+                                )
+                   })
             },
             RaftCommand::OpenSession => {
-                // TODO (sydli) impl open session
-                Ok(RaftCommandReply::Noop)
+                Ok(RaftCommandReply::OpenSession(self.new_session()))
             },
             _ => Ok(RaftCommandReply::Noop),
         }

@@ -4,7 +4,7 @@ use std::sync::mpsc::{channel, Sender};
 use std::thread;
 use std::thread::JoinHandle;
 
-use super::MainThreadMessage;
+use super::{MainThreadMessage, ServerState};
 use super::super::client::state_machine::ExactlyOnceStateMachine;
 use super::super::common::{RaftError, RaftCommand, RaftCommandReply, RaftQuery, RaftQueryReply};
 use super::log::{Log};
@@ -50,7 +50,8 @@ pub struct StateMachineHandle {
 ///
 pub fn state_machine_thread (log: Arc<Mutex<Log>>,
                              start_index: usize,
-                             state_machine: Box<ExactlyOnceStateMachine>,
+                             mut state_machine: Box<ExactlyOnceStateMachine>,
+                             state: Arc<Mutex<ServerState>>,
                              to_main: Sender<MainThreadMessage>,
                             ) -> StateMachineHandle {
     let mut outstanding_commands = Vec::new();
@@ -66,7 +67,7 @@ pub fn state_machine_thread (log: Arc<Mutex<Log>>,
                     // apply any outstanding commands. This will also take
                     // care of ACK'ing client requests in |outstanding_commands|.
                     next_index = apply_commands(next_index, commit_index,
-                                                log.clone(), &state_machine,
+                                                log.clone(), &mut state_machine,
                                                 &mut outstanding_commands);
                 },
                 StateMachineMessage::Query { query, response_channel } => {
@@ -85,12 +86,14 @@ pub fn state_machine_thread (log: Arc<Mutex<Log>>,
                 StateMachineMessage::Flush => {
                     // Flush any outstanding client requests. This will only happen
                     // if leadership changes (we're not leader anymore) in which case
-                    // we should forward them the new leader. TODO (sydli)
+                    // we should forward them the new leader.
                     while let Some(cmd) = outstanding_commands.pop() {
                         if let StateMachineMessage::Command
                             { command, response_channel} = cmd {
-                            response_channel.send(Err(RaftError::NotLeader(None)))
-                                            .unwrap();
+                            response_channel.send(
+                                Err(RaftError::NotLeader(
+                                { state.lock().unwrap().last_leader_contact.1 })))
+                            .unwrap();
                         }
                     }
                 },
@@ -107,7 +110,7 @@ pub fn state_machine_thread (log: Arc<Mutex<Log>>,
 /// to the |state_machine|. Returns the new committed index.
 pub fn apply_commands(next_index: usize, to_commit: usize,
                       log: Arc<Mutex<Log>>,
-                      state_machine: &Box<ExactlyOnceStateMachine>,
+                      state_machine: &mut Box<ExactlyOnceStateMachine>,
                       outstanding_messages: &mut Vec<StateMachineMessage>)
         -> usize {
     if to_commit < next_index { return next_index; }
