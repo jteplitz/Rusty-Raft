@@ -21,7 +21,7 @@ pub enum RaftError {
 /// Changes to ClientRequest should be reflected in the
 /// equivalent protocols in protocol/raft.capnp
 ///
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum RaftCommand {
     StateMachineCommand { data: Vec<u8>, session: SessionInfo },
     OpenSession,
@@ -285,7 +285,7 @@ impl Config {
     }
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub struct SessionInfo {
     pub client_id: u64,
     pub sequence_number: u64,

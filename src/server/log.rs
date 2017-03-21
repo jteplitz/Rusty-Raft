@@ -1,7 +1,7 @@
 use std::fmt;
 use raft_capnp::{entry};
-use super::super::common::{SessionInfo, RaftCommand,
-raft_command_from_proto, raft_command_to_proto};
+use super::super::common::{RaftCommand,
+                           raft_command_from_proto, raft_command_to_proto};
 
 ///
 /// Abstraction for a single Entry for our log.

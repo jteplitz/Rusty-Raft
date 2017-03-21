@@ -4,49 +4,95 @@ use std::sync::mpsc::{channel, Sender};
 use std::thread;
 use std::thread::JoinHandle;
 
+use super::MainThreadMessage;
 use super::super::client::state_machine::ExactlyOnceStateMachine;
-use super::super::common::{RaftError, RaftQuery, RaftQueryReply};
+use super::super::common::{RaftError, RaftCommand, RaftCommandReply, RaftQuery, RaftQueryReply};
 use super::log::{Log};
 
 ///
 /// Messages to be sent to the state machine thread.
 ///
+#[derive(Clone)]
 pub enum StateMachineMessage {
+    Command {
+        command: RaftCommand,
+        response_channel: Sender<Result<RaftCommandReply, RaftError>>
+    },
     Query { 
         query: RaftQuery, 
         response_channel: Sender<Result<RaftQueryReply, RaftError>>
     },
-    Command (usize),
+    Commit (usize),
+    Flush,
     Shutdown
+}
+
+///
+/// A handle to the state machine thread.
+/// Can send messages to it via |tx|.
+pub struct StateMachineHandle {
+    pub thread: Option<JoinHandle<()>>,  // The actual thread handle.
+    pub tx: Sender<StateMachineMessage>  // Channel to send messages.
 }
 
 ///
 /// Starts thread responsible for performing operations on state machine.
 /// Loops waiting on a channel for operations to perform.
 ///
-/// |Command| messages first advances an internal index pointer, then performs
+/// |Commit| messages first advances an internal index pointer, then performs
 /// StateMachine::write on the log entry's command buffer at that index if it
 /// is a Write operation. This index is initialized at |start_index|.
 ///
 /// |Query| messages perform StateMachine::read on the |query_buffer|, and
 /// sends the result over |response_channel|.
 ///
-/// Returns a Sender handle to this thread.
+/// Returns a handle to this thread.
 ///
 pub fn state_machine_thread (log: Arc<Mutex<Log>>,
-                         start_index: usize,
-                         state_machine: Box<ExactlyOnceStateMachine>,
-                         ) -> StateMachineHandle {
+                             start_index: usize,
+                             state_machine: Box<ExactlyOnceStateMachine>,
+                             to_main: Sender<MainThreadMessage>,
+                            ) -> StateMachineHandle {
+    let mut outstanding_commands = Vec::new();
     let(to_state_machine, from_main) = channel();
     let t = thread::spawn(move || {
         let mut next_index = start_index + 1;
         loop {
-            match from_main.recv().unwrap() {
-                StateMachineMessage::Command(commit_index) => {
-                    next_index = apply_commands(next_index, commit_index, log.clone(), &state_machine);
+            let message: StateMachineMessage = from_main.recv().unwrap();
+            let message_copy = message.clone();
+            match message {
+                StateMachineMessage::Commit(commit_index) => {
+                    // Once the commit index has marched forward, we can
+                    // apply any outstanding commands. This will also take
+                    // care of ACK'ing client requests in |outstanding_commands|.
+                    next_index = apply_commands(next_index, commit_index,
+                                                log.clone(), &state_machine,
+                                                &mut outstanding_commands);
                 },
                 StateMachineMessage::Query { query, response_channel } => {
+                    // Since this thread "linearizes" commit index updates wrt queries,
+                    // it's safe just to perform the query here and return it.
                     response_channel.send(state_machine.query(&query)).unwrap();
+                },
+                StateMachineMessage::Command { command, .. } => {
+                    // Inform main thread of client append request.
+                    to_main.send(MainThreadMessage::ClientAppendRequest(command))
+                           .unwrap();
+                    // Queue this command for later... until it's been
+                    // committed.
+                    outstanding_commands.push(message_copy);
+                },
+                StateMachineMessage::Flush => {
+                    // Flush any outstanding client requests. This will only happen
+                    // if leadership changes (we're not leader anymore) in which case
+                    // we should forward them the new leader. TODO (sydli)
+                    while let Some(cmd) = outstanding_commands.pop() {
+                        if let StateMachineMessage::Command
+                            { command, response_channel} = cmd {
+                            response_channel.send(Err(RaftError::NotLeader(None)))
+                                            .unwrap();
+                        }
+                    }
                 },
                 // TODO: Allow state machines to provide custom shutdown logic?
                 StateMachineMessage::Shutdown => break
@@ -60,21 +106,27 @@ pub fn state_machine_thread (log: Arc<Mutex<Log>>,
 /// Applies entries (next_index, to_commit) exclusive, exclusive from |log|
 /// to the |state_machine|. Returns the new committed index.
 pub fn apply_commands(next_index: usize, to_commit: usize,
-                  log: Arc<Mutex<Log>>,
-                  state_machine: &Box<ExactlyOnceStateMachine>)
+                      log: Arc<Mutex<Log>>,
+                      state_machine: &Box<ExactlyOnceStateMachine>,
+                      outstanding_messages: &mut Vec<StateMachineMessage>)
         -> usize {
     if to_commit < next_index { return next_index; }
     let to_apply = { log.lock().unwrap().get_entries_from(next_index - 1)
         [.. (to_commit - next_index + 1) ].to_vec() };
     for entry in to_apply.into_iter() {
-        state_machine.command(&entry.op).unwrap();
+        let response = state_machine.command(&entry.op);
+        let peek = { outstanding_messages.first().cloned() };
+        if let Some(message) = peek {
+            if let StateMachineMessage::Command
+                {ref command, ref response_channel} = message {
+                if *command == entry.op {
+                    response_channel.send(response).unwrap();
+                    outstanding_messages.remove(0);
+                }
+            }
+        }
     }
     to_commit + 1
-}
-
-pub struct StateMachineHandle {
-    pub thread: Option<JoinHandle<()>>,
-    pub tx: Sender<StateMachineMessage>
 }
 
 impl Drop for StateMachineHandle {
