@@ -4,6 +4,7 @@ use std::fs::OpenOptions;
 
 const VOTED_FOR_NONE: &'static str = "NONE";
 
+#[derive(Debug)]
 pub struct StateFile {
     f: File,
     state: Option<State>
@@ -11,8 +12,8 @@ pub struct StateFile {
 
 #[derive(Debug, PartialEq, Clone, Copy)]
 pub struct State {
-    term: u64,
-    voted_for: Option<u64>
+    pub term: u64,
+    pub voted_for: Option<u64>
 }
 
 impl State {
@@ -34,8 +35,8 @@ impl State {
 
 impl StateFile {
     /// Opens the file at filename creating it if it doesn't exist
-    pub fn new_with_filename(filename: &str) -> Result<StateFile> {
-        OpenOptions::new().write(true).read(false).open(filename)
+    pub fn new_from_filename(filename: &str) -> Result<StateFile> {
+        OpenOptions::new().write(true).read(true).create(true).open(filename)
             .map(|f| {
                 StateFile {f: f, state: None}
             })
@@ -50,41 +51,47 @@ impl StateFile {
         };
 
         self.f
-            .metadata()
-            .and_then(|m| {
-                if m.len() == 0 {
-                    // there is no persisted state, so return defaults
-                    return Ok(State {term: 0, voted_for: None})
-                }
-                self.f.seek(SeekFrom::Start(0))
-                    .and_then(|_| {
-                        // clone f so we can create a buffered reader from it and drop the reader
-                        // when we're done
-                        self.f.try_clone()
-                        .and_then(|f| {
-                            let mut reader = BufReader::new(f);
-                            // the file exists and has bytes
-                            // it is considered corrupt if we can't read the term and voted_for from it
-                            let term = StateFile::read_term(&mut reader)?;
-                            let voted_for = StateFile::read_voted_for(&mut reader)?;
+        .metadata()
+        .and_then(|m| {
+            if m.len() == 0 {
+                // there is no persisted state, so return defaults
+                return Ok(State {term: 0, voted_for: None})
+            }
+            self.f.seek(SeekFrom::Start(0))
+                .and_then(|_| {
+                    // clone f so we can create a buffered reader from it and drop the reader
+                    // when we're done
+                    self.f.try_clone()
+                    .and_then(|f| {
+                        let mut reader = BufReader::new(f);
+                        // the file exists and has bytes
+                        // it is considered corrupt if we can't read the term and voted_for from it
+                        let term = StateFile::read_term(&mut reader)?;
+                        let voted_for = StateFile::read_voted_for(&mut reader)?;
 
-                            Ok(State {term: term, voted_for: voted_for})
-                        })
+                        Ok(State {term: term, voted_for: voted_for})
                     })
-            })
-            .map(|s| {
-                self.state = Some(s);
-                s
-            })
+                })
+        })
+        .map(|s| {
+            self.state = Some(s);
+            s
+        })
     }
 
     /// Saves the state to disk. Caching it in memory as well.
     /// Will block until the state has been written. You may assume that if this function
     /// returns an Ok value then the state has been sucesfully written to disk
     pub fn save_state(&mut self, state: State) -> Result<()> {
+        if self.state.is_some() && state == self.state.unwrap() {
+            // Nothing to write. State is the same
+            return Ok(());
+        }
+
         let state_str = state.serialize();
 
-        self.f.seek(SeekFrom::Start(0))
+        self.f
+        .seek(SeekFrom::Start(0))
         .and_then(|_| {
             self.f.write_all(state_str.as_bytes())
         })
@@ -96,6 +103,9 @@ impl StateFile {
         })
         .and_then(|_| {
             self.f.sync_all()
+        })
+        .map(|s| {
+            self.state = Some(state);
         })
     }
 

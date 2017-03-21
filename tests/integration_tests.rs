@@ -25,13 +25,25 @@ use std::net::{SocketAddr, ToSocketAddrs};
 use std::sync::mpsc::{Receiver, channel};
 use std::thread;
 use std::time::Duration;
+use std::fs;
+
+// TODO: Ensure directory exists?
+const TEST_STATE_DIR: &'static str = "build/state";
 
 // Container around a MockStateMachine Receiver and a handle
 // to the raft server that is running that instance of the state machine
 struct StateMachineHandle {
     rx: Receiver<Vec<u8>>,
     server_handle: ServerHandle,
-    id: u64
+    id: u64,
+    state_filename: String
+}
+
+impl Drop for StateMachineHandle {
+    /// Deletes the state file
+    fn drop (&mut self) {
+        fs::remove_file(self.state_filename.clone()).unwrap();
+    }
 }
 
 /// Starts a relay server that binds to num_servers os-assigned local ports 
@@ -53,20 +65,24 @@ fn start_relay_server (num_servers: u64) -> (RelayServer, HashMap<u64, SocketAdd
 /// ServerHandle) or check on the state of the MockStateMachine
 fn start_raft_servers(relay_server: &mut RelayServer, addrs: &HashMap<u64, SocketAddr>) -> Vec<StateMachineHandle> {
     const HEARTBEAT_TIMEOUT: u64 = 75;
+    const STATE_FILENAME_LEN: usize = 20;
     println!("Starting {} raft servers", addrs.len());
 
     (0..addrs.len() as u64)
     .map(|i| {
         // create a config object
+        let mut state_filename: String = thread_rng().gen_ascii_chars().take(STATE_FILENAME_LEN).collect();
+        state_filename = String::from("/tmp/") + &state_filename;
+
         let config = Config::new (addrs.clone(), i, "127.0.0.1:0".to_socket_addrs().unwrap().next().unwrap(),
-                Duration::from_millis(HEARTBEAT_TIMEOUT));
+                Duration::from_millis(HEARTBEAT_TIMEOUT), state_filename.clone());
         let (tx, rx) = channel();
         let state_machine = Box::new(MockStateMachine::new_with_sender(tx));
         let server_handle = start_server(config, move || state_machine).unwrap();
 
         // map this server through the relay server
         relay_server.relay_address(*addrs.get(&i).unwrap(), server_handle.get_local_addr());
-        StateMachineHandle {rx: rx, server_handle: server_handle, id: i}
+        StateMachineHandle {rx: rx, server_handle: server_handle, id: i, state_filename: state_filename}
     })
     .collect()
 }

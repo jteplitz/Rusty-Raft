@@ -5,6 +5,7 @@
 pub mod rpc;
 
 /// Common code between structs.
+// TODO: This probably should not all be public
 pub mod common;
 
 ///
