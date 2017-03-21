@@ -293,7 +293,6 @@ mod tests {
     use super::*;
     use super::super::constants;
     use super::super::log::{Entry, random_entry_with_term, random_entries_with_term, Log, MemoryLog};
-    use super::super::super::rpc::client::*;
     use super::super::super::raft_capnp::{request_vote, request_vote_reply,
                                           append_entries, append_entries_reply};
     use super::super::super::rpc_capnp::rpc_response;

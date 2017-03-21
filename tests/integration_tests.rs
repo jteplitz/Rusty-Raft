@@ -12,8 +12,6 @@ use rusty_raft::common::constants::*;
 use rusty_raft::rpc::client::*;
 use rusty_raft::rpc::RpcError;
 use rusty_raft::client_request;
-use rusty_raft::Op;
-use rusty_raft::client_request_reply;
 
 use rand::{thread_rng, Rng};
 use rand::distributions::{IndependentSample, Range};
@@ -82,16 +80,11 @@ fn it_starts_up_a_cluster() {
 }
 
 /// Returns a new Rpc 
-fn create_client_request(op: Op, data: &[u8]) -> Rpc {
+fn create_client_request(request: ClientRequest) -> Rpc {
     let mut rpc = Rpc::new(CLIENT_REQUEST_OPCODE); 
     {
         let mut param_builder = rpc.get_param_builder().init_as::<client_request::Builder>();
-        param_builder.set_op(op);
-        {
-            let mut session_builder = param_builder.borrow().get_session().unwrap();
-            SessionInfo::new_empty().into_proto(&mut session_builder);
-        }
-        param_builder.set_data(data);
+        client_request_to_proto(request, &mut param_builder);
     }
     rpc
 }
@@ -108,7 +101,11 @@ fn send_client_request(addrs: &HashMap<u64, SocketAddr>, data: &[u8], skip_id: O
         skip_id.is_none() || *i != skip_id.unwrap()
     })
     .map(|(_, &to_addr)| {
-        let rpc = create_client_request(Op::Write, data);
+        let rpc = create_client_request(
+            ClientRequest::Command(
+                RaftCommand::StateMachineCommand{
+                    data: data.to_vec(),
+                    session: SessionInfo::new_empty()}));
         rpc.send(to_addr)
     })
     .collect::<Result<Vec<Reader<OwnedSegments>>, RpcError>>()
@@ -116,7 +113,8 @@ fn send_client_request(addrs: &HashMap<u64, SocketAddr>, data: &[u8], skip_id: O
     .into_iter()
     .filter(|msg| {
         let reply = Rpc::get_result_reader(&msg).unwrap();
-        reply.get_as::<client_request_reply::Reader>().unwrap().get_success()
+        client_request_reply_from_proto(
+            &mut reply.get_as::<client_request::reply::Reader>().unwrap()).is_ok()
     })
     .collect::<Vec<Reader<OwnedSegments>>>()
 }

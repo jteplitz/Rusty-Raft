@@ -5,11 +5,16 @@ use capnp;
 use rand;
 use raft_capnp::{append_entries, append_entries_reply,
                  request_vote, request_vote_reply,
-                 client_request, client_request_reply, Op as ProtoOp};
+                 client_request};
 use rpc::{RpcError};
 use rpc::server::{RpcObject, RpcServer};
 use client::state_machine::{ExactlyOnceStateMachine};
-use common::{SessionInfo, Config, RaftError};
+use common::{Config, RaftError,
+             RaftCommand, RaftCommandReply,
+             RaftQuery, RaftQueryReply,
+             ClientRequest, ClientRequestReply,
+             client_request_from_proto,
+             client_request_reply_to_proto};
 use common::constants;
 use std::net::SocketAddr;
 use std::time::{Duration, Instant};
@@ -19,7 +24,7 @@ use std::sync::{Arc, Mutex, Condvar};
 use std::sync::mpsc::{channel, Sender, Receiver, RecvTimeoutError};
 use std::mem;
 
-use self::log::{Log, MemoryLog, Entry, Op};
+use self::log::{Log, MemoryLog, Entry};
 use self::state_machine::{StateMachineMessage, state_machine_thread, StateMachineHandle};
 use self::peer::{Peer, PeerHandle, PeerThreadMessage, RequestVoteMessage};
 use std::io::Error as IoError;
@@ -674,13 +679,13 @@ fn generate_election_timeout() -> Duration {
 /// Client read. Blocks until most recent write is properly committed to the log,
 /// then returns result from client state machine query.
 ///
-fn client_read_blocking (query: &[u8],
+fn client_read_blocking (query: RaftQuery,
                          to_state_machine: Arc<Mutex<Sender<StateMachineMessage>>>
-                         ) -> Result<Vec<u8>, RaftError> {
+                         ) -> Result<RaftQueryReply, RaftError> {
     let (to_me, from_sm) = channel();
     to_state_machine.lock().unwrap().send(
         StateMachineMessage::Query {
-            buffer: query.to_vec(),
+            query: query,
             response_channel: to_me,
         }).unwrap();
     from_sm.recv().unwrap()
@@ -705,10 +710,10 @@ fn wait_for_commit(term: u64, index: usize, state: Arc<(Mutex<ServerState>, Cond
 /// Returns true if client write succeeds; false if term changes and the write failed.
 ///
 fn client_write_blocking (log: Arc<Mutex<Log>>,
-                          op: Op,
+                          op: RaftCommand,
                           state: Arc<(Mutex<ServerState>, Condvar)>,
                           to_main: Arc<Mutex<Sender<MainThreadMessage>>>)
-                          -> Result<(), RaftError> {
+                          -> Result<RaftCommandReply, RaftError> {
     // TODO (sydli): it may not be 100% safe to drop the state lock here.
     let (current_state, current_term) = {
         let state = state.0.lock().unwrap();
@@ -725,7 +730,7 @@ fn client_write_blocking (log: Arc<Mutex<Log>>,
     unwrapped_to_main.send(MainThreadMessage::ClientAppendRequest).unwrap();
     // wait for commit index to update or term to change
     if wait_for_commit(current_term, index, state.clone()) {
-        Ok(())
+        Ok(RaftCommandReply::StateMachineCommand)
     } else {
         Err(RaftError::NotLeader(None))
     }
@@ -738,8 +743,8 @@ struct ClientRequestHandler {
     to_state_machine: Arc<Mutex<Sender<StateMachineMessage>>>,
 }
 impl ClientRequestHandler {
-    fn client_write_blocking(&self, op: Op)
-        -> Result<(), RaftError>
+    fn client_write_blocking(&self, op: RaftCommand)
+        -> Result<RaftCommandReply, RaftError>
     {
         client_write_blocking(
             self.log.clone(),
@@ -747,35 +752,30 @@ impl ClientRequestHandler {
             self.state.clone(),
             self.to_main.clone())
     }
+
+    fn client_read_blocking(&self, op: RaftQuery)
+        -> Result<RaftQueryReply, RaftError>
+    {
+        client_read_blocking(
+            op,
+            self.to_state_machine.clone())
+    }
 }
 
 impl RpcObject for ClientRequestHandler {
     fn handle_rpc (&self, params: capnp::any_pointer::Reader,
                    result: capnp::any_pointer::Builder) -> Result<(), RpcError> {
         params.get_as::<client_request::Reader>().map(|client_request| {
-            let op_result = match client_request.get_op().unwrap() {
-                ProtoOp::Write => self.client_write_blocking(
-                        Op::Write {
-                            data: client_request.get_data().unwrap().to_vec(),
-                            session: SessionInfo::from_proto(
-                                client_request.get_session().unwrap()),
-                        }).map(|_| vec![]),
-                ProtoOp::OpenSession => self.client_write_blocking(Op::OpenSession)
-                                            .map(|_| vec![]),
-                ProtoOp::Read => client_read_blocking(
-                        client_request.get_data().unwrap(),
-                        self.to_state_machine.clone()),
-                ProtoOp::Noop | ProtoOp::Unknown => Ok(vec![]), 
+            let op = client_request_from_proto(client_request);
+            let reply = match op {
+                ClientRequest::Command(op) =>
+                    self.client_write_blocking(op).map(ClientRequestReply::Command),
+                ClientRequest::Query(op) =>
+                    self.client_read_blocking(op).map(ClientRequestReply::Query),
+                _ => Ok(ClientRequestReply::Command(RaftCommandReply::Noop)),
             };
-            let mut reply = result.init_as::<client_request_reply::Builder>();
-            match op_result {
-                Ok(data) => {
-                    reply.set_success(true);
-                    reply.set_data(&data);
-                }
-                Err(_) => reply.set_success(false),
-
-            }
+            let mut reply_proto = result.init_as::<client_request::reply::Builder>();
+            client_request_reply_to_proto(reply, &mut reply_proto);
         })
         .map_err(RpcError::Capnp)
     }
@@ -1051,7 +1051,7 @@ mod tests {
         use super::mock_server;
         use super::super::{State};
         use super::super::peer::{PeerThreadMessage};
-        use super::super::log::{Op};
+        use super::super::super::common::{RaftCommand};
 
         // TODO (sydli) make sure cv is called
         #[test]
@@ -1092,7 +1092,7 @@ mod tests {
             let log = s.log.lock().unwrap();
             assert_eq!(log.get_last_entry_index(), 1);
             let entry = log.get_entry(1).unwrap();
-            assert!(matches!(entry.op, Op::Noop));
+            assert!(matches!(entry.op, RaftCommand::Noop));
 
             // ensure that the dummy entry was broadcasted properly
             for _ in 0..s.info.peers.len() {

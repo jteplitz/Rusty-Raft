@@ -1,24 +1,16 @@
 use std::fmt;
-use raft_capnp::{entry, Op as ProtoOp};
-use super::super::common::{SessionInfo};
+use raft_capnp::{entry};
+use super::super::common::{SessionInfo, RaftCommand,
+raft_command_from_proto, raft_command_to_proto};
 
 ///
 /// Abstraction for a single Entry for our log.
 ///
 #[derive(Clone)]
 pub struct Entry {
-    pub index: usize,  // index of this Entry in the log
-    pub term: u64,     // term for which this Entry is committed
-    pub op: Op,        // operation represented by this Entry
-}
-
-#[derive(Clone)]
-pub enum Op {
-    Write {data: Vec<u8>, session:SessionInfo},
-    Read  (Vec<u8>),
-    OpenSession,
-    Noop,
-    Unknown,
+    pub index: usize,       // index of this Entry in the log
+    pub term: u64,          // term for which this Entry is committed
+    pub op: RaftCommand,    // operation represented by this Entry
 }
 
 #[cfg(test)]
@@ -32,7 +24,8 @@ pub fn random_entry_with_term(term: u64) -> Entry {
   Entry {
       index: 0,
       term: term,
-      op: Op::Write{data: vec, session: SessionInfo::new_empty()},
+      op: RaftCommand::StateMachineCommand { data: vec, session:
+          SessionInfo::new_empty()},
   }
 }
 
@@ -55,7 +48,7 @@ impl Entry {
         Entry {
             index: 0,
             term: term,
-            op: Op::Noop,
+            op: RaftCommand::Noop,
         }
     }
 
@@ -66,31 +59,10 @@ impl Entry {
     /// Panics if deserialization fails.
     ///
     pub fn from_proto(entry_proto: entry::Reader) -> Entry {
-        let op = match entry_proto.get_op().unwrap() {
-            ProtoOp::Write => Op::Write{data: entry_proto.get_data().unwrap().to_vec(),
-            session: SessionInfo::from_proto(entry_proto.get_session().unwrap())},
-            ProtoOp::Read => Op::Read(entry_proto.get_data().unwrap().to_vec()),
-            ProtoOp::OpenSession => Op::OpenSession,
-            ProtoOp::Noop => Op::Noop,
-            ProtoOp::Unknown => Op::Unknown,
-        };
         Entry {
             index: entry_proto.get_index() as usize,
             term: entry_proto.get_term(),
-            op: op,
-        }
-    }
-
-    ///
-    /// Retrieves the appropriate proto "Op" enum for this entry's |op|.
-    ///
-    fn get_proto_op(&self) -> ProtoOp {
-        match self.op {
-            Op::Write{..} => ProtoOp::Write,
-            Op::Read(_) => ProtoOp::Read,
-            Op::OpenSession => ProtoOp::OpenSession,
-            Op::Noop => ProtoOp::Noop,
-            Op::Unknown => ProtoOp::Unknown,
+            op: raft_command_from_proto(entry_proto.get_op().unwrap()),
         }
     }
 
@@ -100,8 +72,8 @@ impl Entry {
     pub fn into_proto(&self, builder: &mut entry::Builder) {
         builder.set_term(self.term);
         builder.set_index(self.index as u64);
-        builder.set_data(&self.get_data());
-        builder.set_op(self.get_proto_op());
+        raft_command_to_proto(self.op.clone(), &mut builder.borrow()
+                                .init_op());
     }
 
     ///
@@ -109,9 +81,8 @@ impl Entry {
     ///
     fn get_data(&self) -> Vec<u8> {
         match self.op {
-            Op::Write{ref data, .. } => data.clone(),
-            Op::Read(ref data) => data.clone(),
-            Op::OpenSession | Op::Noop | Op::Unknown  => vec![],
+            RaftCommand::StateMachineCommand {ref data, ..} => data.to_vec(),
+            _ => vec![],
         }
     }
 }

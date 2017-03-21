@@ -1,5 +1,6 @@
 use std::collections::HashMap;
-use super::super::common::{RaftError, SessionInfo};
+use super::super::common::{RaftError, RaftCommandReply,
+                           RaftQueryReply, RaftCommand, RaftQuery};
 
 ///
 /// State machine trait for clients to implement. Client should define
@@ -51,14 +52,29 @@ impl ExactlyOnceStateMachine {
     pub fn new_session(&self) {
     }
 
-    pub fn command (&self, buffer: &[u8], session: SessionInfo)
-        -> Result<(), RaftError> {
-            // TODO (sydli) impl
-        self.client_state_machine.command(buffer)
+    pub fn command (&self, data: &RaftCommand)
+        -> Result<RaftCommandReply, RaftError> {
+        match *data {
+            RaftCommand::StateMachineCommand{ref data, session} => {
+        // TODO (sydli) verify session
+            self.client_state_machine.command(data)
+                .map(|_| RaftCommandReply::StateMachineCommand)
+            },
+            RaftCommand::OpenSession => {
+                // TODO (sydli) impl open session
+                Ok(RaftCommandReply::Noop)
+            },
+            _ => Ok(RaftCommandReply::Noop),
+        }
     }
 
-    pub fn query (&self, buffer: &[u8]) -> Result<Vec<u8>, RaftError> {
-        self.client_state_machine.query(buffer)
+    pub fn query (&self, data: &RaftQuery) -> Result<RaftQueryReply, RaftError> {
+        match *data {
+            RaftQuery::StateMachineQuery(ref buffer) =>
+                self.client_state_machine.query(buffer)
+                    .map(RaftQueryReply::StateMachineQuery),
+            _ => Err(RaftError::Unknown),
+        }
     }
 }
 

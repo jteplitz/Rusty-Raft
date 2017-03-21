@@ -1,19 +1,61 @@
 @0xdcf9b3ce29f421d0;
 
-enum Op {
-  write @0;
-  read @1;
-  noop @2;
-  openSession @3;
-  unknown @4;
+# Changes to RaftOp should be reflected in the
+# equivalent structures from the common module.
+struct RaftCommand {
+  struct StateMachineCommand {
+    data        @0  :Data;
+    session     @1  :SessionInfo;
+  }
+  union {
+    stateMachineCommand  @0 :StateMachineCommand;
+    openSession          @1 :Void;
+    setConfig            @2 :Void;
+    noop                 @3 :Void;
+  }
+  struct Reply {
+    union {
+      stateMachineCommand  @0  :Void;
+      openSession          @1  :UInt64; # for openSession
+      setConfig            @2  :Void;   # for setConfig
+      noop                 @3  :Void;
+    }
+  }
+}
+
+struct RaftQuery {
+  union {
+    stateMachineQuery   @0   :Data;
+    getConfig           @1   :Void;
+  }
+  struct Reply {
+    union {
+      stateMachineQuery   @0  :Data;  # for statemachinequery
+      getConfig           @1  :Data;  # for getConfig
+    }
+  }
+}
+
+struct ClientRequest {
+  union {
+    command     @0   :RaftCommand;
+    query       @1   :RaftQuery;
+    noop        @2   :Void; # TODO move into command
+    unknown     @3   :Void;
+  }
+  struct Reply {
+    union {
+      error           @0   :RaftError;
+      commandReply    @1   :RaftCommand.Reply;
+      queryReply      @2   :RaftQuery.Reply;
+    }
+  }
 }
 
 struct Entry {
   term          @0   :UInt64;
   index         @1   :UInt64;
-  op            @2   :Op;
-  data          @3   :Data;
-  session       @4   :SessionInfo;
+  op            @2   :RaftCommand;
 }
 
 struct AppendEntries {
@@ -47,54 +89,13 @@ struct RequestVoteReply {
   voteGranted   @1   :Bool;
 }
 
-struct ClientRequest {
-  op            @0  :Op;
-  clientId      @1  :UInt64;
-  data          @2  :Data;
-  session       @3  :SessionInfo;
+struct RaftError {
+  union {
+    clientError   @0  :Text;
+    notLeader     @1  :Text;
+    sessionError  @2  :Void;
+    unknown       @3  :Void;
+  }
 }
 
-# To factor into Entry & ClientRequest after merge...
-# struct ClientRequest {
-#   struct SessionInfo {
-#     clientId                 @0  :UInt64;
-#     firstOutstandingRequest  @1  :UInt64;
-#     requestNumber            @2  :UInt64;
-#   }
-#   op :union {
-#     write :group {
-#         command      @0  :Data;
-#         session      @1  :SessionInfo;
-#     }
-#     read :group {
-#         query        @2  :Data;
-#         session      @3  :SessionInfo;
-#     }
-#     openSession      @4  :Void;
-#   }
-# }
-# 
-# struct ClientReply {
-#   struct Error {
-#     union {
-#       clientError   @0  :Text;
-#       notLeader     @1  :Text;
-#       sessionError  @2  :Void;
-#       rpcError      @3  :Void;
-#       unknown       @4  :Void;
-#     }
-#   }
-#   reply :union {
-#     error @0 :Error;
-#     write @1 :Void;
-#     read  @2 :Data;
-#   }
-# }
-
-struct ClientRequestReply {
-  success       @0   :Bool;
-  clientId      @1   :UInt64;
-  leaderAddr    @2   :Text;
-  data          @3   :Data;
-}
 

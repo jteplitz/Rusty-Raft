@@ -4,18 +4,22 @@ use std::sync::mpsc::{channel, Sender};
 use std::thread;
 use std::thread::JoinHandle;
 
-use super::super::client::state_machine::{ExactlyOnceStateMachine};
-use super::super::common::{RaftError};
-use super::log::{Log, Op};
+use super::super::client::state_machine::ExactlyOnceStateMachine;
+use super::super::common::{RaftError, RaftQuery, RaftQueryReply};
+use super::log::{Log};
 
 ///
 /// Messages to be sent to the state machine thread.
 ///
 pub enum StateMachineMessage {
+    Query { 
+        query: RaftQuery, 
+        response_channel: Sender<Result<RaftQueryReply, RaftError>>
+    },
     Command (usize),
-    Query { buffer: Vec<u8>, response_channel: Sender<Result<Vec<u8>, RaftError>> },
     Shutdown
 }
+
 ///
 /// Starts thread responsible for performing operations on state machine.
 /// Loops waiting on a channel for operations to perform.
@@ -41,8 +45,8 @@ pub fn state_machine_thread (log: Arc<Mutex<Log>>,
                 StateMachineMessage::Command(commit_index) => {
                     next_index = apply_commands(next_index, commit_index, log.clone(), &state_machine);
                 },
-                StateMachineMessage::Query { buffer, response_channel } => {
-                    response_channel.send(state_machine.query(&buffer)).unwrap();
+                StateMachineMessage::Query { query, response_channel } => {
+                    response_channel.send(state_machine.query(&query)).unwrap();
                 },
                 // TODO: Allow state machines to provide custom shutdown logic?
                 StateMachineMessage::Shutdown => break
@@ -63,13 +67,7 @@ pub fn apply_commands(next_index: usize, to_commit: usize,
     let to_apply = { log.lock().unwrap().get_entries_from(next_index - 1)
         [.. (to_commit - next_index + 1) ].to_vec() };
     for entry in to_apply.into_iter() {
-        match entry.op {
-            Op::Write{data, session} => {
-                state_machine.command(&data, session).unwrap();
-            },
-            Op::OpenSession => {state_machine.new_session();},
-            Op::Read(_) | Op::Noop | Op::Unknown => {},
-        };
+        state_machine.command(&entry.op).unwrap();
     }
     to_commit + 1
 }
