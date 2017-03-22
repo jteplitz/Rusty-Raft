@@ -268,6 +268,7 @@ fn handle_append_entries_reply(m: AppendEntriesReply, server_info: &mut ServerIn
         State::Candidate{ .. } | State::Follower => return, // drop it like it's hot
     }
     if m.term > state.current_term {
+        println!("Server {}: becoming follower in term {} after being leader in {}", server_info.me.0, m.term, state.current_term);
         state.transition_to_follower(m.term, state_condition, None);
     } else if m.success {
         // On success, advance peer's index.
@@ -581,13 +582,16 @@ impl RpcObject for RequestVoteHandler {
             // So we save the new_term in a local variable and transition after we know
             // if we've voted for this candidate or not
             let new_term;
+            let voted_for;
             if term > state.current_term {
                 new_term = term;
+                voted_for = None;
             } else {
                 new_term = state.current_term;
+                voted_for = state.voted_for;
             }
 
-            if state.voted_for == None || state.voted_for == Some(candidate_id) {
+            if voted_for == None || voted_for == Some(candidate_id) {
                 let log = self.log.lock().unwrap(); // panics if mutex is poisoned
                 if term == new_term && log.is_other_log_valid(last_log_index, last_log_term) {
                     // grant vote and become a follower of this candidate
