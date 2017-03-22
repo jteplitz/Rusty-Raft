@@ -25,7 +25,7 @@ use std::mem;
 use std::cmp::min;
 use std::collections::HashMap;
 
-use self::log::{Log, MemoryLog, Entry};
+use self::log::{Log, Entry};
 use self::state_machine::{StateMachineMessage, state_machine_thread, StateMachineHandle};
 use self::peer::{Peer, PeerHandle, PeerThreadMessage, RequestVoteMessage};
 use self::state_file::StateFile;
@@ -149,7 +149,7 @@ impl ServerState {
 pub struct Server {
     // TODO: Rename properties?
     state: Arc<Mutex<ServerState>>,
-    log: Arc<Mutex<MemoryLog>>,
+    log: Arc<Mutex<Log>>,
     info: ServerInfo
 }
 
@@ -353,7 +353,7 @@ impl Server {
         let mut state_file = StateFile::new_from_filename(&config.state_filename)?;
         let persisted_state = state_file.get_state()?;
         let (last_persisted_index, log) = {
-            let l = MemoryLog::new_from_filename(config.log_filename, tx.clone())?;
+            let l = Log::new_from_filename(config.log_filename, tx.clone())?;
             (l.get_last_entry_index(), Arc::new(Mutex::new(l)))
         };
         let state = Arc::new(Mutex::new(ServerState {
@@ -590,7 +590,7 @@ impl Server {
 
 struct RequestVoteHandler {
     state: Arc<Mutex<ServerState>>,
-    log: Arc<Mutex<MemoryLog>>,
+    log: Arc<Mutex<Log>>,
     to_state_machine: Arc<Mutex<Sender<StateMachineMessage>>>,
 }
 
@@ -663,7 +663,7 @@ impl RpcObject for RequestVoteHandler {
 
 struct AppendEntriesHandler {
     state: Arc<Mutex<ServerState>>,
-    log: Arc<Mutex<MemoryLog>>,
+    log: Arc<Mutex<Log>>,
     to_state_machine: Arc<Mutex<Sender<StateMachineMessage>>>,
 }
 
@@ -811,7 +811,7 @@ mod tests {
                 State, generate_election_timeout, update_commit_index,
                 StateMachineMessage,
                 handle_request_vote_reply};
-    use super::log::{MemoryLog, random_entries_with_term};
+    use super::log::{Log, random_entries_with_term};
     use super::log::mocks::{new_mock_log, MockLogFileHandle};
     use std::time::{Duration, Instant};
     use std::sync::mpsc::{channel, Receiver};
@@ -841,7 +841,7 @@ mod tests {
         state_filename = String::from("/tmp/") + &state_filename;
 
         let (mock_log, log_file_handle) = new_mock_log();
-        let log: Arc<Mutex<MemoryLog>> = Arc::new(Mutex::new(mock_log));
+        let log: Arc<Mutex<Log>> = Arc::new(Mutex::new(mock_log));
         let state = Arc::new(Mutex::new(ServerState {
             current_state: State::Follower,
             current_term: 0,
@@ -1135,7 +1135,6 @@ mod tests {
         use super::super::peer::{PeerThreadMessage};
         use super::super::super::common::{raft_command};
         use super::super::StateFile;
-        use super::super::log::Log;
 
         #[test]
         fn transition_to_candidate_normal() {
