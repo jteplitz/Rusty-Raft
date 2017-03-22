@@ -132,10 +132,8 @@ fn it_handles_a_failure() {
     let index: u64 = Range::new(0, state_machines.len()).ind_sample(&mut thread_rng()) as u64;
     addrs.remove(&index);
     state_machines.remove(index as usize);
-    //relay_server.set_address_active(addrs[offline_id], false);
 
-    // generate the client append RPC and send it to each server
-    // only one should respond that they're the leader
+    // generate the client append RPC and send it 
     let data: String = thread_rng().gen_ascii_chars().take(DATA_LENGTH).collect();
     let mut raft_db = RaftConnection::new_with_session(&addrs.clone()).unwrap();
     assert!(raft_db.command(data.as_bytes()).is_ok());

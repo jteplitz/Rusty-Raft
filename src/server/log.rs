@@ -225,11 +225,13 @@ impl Drop for MemoryLog {
     /// #Panics
     /// Panics if the background thread has panicked
     fn drop (&mut self) {
+        println!("Dropping memory log");
         let thread = mem::replace(&mut self.background_thread, None);
         match thread {
             Some(t) => {
                 self.background_thread_tx.send(BackgroundThreadMessage::Shutdown).unwrap();
                 t.join().unwrap();
+                println!("Background thread done");
             },
             None => {/* Nothing to shutdown*/}
         }
@@ -262,8 +264,6 @@ impl MemoryLog {
 
     fn background_thread_repl(mut file: File, to_main_thread: Sender<MainThreadMessage>, to_log_thread: Sender<BackgroundThreadReply>,
                               from_log_thread: Receiver<BackgroundThreadMessage>, entry_offsets: Arc<Mutex<Vec<u64>>>) {
-        const MAX_RETRIES: u32 = 5; // maximum times to try writing an entry before giving up
-        let RETRY_WAIT_TIME = Duration::from_millis(50);
         loop {
             match from_log_thread.recv().unwrap() {
                 BackgroundThreadMessage::Flush => {
@@ -272,31 +272,50 @@ impl MemoryLog {
                     to_log_thread.send(BackgroundThreadReply::Flushed).unwrap();
                 },
                 BackgroundThreadMessage::AppendEntry(e) => {
-                    // TODO Move to different fn
                     // Panic if we can't write the entry after trying for MAX_RETRIES
-                    let mut success = false;
-                    for i in 0..MAX_RETRIES {
-                        match MemoryLog::write_entry_to_disk(&mut file, &e, &entry_offsets) {
-                            Ok(_) => {
-                                success = true;
-                                break;
-                            },
-                            Err(e) => {
-                                warn!("Unable to write to log file. Will retry.");
-                                thread::sleep(RETRY_WAIT_TIME * (i + 1));
-                            }
+                    let index = e.index;
+                    match MemoryLog::background_append_entry(&mut file, e, &entry_offsets) {
+                        Ok(_) => to_main_thread.send(MainThreadMessage::EntryPersisted(index)).unwrap(),
+                        Err(e) => {
+                            error!("Unable to write to log file. This is unrecoverable, and the server will shut down. {}", e);
+                            panic!("Unable to write to log file.");
                         }
-                    }
-                    if !success {
-                        error!("Unable to write to log file. This is unrecoverable, and the server will shut down.");
-                        panic!("Unable to write to log file.");
-                    } else {
-                        to_main_thread.send(MainThreadMessage::EntryPersisted(e.index));
-                    }
+                    };
                 },
                 BackgroundThreadMessage::Shutdown => break
             }
         }
+    }
+
+    /// Tries to write e to file. Puts its start offset into entry_offsets if sucessful.
+    ///
+    /// #Error
+    /// Returns an IO error if it fails to write the entry after 5 retries or if
+    /// it fails to flush the entry to disk after writing it
+    ///
+    /// #Panics
+    /// Panics if the offsets vec lock is posioned
+    fn background_append_entry(file: &mut File, e: Entry, entry_offsets: &Arc<Mutex<Vec<u64>>>) -> Result<()> {
+        const MAX_RETRIES: u32 = 5; // maximum times to try writing an entry before giving up
+        let RETRY_WAIT_TIME = Duration::from_millis(50);
+
+        for i in 0..MAX_RETRIES {
+            match MemoryLog::write_entry_to_disk(file, &e, &entry_offsets) {
+                Ok(_) => {
+                    break;
+                },
+                Err(e) => {
+                    if i != MAX_RETRIES - 1 {
+                        warn!("Unable to write to log file. Will retry.");
+                        thread::sleep(RETRY_WAIT_TIME * (i + 1));
+                    } else {
+                        return Err(e)
+                    }
+                }
+            }
+        }
+
+        file.sync_all()
     }
 
     /// Takes in a file (assumed to be pointed at EOF) and writes the given entry to the file.
@@ -399,6 +418,7 @@ impl Log for MemoryLog {
             entry
         });
         
+        // write the entries to disk
         let mut writer = BufWriter::new(&self.file);
         for entry in indexed_entries {
             let mut metadata = self.file.metadata()?;
@@ -411,7 +431,7 @@ impl Log for MemoryLog {
             self.entry_offsets.lock().unwrap().push(cursor);
         }
 
-        // write the entries to disk
+        self.file.sync_all()?;
         Ok(self)
     }
 
@@ -527,7 +547,7 @@ pub mod mocks {
 
     impl Drop for MockLogFileHandle {
         fn drop (&mut self) {
-            //fs::remove_file(&self.name).unwrap();
+            fs::remove_file(&self.name).unwrap();
         }
     }
 }
@@ -553,33 +573,42 @@ mod tests {
     #[test]
     /// Makes sure we return None if the index is out of the log
     fn get_entry_out_of_index() {
-        let (mut log, _file_handle) = new_mock_log();
-        log.append_entry(random_entry());
-        assert!(log.get_entry(2).is_none());
+        let (mut l, _file_handle) = new_mock_log();
+        { // _file_handle must outlive log
+            let mut log = l;
+            log.append_entry(random_entry());
+            assert!(log.get_entry(2).is_none());
+        }
     }
 
     #[test]
     fn index_0_is_none() {
-        let (mut log, _file_handle) = new_mock_log();
-        assert!(log.get_entry(0).is_none());
-        log.append_entry(random_entry());
-        assert!(log.get_entry(0).is_none());
+        let (mut l, _file_handle) = new_mock_log();
+        { // _file_handle must outlive log
+            let mut log = l;
+            assert!(log.get_entry(0).is_none());
+            log.append_entry(random_entry());
+            assert!(log.get_entry(0).is_none());
+        }
     }
 
     #[test]
     /// Tests that simple append and get works for a two-element array.
     fn append_get_simple() {
-        let (mut log, _file_handle) = new_mock_log();
-        let entry1 = random_entry();
-        let entry2 = random_entry();
+        let (mut l, _file_handle) = new_mock_log();
+        { // _file_handle must outlive log
+            let mut log = l;
+            let entry1 = random_entry();
+            let entry2 = random_entry();
 
-        // Append operations
-        log.append_entry(entry1.clone());
-        log.append_entry(entry2.clone());
+            // Append operations
+            log.append_entry(entry1.clone());
+            log.append_entry(entry2.clone());
 
-        // Data should be the same
-        assert_eq!(entry1.get_data(), log.get_entry(1).unwrap().get_data());
-        assert_eq!(entry2.get_data(), log.get_entry(2).unwrap().get_data());
+            // Data should be the same
+            assert_eq!(entry1.get_data(), log.get_entry(1).unwrap().get_data());
+            assert_eq!(entry2.get_data(), log.get_entry(2).unwrap().get_data());
+        }
     }
 
     #[test]
@@ -654,26 +683,35 @@ mod tests {
 
     #[test]
     fn is_other_log_valid_rejects_previous_terms() {
-        let (mut log, _file_handle) = new_mock_log();
-        log.append_entry(random_entry_with_term(1));
-        log.append_entry(random_entry_with_term(2));
-        assert!(!log.is_other_log_valid(3, 1));
+        let (mut l, _file_handle) = new_mock_log();
+        { // _file_handle must outlive log
+            let mut log = l;
+            log.append_entry(random_entry_with_term(1));
+            log.append_entry(random_entry_with_term(2));
+            assert!(!log.is_other_log_valid(3, 1));
+        }
     }
 
     #[test]
     fn is_other_log_valid_rejects_lower_indices() {
-        let (mut log, _file_handle) = new_mock_log();
-        log.append_entry(random_entry_with_term(1));
-        log.append_entry(random_entry_with_term(1));
-        log.append_entry(random_entry_with_term(2));
-        assert!(!log.is_other_log_valid(1, 2));
+        let (mut l, _file_handle) = new_mock_log();
+        { // _file_handle must outlive log
+            let mut log = l;
+            log.append_entry(random_entry_with_term(1));
+            log.append_entry(random_entry_with_term(1));
+            log.append_entry(random_entry_with_term(2));
+            assert!(!log.is_other_log_valid(1, 2));
+        }
     }
 
     #[test]
     fn is_other_log_valid_accepts_same_index() {
-        let (mut log, _file_handle) = new_mock_log();
-        log.append_entry(random_entry_with_term(1));
-        assert!(log.is_other_log_valid(1, 1));
+        let (mut l, _file_handle) = new_mock_log();
+        { // _file_handle must outlive log
+            let mut log = l;
+            log.append_entry(random_entry_with_term(1));
+            assert!(log.is_other_log_valid(1, 1));
+        }
     }
 
     #[test]
