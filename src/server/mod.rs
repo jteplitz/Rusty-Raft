@@ -9,7 +9,7 @@ use raft_capnp::{append_entries, append_entries_reply,
                  client_request};
 use rpc::{RpcError};
 use rpc::server::{RpcObject, RpcServer};
-use client::state_machine::{ExactlyOnceStateMachine};
+use client::state_machine::{RaftStateMachine};
 use common::{Config, RaftError,
              raft_command,
              raft_query,
@@ -23,13 +23,13 @@ use std::sync::{Arc, Mutex};
 use std::sync::mpsc::{channel, Sender, Receiver, RecvTimeoutError};
 use std::mem;
 use std::cmp::min;
+use std::collections::HashMap;
 
 use self::log::{Log, MemoryLog, Entry};
 use self::state_machine::{StateMachineMessage, state_machine_thread, StateMachineHandle};
 use self::peer::{Peer, PeerHandle, PeerThreadMessage, RequestVoteMessage};
 use self::state_file::StateFile;
 use std::io::Error as IoError;
-use std::str::FromStr;
 use rand::distributions::{IndependentSample, Range};
 
 
@@ -79,6 +79,7 @@ pub struct ServerState {
     voted_for: Option<u64>,
     election_timeout: Duration,
     state_file: StateFile,
+    cluster: HashMap<u64, SocketAddr>,
 }
 
 /// 
@@ -239,7 +240,7 @@ impl Drop for ServerHandle {
 /// in a live thread.
 ///
 pub fn start_server<F> (config: Config, load_state_machine: F) -> Result<ServerHandle, IoError>
-    where F: FnOnce() -> Box<ExactlyOnceStateMachine> {
+    where F: FnOnce() -> Box<RaftStateMachine> {
     let (tx, rx) = channel();
     let tx_clone = tx.clone();
     let (server, rpc_server) = try!(Server::new(config, tx, load_state_machine()));
@@ -284,7 +285,6 @@ fn handle_append_entries_reply(m: AppendEntriesReply, server_info: &mut ServerIn
         update_commit_index(server_info, state);
     } else {
         let leader_id = server_info.me.0;
-        let leader_addr = server_info.me.1;
         // If we failed, roll back peer index by 1 (if we can) and retry
         // the append entries call.
         server_info.get_peer_mut(m.peer.0).map(|peer| {
@@ -292,7 +292,7 @@ fn handle_append_entries_reply(m: AppendEntriesReply, server_info: &mut ServerIn
                 // can we make sure match_index never exceeds peer_index?
                 peer.next_index = peer.next_index - 1;
             }
-            peer.append_entries_nonblocking(leader_id, leader_addr,
+            peer.append_entries_nonblocking(leader_id,
                                             state.commit_index,
                                             state.current_term, log);
         });
@@ -318,7 +318,7 @@ fn broadcast_append_entries(info: &mut ServerInfo, state: &mut ServerState, log:
     debug_assert!(matches!(state.current_state, State::Leader{ .. }));
     for peer in &info.peers {
         // Perf: each call copies the needed |entries| from |log| to send along to the peer.
-        peer.append_entries_nonblocking(info.me.0, info.me.1, state.commit_index,
+        peer.append_entries_nonblocking(info.me.0, state.commit_index,
                                         state.current_term, log.clone());
     }
     state.current_state = State::Leader { last_heartbeat: Instant::now() };
@@ -347,7 +347,7 @@ fn handle_request_vote_reply(reply: RequestVoteReply, info: &mut ServerInfo,
 }
 
 impl Server {
-    fn new (config: Config, tx: Sender<MainThreadMessage>, state_machine: Box<ExactlyOnceStateMachine>)
+    fn new (config: Config, tx: Sender<MainThreadMessage>, state_machine: Box<RaftStateMachine>)
         -> Result<(Server, RpcServer), IoError> {
         let me = config.me;
         let mut state_file = StateFile::new_from_filename(&config.state_filename)?;
@@ -364,7 +364,8 @@ impl Server {
             last_leader_contact: (Instant::now(), None),
             election_timeout: generate_election_timeout(),
             state_file: state_file,
-            last_persisted_index: last_persisted_index
+            last_persisted_index: last_persisted_index,
+            cluster: config.cluster.clone(),
         }));
 
         // 1a. Start state machine thread.
@@ -406,7 +407,6 @@ impl Server {
             .collect::<Vec<PeerHandle>>();
 
         // 3. Construct server state object.
-        
         // safe to unwrap here because we should only get this far
         // if the server is bound.
         let bound_address = rpc_server.get_local_addr().unwrap();
@@ -576,14 +576,13 @@ impl Server {
         let request_vote_message = RequestVoteMessage {
             term: state.current_term,
             candidate_id: self.info.me.0,
-            candidate_addr: self.info.me.1,
             last_log_index: last_log_index,
             last_log_term: last_log_term
         };
 
         for peer in &self.info.peers {
             peer.to_peer.send(PeerThreadMessage::RequestVote(request_vote_message))
-                .unwrap(); // panic if the peer thread is down
+                        .unwrap(); // panic if the peer thread is down
         }
         state.election_timeout
     }
@@ -600,11 +599,10 @@ impl RpcObject for RequestVoteHandler {
     fn handle_rpc (&self, params: capnp::any_pointer::Reader, result: capnp::any_pointer::Builder) 
         ->Result<(), RpcError>
     {
-        let (candidate_addr, candidate_id, term, last_log_index, last_log_term) = try!(
+        let (candidate_id, term, last_log_index, last_log_term) = try!(
             params.get_as::<request_vote::Reader>()
             .map_err(RpcError::Capnp)
-            .map(|params| {
-                (params.get_candidate_addr().unwrap(),
+            .map(|params| {(
                  params.get_candidate_id(), params.get_term(),
                  params.get_last_log_index() as usize,
                  params.get_last_log_term())
@@ -613,9 +611,7 @@ impl RpcObject for RequestVoteHandler {
         let current_term;
         {
             let ref mut state = self.state.lock().unwrap(); // panics if mutex is poisoned
-            state.last_leader_contact = (Instant::now(), Some(
-                    SocketAddr::from_str(candidate_addr).unwrap()));
-
+            state.last_leader_contact = (Instant::now(), None);
             // We may transition to a new term, but we want to avoid doing multiple
             // state transitions since we flush the information to disk each time.
             // So we save the new_term in a local variable and transition after we know
@@ -691,7 +687,7 @@ impl AppendEntriesHandler {
         debug_assert!(message.get_term() == state.current_term);
         // Reset election timer for this term.
         state.last_leader_contact = (Instant::now(),
-            Some(SocketAddr::from_str(message.get_leader_addr().unwrap()).unwrap()));
+            state.cluster.get(&message.get_leader_id()).cloned());
         // Check: (prev_log_term, prev_log_index) exists in our log
         let prev_log_index = message.get_prev_log_index() as usize;
         let (last_log_index, prev_log_entry_term) = {
@@ -711,6 +707,7 @@ impl AppendEntriesHandler {
             log.append_entries_blocking(entries);
             min(log.get_last_entry_index(), message.get_leader_commit() as usize)
         };
+        debug_assert!(matches!(state.current_state, State::Follower));
         // March forward the commit index.
         if commit_index > state.commit_index {
             state.commit_index = commit_index;
@@ -853,7 +850,8 @@ mod tests {
             last_leader_contact: (Instant::now(), None),
             election_timeout: generate_election_timeout(),
             state_file: StateFile::new_from_filename(&state_filename).unwrap(),
-            last_persisted_index: 0
+            last_persisted_index: 0,
+            cluster: HashMap::new(),
         }));
         let (tx, rx) = channel();
         let (tx1, rx1) = channel();
@@ -933,7 +931,7 @@ mod tests {
         const NUM_PEERS: u64 = 4;
         let mut mock_server = mock_server(NUM_PEERS);
         {
-            let mut state = mock_server.server.state.lock().unwrap();
+            let state = mock_server.server.state.lock().unwrap();
             mock_server.server.info.peers[0].match_index = 2;
             mock_server.server.info.peers[1].match_index = 1;
             mock_server.server.info.peers[2].match_index = 2;
@@ -945,7 +943,7 @@ mod tests {
 
     #[test]
     fn leader_waits_on_persisted_index() {
-        let mut mock_server = mock_replicate_two_entries();
+        let mock_server = mock_replicate_two_entries();
         let mut state = mock_server.server.state.lock().unwrap();
         update_commit_index(&mock_server.server.info, &mut state);
         assert_eq!(state.commit_index, 0);
@@ -953,7 +951,7 @@ mod tests {
 
     #[test]
     fn server_updates_comit_index() {
-        let mut mock_server = mock_replicate_two_entries();
+        let mock_server = mock_replicate_two_entries();
         let mut state = mock_server.server.state.lock().unwrap();
         assert_eq!(state.commit_index, 0);
 

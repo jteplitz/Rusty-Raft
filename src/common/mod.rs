@@ -2,8 +2,7 @@ pub mod constants;
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::time::Duration;
-use raft_capnp::{session_info, client_request, raft_error};
-use rpc::RpcError;
+use raft_capnp::{session_info};
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum RaftError { 
@@ -16,18 +15,34 @@ pub enum RaftError {
     Unknown,
 }
 
+/// 
+/// High-level abstraction for message types:
+///
+/// `client_command` Request/Reply is the input/output for Raft's client
+/// handler (the message between |client| and the Raft cluster).
+///
+/// `raft_command` and `raft_query` Request/Reply are input/output types for
+/// |RaftStateMachine::command| and |RaftStateMachine::query|, respectively.
+///
+/// The sub-types of the above, Request/Reply::StateMachine, are input/output
+/// types for the client's StateMachine command and query.
+///
+/// Changes to any of these messages should be reflected in the equivalent
+/// protocols in protocol/raft.capnp, and in the appropriate proto serialization
+/// functions.
+///
+
+///
+/// `raft_command` Request/Reply are input/output types for |RaftStateMachine::command|
+///
 pub mod raft_command {
     use super::{SessionInfo};
     use super::super::raft_capnp::raft_command as proto;
 
-    ///
-    /// Changes to ClientRequest should be reflected in the
-    /// equivalent protocols in protocol/raft.capnp
-    ///
     #[derive(Clone, Debug, PartialEq)]
     pub enum Request {
         StateMachineCommand { data: Vec<u8>, session: SessionInfo },
-        OpenSession,
+        OpenSession (u64),
         SetConfig,
         Noop,
     }
@@ -35,11 +50,10 @@ pub mod raft_command {
     #[derive(Clone, Debug, PartialEq)]
     pub enum Reply {
         StateMachineCommand,
-        OpenSession (u64),
+        OpenSession,
         SetConfig,
         Noop,
     }
-
 
     #[cfg(test)]
     pub fn dummy_request() -> Request {
@@ -53,20 +67,26 @@ pub mod raft_command {
 
     #[cfg(test)]
     pub fn dummy_reply() -> Reply {
-        Reply::OpenSession(36)
+        Reply::OpenSession
     }
 
+    /// 
+    /// Generates corresponding Reply for Request.
+    ///
     #[cfg(test)]
     pub fn successful_reply_for(request: Request) -> Reply {
         match request {
             Request::StateMachineCommand{..} => 
                 Reply::StateMachineCommand,
-            Request::OpenSession => 
-                Reply::OpenSession(0),
+            Request::OpenSession(_) => Reply::OpenSession,
             Request::SetConfig => Reply::SetConfig,
             Request::Noop => Reply::Noop
         }
     }
+
+    /// 
+    /// Serialization to and from proto.
+    ///
 
     pub fn request_to_proto(command: Request, builder: &mut proto::Builder){
         match command {
@@ -75,7 +95,7 @@ pub mod raft_command {
                 command.set_data(&data);
                 session.into_proto(&mut command.init_session());
             },
-            Request::OpenSession => builder.set_open_session(()),
+            Request::OpenSession(client_id) =>builder.set_open_session(client_id),
             Request::SetConfig => builder.set_set_config(()),
             Request::Noop => builder.set_noop(()),
         }
@@ -90,7 +110,7 @@ pub mod raft_command {
                    session: SessionInfo::from_proto(command.get_session().unwrap()),
                 }
             },
-            proto::OpenSession(_) => Request::OpenSession,
+            proto::OpenSession(client_id) => Request::OpenSession(client_id),
             proto::SetConfig(_) => Request::SetConfig,
             proto::Noop(_) => Request::Noop,
         }
@@ -99,7 +119,7 @@ pub mod raft_command {
     pub fn reply_to_proto(reply: Reply, builder: &mut proto::reply::Builder) {
         match reply {
             Reply::StateMachineCommand => builder.set_state_machine_command(()),
-            Reply::OpenSession(client_id) => builder.set_open_session(client_id),
+            Reply::OpenSession => builder.set_open_session(()),
             Reply::SetConfig => builder.set_set_config(()),
             Reply::Noop => builder.set_noop(()),
         }
@@ -108,7 +128,7 @@ pub mod raft_command {
     pub fn reply_from_proto(proto: &mut proto::reply::Reader) -> Reply {
         match proto.which().unwrap() {
             proto::reply::StateMachineCommand(_) => Reply::StateMachineCommand,
-            proto::reply::OpenSession(client_id) => Reply::OpenSession(client_id),
+            proto::reply::OpenSession(_) => Reply::OpenSession,
             proto::reply::SetConfig(_) => Reply::SetConfig,
             proto::reply::Noop(_) => Reply::Noop,
         }
@@ -155,8 +175,10 @@ pub mod raft_command {
     }
 }
 
+///
+/// `raft_query` Request/Reply are input/output types for |RaftStateMachine::query|
+///
 pub mod raft_query {
-    use super::SessionInfo;
     use super::super::raft_capnp::raft_query as proto;
 
     #[derive(Clone, Debug, PartialEq)]
@@ -262,6 +284,11 @@ pub mod raft_query {
     }
 }
 
+///
+/// `client_command` Request/Reply are for the RPC between main thread's
+/// |ClientHandler| and the client's |RaftConnection|, which pass ClientRequest
+/// protobufs between each other.
+///
 pub mod client_command {
     use super::{raft_command, raft_query, RaftError};
     use super::super::raft_capnp::{client_request as proto, raft_error};
@@ -446,6 +473,10 @@ pub mod client_command {
     }
 }
 
+/// 
+/// Common Config object to specify initial cluster configuration and other
+/// global variables.
+///
 pub struct Config<'a> {
     // Each server has a unique 64bit integer id that and a socket address
     // These mappings MUST be identical for each server in the cluster
@@ -470,12 +501,18 @@ impl<'a> Config<'a> {
     }
 }
 
+///
+/// Client session info object to pass along with commands.
+///
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct SessionInfo {
     pub client_id: u64,
     pub sequence_number: u64,
 }
 
+///
+/// Creates a default/mock/test session.
+///
 pub fn mock_session() -> SessionInfo {
     SessionInfo {
         client_id:0,

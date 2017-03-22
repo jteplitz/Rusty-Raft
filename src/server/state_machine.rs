@@ -5,7 +5,7 @@ use std::thread;
 use std::thread::JoinHandle;
 
 use super::{MainThreadMessage, ServerState};
-use super::super::client::state_machine::ExactlyOnceStateMachine;
+use super::super::client::state_machine::RaftStateMachine;
 use super::super::common::{RaftError, raft_command, raft_query};
 use super::log::{Log, MemoryLog};
 
@@ -50,7 +50,7 @@ pub struct StateMachineHandle {
 ///
 pub fn state_machine_thread (log: Arc<Mutex<MemoryLog>>,
                              start_index: usize,
-                             mut state_machine: Box<ExactlyOnceStateMachine>,
+                             mut state_machine: Box<RaftStateMachine>,
                              state: Arc<Mutex<ServerState>>,
                              to_main: Sender<MainThreadMessage>,
                             ) -> StateMachineHandle {
@@ -110,7 +110,7 @@ pub fn state_machine_thread (log: Arc<Mutex<MemoryLog>>,
 /// to the |state_machine|. Returns the new committed index.
 pub fn apply_commands(next_index: usize, to_commit: usize,
                       log: Arc<Mutex<MemoryLog>>,
-                      state_machine: &mut Box<ExactlyOnceStateMachine>,
+                      state_machine: &mut Box<RaftStateMachine>,
                       outstanding_messages: &mut Vec<StateMachineMessage>)
         -> usize {
     if to_commit < next_index { return next_index; }

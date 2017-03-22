@@ -1,7 +1,5 @@
-use rand;
-use rand::Rng;
 use std::collections::HashMap;
-use std::time::{Instant, Duration};
+use std::time::{Instant};
 use super::super::common::{RaftError, raft_command, raft_query, SessionInfo};
 
 ///
@@ -34,7 +32,7 @@ pub trait StateMachine:  Send {
 /// A Session for a single client. Caches all responses to client commands
 /// to ensure each command is executed exactly once.
 ///
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct Session {
     // Last time this Session was touched. TODO (sydli) If it's expired, remove it.
     last_update: Instant,
@@ -54,38 +52,40 @@ pub struct Session {
 ///
 /// Usage:
 /// 
-/// ```rust,no_run
+/// ```rust
 /// # use rusty_raft::common::{raft_command, SessionInfo, RaftError};
-/// # use rusty_raft::client::state_machine::{ExactlyOnceStateMachine, StateMachine};
+/// # use rusty_raft::client::state_machine::{RaftStateMachine, StateMachine};
 /// # pub struct EmptyStateMachine {}
 /// # impl StateMachine for EmptyStateMachine {
 /// #     fn command(&mut self, _: &[u8]) -> Result<(), RaftError> {Ok(())}
 /// #     fn query(& self, _: &[u8]) -> Result<Vec<u8>, RaftError> {Ok(vec![])}
 /// # }
-/// # let mut state_machine = ExactlyOnceStateMachine::new(Box::new(EmptyStateMachine{}));
-/// let client_id = state_machine.command(&raft_command::Request::OpenSession);
-/// let session_info = SessionInfo { client_id: 0, sequence_number: 0 };
+/// # let mut state_machine = RaftStateMachine::new(Box::new(EmptyStateMachine{}));
+/// let session_id = 5; // normally you'd randomly generate this
+/// state_machine.command(&raft_command::Request::OpenSession(session_id)).unwrap();
+/// let session_info = SessionInfo { client_id: session_id,
+///                                  sequence_number: 0 };
 /// state_machine.command(
 ///     &raft_command::Request::StateMachineCommand {
 ///         data: vec![],
-///         session: session_info });
+///         session: session_info }).unwrap();
 /// ```
-pub struct ExactlyOnceStateMachine {
+pub struct RaftStateMachine {
     // State machine that we're wrapping.
     client_state_machine: Box<StateMachine>,
     // Maps client_id to a Session.
     sessions: HashMap<u64, Session>
 }
 
-impl ExactlyOnceStateMachine {
+impl RaftStateMachine {
     ///
     /// Creates a new linearizable state machine around |client_state_machine|.
     ///
-    pub fn new(client_state_machine: Box<StateMachine>) -> ExactlyOnceStateMachine {
+    pub fn new(client_state_machine: Box<StateMachine>) -> RaftStateMachine {
         let mut sessions = HashMap::new();
         // NOTE: CLIENT ID OF 0 SHOULD BE USED FOR SESSIONLESS TESTING ONLY
         sessions.insert(0, Session {last_update: Instant::now(), responses: HashMap::new()});
-        ExactlyOnceStateMachine {
+        RaftStateMachine {
             client_state_machine: client_state_machine,
             sessions: sessions,
         }
@@ -95,13 +95,15 @@ impl ExactlyOnceStateMachine {
     /// Helper to generate a new session and update |sessions|.
     ///
     // TODO(sydli): Expire sessions
-    fn new_session(&mut self) -> u64 {
-        let session_id = rand::thread_rng().next_u64();
+    // TODO (sydli): Fix: sessions should be generated
+    //                client-side
+    fn new_session(&mut self, session_id: u64) -> Result<raft_command::Reply, RaftError> {
+        // TODO (sydli) if session already exists, what do?
         self.sessions.insert(session_id, Session {
             last_update: Instant::now(),
             responses: HashMap::new(),
         });
-        session_id
+        Ok(raft_command::Reply::OpenSession)
     }
 
     ///
@@ -140,8 +142,8 @@ impl ExactlyOnceStateMachine {
         match *data {
             raft_command::Request::StateMachineCommand{ref data, session} =>
                 self.command_exactly_once(data, session),
-            raft_command::Request::OpenSession =>
-                Ok(raft_command::Reply::OpenSession(self.new_session())),
+            raft_command::Request::OpenSession(client_id) =>
+                self.new_session(client_id),
             _ => Ok(raft_command::Reply::Noop),
         }
     }
@@ -163,9 +165,11 @@ impl ExactlyOnceStateMachine {
 
 #[cfg(test)]
 mod tests {
-    use super::{StateMachine, ExactlyOnceStateMachine};
+    use super::{StateMachine, RaftStateMachine};
     use super::super::super::common::{RaftError, raft_command, SessionInfo};
     use std::sync::mpsc::{channel, Sender};
+    use rand;
+    use rand::Rng;
 
     ///
     /// Dumb state machine that simply sends a message to |commands|
@@ -189,17 +193,17 @@ mod tests {
     }
 
     /// Helper to send |state_machine| an open session request.
-    fn open_session(state_machine: &mut ExactlyOnceStateMachine) -> u64 {
-        let reply = state_machine.command(&raft_command::Request::OpenSession)
+    fn open_session(state_machine: &mut RaftStateMachine) -> u64 {
+        let session_id = rand::thread_rng().next_u64();
+        let reply = state_machine.command(
+            &raft_command::Request::OpenSession(session_id))
                                  .unwrap();
-        match reply {
-            raft_command::Reply::OpenSession(client_id) => return client_id,
-            _ => panic!(),
-        };
+        assert!(reply == raft_command::Reply::OpenSession);
+        session_id
     }
 
     /// Helper to send |state_machine| an empty command with |session|.
-    fn command_with_session(state_machine: &mut ExactlyOnceStateMachine,
+    fn command_with_session(state_machine: &mut RaftStateMachine,
                             session: SessionInfo)
         -> Result<raft_command::Reply, RaftError> {
         state_machine.command(&raft_command::Request::StateMachineCommand {
@@ -209,14 +213,14 @@ mod tests {
     #[test]
     fn it_creates_a_session_successfully () {
         let client = Box::new(DumbStateMachine { commands: None });
-        let mut state_machine = ExactlyOnceStateMachine::new(client);
+        let mut state_machine = RaftStateMachine::new(client);
         open_session(&mut state_machine);
     }
 
     #[test]
     fn it_returns_session_error_on_incorrect_session () {
         let client = Box::new(DumbStateMachine { commands: None });
-        let mut state_machine = ExactlyOnceStateMachine::new(client);
+        let mut state_machine = RaftStateMachine::new(client);
         let client_id = open_session(&mut state_machine);
         let result = command_with_session(&mut state_machine,
                          SessionInfo {client_id: client_id + 1, sequence_number: 0 });
@@ -228,7 +232,7 @@ mod tests {
     fn it_executes_command_exactly_once () {
         let (tx, rx) = channel();
         let client = Box::new(DumbStateMachine { commands: Some(tx.clone()) });
-        let mut state_machine = ExactlyOnceStateMachine::new(client);
+        let mut state_machine = RaftStateMachine::new(client);
         let client_id = open_session(&mut state_machine);
         assert!(command_with_session(&mut state_machine,
                     SessionInfo {client_id: client_id, sequence_number: 0 }).is_ok());

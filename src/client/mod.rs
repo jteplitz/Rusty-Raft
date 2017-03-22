@@ -3,7 +3,7 @@ use capnp::serialize::OwnedSegments;
 use capnp::message::Reader;
 use raft_capnp::{client_request};
 use rpc::client::Rpc;
-use common::{client_command, raft_query, raft_command, Config, RaftError, SessionInfo};
+use common::{client_command, raft_query, raft_command, RaftError, SessionInfo};
 use common::constants;
 
 use std::collections::HashMap;
@@ -19,19 +19,31 @@ const BACKOFF_TIME_MS:u64 = 50;
 
 ///
 /// # Usage
-/// let raft_db = RaftConnection::new_session(Config::from_file("config"));
-/// raft_db.command( ... );
-/// let result = raft_db.query( ... );
+/// ```rust,no_run
+/// # use rusty_raft::client::RaftConnection;
+/// # use std::collections::HashMap;
+/// let cluster = HashMap::new(); // This map should be actually indicative of
+///                               // your cluster configuration.
+///                               // (it maps server id => server sockets)
+/// let mut raft_db = RaftConnection::new_with_session(&cluster).unwrap();
+/// // Command and data buffers should be serialized/deserialized by client.
+/// // These will be passed on to the state machines running on your cluster.
+/// raft_db.command(&vec![1, 2, 3, 4]);
+/// let result = raft_db.query(&vec![1, 2, 3, 4]);
+/// ```
 ///
 /// These will always succeed because RaftConnection will continue retrying
-/// until the request succeeds (with an increasing backoff timeout). They are
+/// until the request terminates (with an increasing backoff timeout). They are
 /// implicitly guaranteed to terminate due to the properties of the Raft protocol.
+/// Optionally, you can call |command_timeout| or |query_timeout| to guarantee
+/// termination.
 ///
 /// Note: not thread-safe. Wrap object in Mutex if shared across threads.
 ///
 pub struct RaftConnection {
     cluster: HashMap<u64, SocketAddr>,  // Known peers
-    leader_guess: SocketAddr,           // Current guess for leader.
+    pub leader_guess: SocketAddr,           // Current guess for leader. TODO (sydli) unpub this
+    // after testing
     backoff_time: Duration,             // Base backoff time.
     client_id: Option<u64>,             // client id for current session
     sequence_number: u64,               // client id for current session
@@ -39,12 +51,12 @@ pub struct RaftConnection {
 
 impl RaftConnection {
     ///
-    /// Simply constructs a RaftConnection object from cluster in |config|.
+    /// New RaftConnection for testing.
     ///
-    fn new(config: Config, client_id: Option<u64>) -> RaftConnection {
+    fn new(cluster: &HashMap<u64, SocketAddr>, client_id: Option<u64>) -> RaftConnection {
         RaftConnection { 
-            cluster: config.cluster.clone(),
-            leader_guess: config.cluster.iter().next().map(|(_, b)| *b).unwrap(),
+            cluster: cluster.clone(),
+            leader_guess: cluster.iter().next().map(|(_, b)| *b).unwrap(),
             backoff_time: Duration::from_millis(BACKOFF_TIME_MS),
             client_id: client_id,
             sequence_number: 0,
@@ -53,7 +65,7 @@ impl RaftConnection {
 
     fn get_session(&mut self) -> SessionInfo {
         if self.client_id.is_none() {
-            self.open_session().unwrap();
+            self.register_client().unwrap();
         }
         SessionInfo {
             client_id: self.client_id.unwrap(),
@@ -62,14 +74,14 @@ impl RaftConnection {
     }
 
     ///
-    /// Creates a mock (sessionless) RaftConnection from a Config file.
+    /// Creates a mock (sessionless) RaftConnection using the initial cluster configuration.
     ///
     #[cfg(test)]
-    fn new_mock(config: Config) -> RaftConnection {
-        RaftConnection::new(config, Some(0))
+    fn new_mock(cluster: &HashMap<u64, SocketAddr>) -> RaftConnection {
+        RaftConnection::new(cluster, Some(0))
     }
 
-    fn handle_register_client_reply(msg: Reader<OwnedSegments>) -> Result<u64, RaftError> {
+    fn handle_register_client_reply(msg: Reader<OwnedSegments>) -> Result<(), RaftError> {
         Rpc::get_result_reader(&msg)
             .map_err(|x| RaftError::ClientError(format!("{:?}", x)))// jank
             .and_then(|result| {
@@ -78,9 +90,9 @@ impl RaftConnection {
             })
             .and_then(|result| {
                 if let client_command::Reply::Command(reply) = result {
-                  if let raft_command::Reply::OpenSession(client_id) = reply {
-                    return Ok(client_id)
-                }
+                  if raft_command::Reply::OpenSession == reply {
+                    return Ok(())
+                  }
                 }
                 Err(RaftError::Unknown)
             })
@@ -89,34 +101,35 @@ impl RaftConnection {
     ///
     /// Registers this client with the current leader.
     ///
-    fn register_client(&mut self) -> Result<u64, RaftError> {
+    fn register_client(&mut self) -> Result<(), RaftError> {
+
+        let session_id = rand::thread_rng().next_u64();
         self.perform_leader_op(|leader_addr|  {
             let mut rpc = Rpc::new(constants::CLIENT_REQUEST_OPCODE);
             {
                 let mut params = rpc.get_param_builder()
                                     .init_as::<client_request::Builder>();
                 client_command::request_to_proto(
-                    client_command::Request::Command(raft_command::Request::OpenSession),
+                    client_command::Request::Command(
+                        raft_command::Request::OpenSession(session_id)),
                     &mut params);
             }
             rpc.send(leader_addr)
                .map_err(|x| RaftError::ClientError(format!("{:?}", x)))// jank
                .and_then(RaftConnection::handle_register_client_reply)
-        })
-    }
-
-    fn open_session(&mut self) -> Result<(), RaftError> {
-        self.register_client().map(|client_id| {
-            self.client_id = Some(client_id);
+        }).map(|x| {
+            self.client_id = Some(session_id);
+            x
         })
     }
 
     ///
-    /// Opens a new session with the Raft cluster specified by |config|.
+    /// Opens a new session with the Raft cluster specified.
     ///
-    pub fn new_with_session(config: Config) -> Option<RaftConnection> {
-        let mut conn = RaftConnection::new(config, None);
-        conn.open_session().ok().map(|_| conn)
+    pub fn new_with_session(cluster: &HashMap<u64, SocketAddr>)
+        -> Option<RaftConnection> {
+        let mut conn = RaftConnection::new(cluster, None);
+        conn.register_client().ok().map(|_| conn)
     }
 
     ///
@@ -151,7 +164,7 @@ impl RaftConnection {
     }
 
     ///
-    /// Helper to retrieve a random leader from our initial cluster config.
+    /// Helper to retrieve a random leader from our initial cluster
     ///
     fn choose_random_leader(&self) -> SocketAddr {
         let keys: Vec<u64> = self.cluster.keys().cloned().collect();
@@ -233,7 +246,7 @@ mod tests {
     use super::{RaftConnection, BACKOFF_TIME_MS};
     use super::super::rpc::server::{RpcObject, RpcServer};
     use super::super::rpc::RpcError;
-    use super::super::common::{Config, client_command, RaftError };
+    use super::super::common::{client_command, RaftError };
     use super::super::raft_capnp::{client_request as proto};
     use capnp;
     use std::collections::HashMap;
@@ -306,17 +319,6 @@ mod tests {
                                       {}))
     }
 
-    fn get_dummy_config<'a> (cluster: HashMap<u64, SocketAddr>) -> Config<'a> {
-        Config {
-            cluster: cluster,
-            // dummy "me" entry
-            me: (1, SocketAddr::from_str("127.0.0.1:8005").unwrap()),
-            heartbeat_timeout: Duration::from_millis(100),
-            state_filename: String::from(""),
-            log_filename: ""
-        }
-    }
-
     ///
     /// Helper function for testing! Creates servers that "redirect" to each
     /// other in a chain:
@@ -359,7 +361,7 @@ mod tests {
         }
         // Create and operate on RaftConnection ...
         let start_time = Instant::now();
-        let mut db = RaftConnection::new_mock(get_dummy_config(cluster));
+        let mut db = RaftConnection::new_mock(&cluster);
         db_op(&mut db);
         // Make sure the db_op computed within the expected backoff time
         // of the chain.
@@ -387,7 +389,7 @@ mod tests {
     #[test]
     fn open_session_redirects_to_leader() {
         client_request_redirects_to_leader(3, 
-            |db| { assert!((*db).open_session().is_ok()); });
+            |db| { assert!((*db).register_client().is_ok()); });
     }
 
     #[test]
@@ -407,6 +409,6 @@ mod tests {
     #[test]
     fn open_session_sends() {
         client_request_redirects_to_leader(0, 
-            |db| { assert!((*db).open_session().is_ok()); });
+            |db| { assert!((*db).register_client().is_ok()); });
     }
 }

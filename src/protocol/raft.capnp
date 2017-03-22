@@ -9,14 +9,14 @@ struct RaftCommand {
   }
   union {
     stateMachineCommand  @0 :StateMachineCommand;
-    openSession          @1 :Void;
+    openSession          @1 :UInt64;
     setConfig            @2 :Void;
     noop                 @3 :Void;
   }
   struct Reply {
     union {
       stateMachineCommand  @0  :Void;
-      openSession          @1  :UInt64;
+      openSession          @1  :Void;
       setConfig            @2  :Void;
       noop                 @3  :Void;
     }
@@ -60,11 +60,10 @@ struct Entry {
 struct AppendEntries {
   term          @0   :UInt64;
   leaderId      @1   :UInt64;
-  leaderAddr    @2   :Text;
-  prevLogIndex  @3   :UInt64;
-  prevLogTerm   @4   :UInt64;
-  entries       @5   :List(Entry);
-  leaderCommit  @6   :UInt64;
+  prevLogIndex  @2   :UInt64;
+  prevLogTerm   @3   :UInt64;
+  entries       @4   :List(Entry);
+  leaderCommit  @5   :UInt64;
 }
 
 struct AppendEntriesReply {
@@ -75,9 +74,8 @@ struct AppendEntriesReply {
 struct RequestVote {
   term          @0   :UInt64;
   candidateId   @1   :UInt64;
-  candidateAddr @2   :Text;
-  lastLogIndex  @3   :UInt64;
-  lastLogTerm   @4   :UInt64;
+  lastLogIndex  @2   :UInt64;
+  lastLogTerm   @3   :UInt64;
 }
 
 struct SessionInfo {

@@ -34,7 +34,3 @@ mod rpc_capnp {
 mod raft_capnp {
     include!(concat!(env!("OUT_DIR"), "/raft_capnp.rs"));
 }
-
-pub use raft_capnp::client_request;
-// pub use raft_capnp::Op;
-// pub use raft_capnp::client_request_reply;

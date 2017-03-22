@@ -6,22 +6,16 @@ mod mock_state_machine;
 
 use mock_state_machine::*;
 use relay_server::*;
-use rusty_raft::server::*;
-use rusty_raft::common::*;
-use rusty_raft::common::constants::*;
-use rusty_raft::rpc::client::*;
-use rusty_raft::rpc::RpcError;
-use rusty_raft::client_request;
+use rusty_raft::server::{start_server, ServerHandle};
+use rusty_raft::client::RaftConnection;
+use rusty_raft::common::Config;
 
 use rand::{thread_rng, Rng};
 use rand::distributions::{IndependentSample, Range};
-use capnp::message::{Reader};
-use capnp::serialize::OwnedSegments;
 
 use std::collections::HashMap;
 use std::net::{SocketAddr, ToSocketAddrs};
 use std::sync::mpsc::{Receiver, channel};
-use std::thread;
 use std::time::Duration;
 use std::fs;
 
@@ -101,70 +95,19 @@ fn it_starts_up_a_cluster() {
     let state_machines = start_raft_servers(&mut relay_server, &addrs);
 }
 
-/// Returns a new Rpc 
-fn create_client_request(request: client_command::Request) -> Rpc {
-    let mut rpc = Rpc::new(CLIENT_REQUEST_OPCODE); 
-    {
-        let mut param_builder = rpc.get_param_builder().init_as::<client_request::Builder>();
-        client_command::request_to_proto(request, &mut param_builder);
-    }
-    rpc
-}
-
-/// Sends the given data as a write request to all
-/// nodes and returns a vector over the succesfull responses.
-/// You should only have one response from the leader
-/// Optionally skips sending to the skip id
-#[cfg(test)]
-fn send_client_request(addrs: &HashMap<u64, SocketAddr>, data: &[u8], skip_id: Option<u64>) 
-    -> Vec<Reader<OwnedSegments>> 
-{
-    addrs.iter()
-    .filter(|&(i, _)| {
-        skip_id.is_none() || *i != skip_id.unwrap()
-    })
-    .map(|(_, &to_addr)| {
-        let rpc = create_client_request(
-            client_command::Request::Command(
-                raft_command::Request::StateMachineCommand{
-                    data: data.to_vec(),
-                    // TODO (sydli): Actually ask for a real session here
-                    session: mock_session()}));
-        rpc.send(to_addr)
-    })
-    .collect::<Result<Vec<Reader<OwnedSegments>>, RpcError>>()
-    .unwrap()
-    .into_iter()
-    .filter(|msg| {
-        let reply = Rpc::get_result_reader(&msg).unwrap();
-        client_command::reply_from_proto(
-            &mut reply.get_as::<client_request::reply::Reader>().unwrap()).is_ok()
-    })
-    .collect::<Vec<Reader<OwnedSegments>>>()
-}
-
 #[test]
-/// Simple normal case test that starts up a static cluster, sends an entry,
-/// and ensures that entry is recieved by all state machines
 fn it_replicates_an_entry() {
-    const NUM_SERVERS: u64 = 8;
-    const REPLICATE_TIMEOUT: u64 = 100;
+    const NUM_SERVERS: u64 = 3;
+    const REPLICATE_TIMEOUT: u64 = 5000;
     const DATA_LENGTH: usize = 1;
     let replicate_timeout = Duration::from_millis(REPLICATE_TIMEOUT);
 
     let (mut relay_server, addrs) = start_relay_server(NUM_SERVERS);
     let state_machines = start_raft_servers(&mut relay_server, &addrs);
 
-    // TODO: We need a better way of sleeping until a leader is elected
-    // Currently we just allow for 3 rounds of split votes...
-    thread::sleep_ms(1000);
-
-    // generate the client append RPC and send it to each server
-    // only one should respond that they're the leader
     let data: String = thread_rng().gen_ascii_chars().take(DATA_LENGTH).collect();
-    let leader_replies = send_client_request(&addrs, data.as_bytes(), None);
-    // only 1 server should reply as leader
-    assert_eq!(leader_replies.len(), 1);
+    let mut raft_db = RaftConnection::new_with_session(&addrs.clone()).unwrap();
+    assert!(raft_db.command(data.as_bytes()).is_ok());
 
     // ensure that all state machines replicated the entry 
     assert!(state_machines
@@ -190,25 +133,21 @@ fn it_handles_a_failure() {
     addrs.remove(&index);
     state_machines.remove(index as usize);
     //relay_server.set_address_active(addrs[offline_id], false);
-    println!("Brought {} offline", index);
-
-    // TODO: We need a better way of sleeping until a leader is elected
-    // Currently we just allow for 3 rounds of split votes...
-    thread::sleep_ms(1000);
 
     // generate the client append RPC and send it to each server
     // only one should respond that they're the leader
     let data: String = thread_rng().gen_ascii_chars().take(DATA_LENGTH).collect();
-    // TODO: Skip offline server
-    let leader_replies = send_client_request(&addrs, data.as_bytes(), Some(index));
-    // only 1 server should reply as leader
-    assert_eq!(leader_replies.len(), 1);
+    let mut raft_db = RaftConnection::new_with_session(&addrs.clone()).unwrap();
+    assert!(raft_db.command(data.as_bytes()).is_ok());
 
     // ensure that all online state machines replicated the entry 
     assert!(state_machines
                 .iter()
                 .filter(|handle| handle.id != index)
-                .map(|handle|handle.rx.recv_timeout(replicate_timeout).unwrap())
+                .map(|handle| {
+                    let result = handle.rx.recv_timeout(replicate_timeout).unwrap();
+                    result
+                })
                 .all(|vec| vec.iter()
                               .zip(data.clone().into_bytes())
                               .all(|(a, b)| *a == b)));
