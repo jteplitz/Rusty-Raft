@@ -24,6 +24,7 @@ use std::thread::JoinHandle;
 use std::sync::{Arc, Mutex, Condvar};
 use std::sync::mpsc::{channel, Sender, Receiver, RecvTimeoutError};
 use std::mem;
+use std::cmp::min;
 
 use self::log::{Log, MemoryLog, Entry};
 use self::state_machine::{StateMachineMessage, state_machine_thread, StateMachineHandle};
@@ -653,7 +654,7 @@ impl AppendEntriesHandler {
             let mut log = self.log.lock().unwrap();
             log.roll_back(prev_log_index);
             log.append_entries(entries);
-            log.get_last_entry_index()
+            min(log.get_last_entry_index(), message.get_leader_commit() as usize)
         };
         // March forward the commit index.
         if commit_index > state.commit_index {
