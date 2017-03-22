@@ -249,7 +249,7 @@ mod tests {
     ///
     struct RedirectClientRequestHandler {redirect_port: u16}
     impl RpcObject for RedirectClientRequestHandler {
-        fn handle_rpc (&self, params: capnp::any_pointer::Reader, result: capnp::any_pointer::Builder) 
+        fn handle_rpc (&self, _: capnp::any_pointer::Reader, result: capnp::any_pointer::Builder) 
             -> Result<(), RpcError>
             {
                 let mut result_builder = result.init_as::<proto::reply::Builder>();

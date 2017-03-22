@@ -5,7 +5,7 @@ use std::time::Duration;
 use raft_capnp::{session_info, client_request, raft_error};
 use rpc::RpcError;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum RaftError { 
     ClientError(String),      // Error defined by client.
     NotLeader(Option<SocketAddr>),   // I'm not the leader; give leader id
@@ -17,7 +17,7 @@ pub enum RaftError {
 }
 
 pub mod raft_command {
-    use super::SessionInfo;
+    use super::{SessionInfo};
     use super::super::raft_capnp::raft_command as proto;
 
     ///
@@ -32,12 +32,40 @@ pub mod raft_command {
         Noop,
     }
 
-    #[derive(Clone, Debug)]
+    #[derive(Clone, Debug, PartialEq)]
     pub enum Reply {
         StateMachineCommand,
         OpenSession (u64),
         SetConfig,
         Noop,
+    }
+
+
+    #[cfg(test)]
+    pub fn dummy_request() -> Request {
+        let data = vec![10, 35, 6];
+        let session = SessionInfo {
+            client_id: 0,
+            sequence_number: 0,
+        };
+        Request::StateMachineCommand {data: data, session: session}
+    }
+
+    #[cfg(test)]
+    pub fn dummy_reply() -> Reply {
+        Reply::OpenSession(36)
+    }
+
+    #[cfg(test)]
+    pub fn successful_reply_for(request: Request) -> Reply {
+        match request {
+            Request::StateMachineCommand{..} => 
+                Reply::StateMachineCommand,
+            Request::OpenSession => 
+                Reply::OpenSession(0),
+            Request::SetConfig => Reply::SetConfig,
+            Request::Noop => Reply::Noop
+        }
     }
 
     pub fn request_to_proto(command: Request, builder: &mut proto::Builder){
@@ -68,9 +96,7 @@ pub mod raft_command {
         }
     }
 
-
-    pub fn reply_to_proto(reply: Reply,
-                                   builder: &mut proto::reply::Builder) {
+    pub fn reply_to_proto(reply: Reply, builder: &mut proto::reply::Builder) {
         match reply {
             Reply::StateMachineCommand => builder.set_state_machine_command(()),
             Reply::OpenSession(client_id) => builder.set_open_session(client_id),
@@ -87,21 +113,70 @@ pub mod raft_command {
             proto::reply::Noop(_) => Reply::Noop,
         }
     }
+
+    #[cfg(test)]
+    mod tests {
+        use super::{Request, Reply,
+                    request_to_proto, request_from_proto,
+                    reply_to_proto, reply_from_proto,
+                    dummy_request, dummy_reply};
+        use super::super::{mock_session};
+        use super::super::super::raft_capnp::{raft_command as proto};
+        use super::super::super::rpc::client::Rpc;
+
+        #[test]
+        fn request_to_and_from_proto() {
+            let mut rpc = Rpc::new(1);
+            let session = mock_session();
+            let request = dummy_request();
+            {
+                let mut builder = rpc.get_param_builder()
+                                     .init_as::<proto::Builder>();
+                request_to_proto(request.clone(), &mut builder);
+            }
+            let mut reader = rpc.get_param_builder().as_reader()
+                            .get_as::<proto::Reader>().unwrap();
+            assert_eq!(request, request_from_proto(reader));
+        }
+
+        #[test]
+        fn reply_to_and_from_proto() {
+            let mut rpc = Rpc::new(1);
+            let reply = dummy_reply();
+            {
+                let mut builder = rpc.get_param_builder()
+                                     .init_as::<proto::reply::Builder>();
+                reply_to_proto(reply.clone(), &mut builder);
+            }
+            let mut reader = rpc.get_param_builder().as_reader()
+                            .get_as::<proto::reply::Reader>().unwrap();
+            assert_eq!(reply, reply_from_proto(&mut reader));
+        }
+    }
 }
+
 pub mod raft_query {
     use super::SessionInfo;
     use super::super::raft_capnp::raft_query as proto;
 
-    #[derive(Clone, Debug)]
+    #[derive(Clone, Debug, PartialEq)]
     pub enum Request {
         StateMachineQuery ( Vec<u8> ),
         GetConfig,
     }
 
-    #[derive(Clone, Debug)]
+    #[derive(Clone, Debug, PartialEq)]
     pub enum Reply {
         StateMachineQuery ( Vec<u8> ),
         GetConfig ( Vec<u8> ),
+    }
+
+    #[cfg(test)]
+    pub fn successful_reply_for(request: Request) -> Reply {
+        match request {
+            Request::StateMachineQuery(_) => Reply::StateMachineQuery(vec![]),
+            Request::GetConfig => Reply::GetConfig(vec![]),
+        }
     }
 
     pub fn request_from_proto(proto: proto::Reader) -> Request {
@@ -137,6 +212,54 @@ pub mod raft_query {
                 Reply::GetConfig(data.unwrap().to_vec()),
         }
     }
+
+    #[cfg(test)]
+    mod tests {
+        use super::{Request, Reply,
+                    request_to_proto, request_from_proto,
+                    reply_to_proto, reply_from_proto};
+        use super::super::super::raft_capnp::{raft_query as proto};
+        use super::super::super::rpc::client::Rpc;
+
+        pub fn dummy_request() -> Request {
+            let data = vec![10, 35, 6];
+            Request::StateMachineQuery (data.to_vec())
+        }
+
+        pub fn dummy_reply() -> Reply {
+            let data = vec![10, 35, 6];
+            Reply::StateMachineQuery (data.to_vec())
+        }
+
+        #[test]
+        fn request_to_and_from_proto() {
+            let mut rpc = Rpc::new(1);
+            let request = dummy_request();
+            {
+                let mut builder = rpc.get_param_builder()
+                                     .init_as::<proto::Builder>();
+                request_to_proto(request.clone(), &mut builder);
+            }
+            let mut reader = rpc.get_param_builder().as_reader()
+                            .get_as::<proto::Reader>().unwrap();
+            assert_eq!(request, request_from_proto(reader));
+        }
+
+        #[test]
+        fn reply_to_and_from_proto() {
+            let mut rpc = Rpc::new(1);
+            let data = vec![5, 2, 7];
+            let reply = dummy_reply();
+            {
+                let mut builder = rpc.get_param_builder()
+                                     .init_as::<proto::reply::Builder>();
+                reply_to_proto(reply.clone(), &mut builder);
+            }
+            let mut reader = rpc.get_param_builder().as_reader()
+                            .get_as::<proto::reply::Reader>().unwrap();
+            assert_eq!(reply, reply_from_proto(&mut reader));
+        }
+    }
 }
 
 pub mod client_command {
@@ -145,14 +268,14 @@ pub mod client_command {
     use std::net::SocketAddr;
     use std::str::FromStr;
 
-    #[derive(Clone, Debug)]
+    #[derive(Clone, Debug, PartialEq)]
     pub enum Request {
         Command(raft_command::Request),
         Query(raft_query::Request),
         Unknown,
     }
 
-    #[derive(Clone, Debug)]
+    #[derive(Clone, Debug, PartialEq)]
     pub enum Reply {
         Command(raft_command::Reply),
         Query(raft_query::Reply),
@@ -173,7 +296,7 @@ pub mod client_command {
     }
 
     pub fn reply_to_proto(op: Result<Reply, RaftError>,
-                                         builder: &mut proto::reply::Builder) {
+                              builder: &mut proto::reply::Builder) {
         match op {
             Ok(reply) => {
                 match reply {
@@ -194,27 +317,10 @@ pub mod client_command {
     #[cfg(test)]
     pub fn successful_reply_for(op: Request) -> Reply {
         match op {
-            Request::Command(data) => {
-                Reply::Command(
-                    match data {
-                        raft_command::Request::StateMachineCommand{..} => 
-                            raft_command::Reply::StateMachineCommand,
-                        raft_command::Request::OpenSession => 
-                            raft_command::Reply::OpenSession(0),
-                        raft_command::Request::SetConfig => raft_command::Reply::SetConfig,
-                        raft_command::Request::Noop => raft_command::Reply::Noop
-                    }
-                )
-            },
-            Request::Query(data) => {
-                Reply::Query(
-                    match data {
-                        raft_query::Request::StateMachineQuery(_) =>
-                            raft_query::Reply::StateMachineQuery(vec![]),
-                        raft_query::Request::GetConfig => raft_query::Reply::GetConfig(vec![]),
-                    }
-                )
-            },
+            Request::Command(data) =>
+                Reply::Command(raft_command::successful_reply_for(data)),
+            Request::Query(data) =>
+                Reply::Query(raft_query::successful_reply_for(data)),
             _ => Reply::Command(raft_command::Reply::Noop),
         }
     }
@@ -271,6 +377,73 @@ pub mod client_command {
             raft_error::Unknown(_) => RaftError::Unknown,
         }
     }
+
+    #[cfg(test)]
+    mod tests {
+        use super::{Request, Reply,
+                    request_to_proto, request_from_proto,
+                    reply_to_proto, reply_from_proto};
+        use super::super::{RaftError, raft_command, raft_query};
+        use super::super::super::raft_capnp::{client_request as proto};
+        use super::super::super::rpc::client::Rpc;
+        use std::string::String;
+
+        fn dummy_request() -> Request {
+            Request::Command(raft_command::dummy_request())
+        }
+
+        fn dummy_reply() -> Result<Reply, RaftError> {
+            Ok(Reply::Command(raft_command::dummy_reply()))
+        }
+
+        fn dummy_error_reply() -> Result<Reply, RaftError> {
+            let s = String::from("This is a dumbo error");
+            Err(RaftError::ClientError(s))
+        }
+
+        #[test]
+        fn request_to_and_from_proto() {
+            let mut rpc = Rpc::new(1);
+            let request = dummy_request();
+            {
+                let mut builder = rpc.get_param_builder()
+                                     .init_as::<proto::Builder>();
+                request_to_proto(request.clone(), &mut builder);
+            }
+            let mut reader = rpc.get_param_builder().as_reader()
+                            .get_as::<proto::Reader>().unwrap();
+            assert_eq!(request, request_from_proto(reader));
+        }
+
+        #[test]
+        fn reply_to_and_from_proto() {
+            let mut rpc = Rpc::new(1);
+            let reply = dummy_reply();
+            {
+                let mut builder = rpc.get_param_builder()
+                                     .init_as::<proto::reply::Builder>();
+                reply_to_proto(reply.clone(), &mut builder);
+            }
+            let mut reader = rpc.get_param_builder().as_reader()
+                            .get_as::<proto::reply::Reader>().unwrap();
+            assert_eq!(reply.unwrap(), reply_from_proto(&mut reader).unwrap());
+        }
+
+        #[test]
+        fn error_reply_to_and_from_proto() {
+            let mut rpc = Rpc::new(1);
+            let reply = dummy_error_reply();
+            {
+                let mut builder = rpc.get_param_builder()
+                                     .init_as::<proto::reply::Builder>();
+                reply_to_proto(reply.clone(), &mut builder);
+            }
+            let mut reader = rpc.get_param_builder().as_reader()
+                            .get_as::<proto::reply::Reader>().unwrap();
+            assert_eq!(reply.unwrap_err(), reply_from_proto(&mut reader).unwrap_err());
+        }
+
+    }
 }
 
 pub struct Config {
@@ -308,7 +481,6 @@ pub fn mock_session() -> SessionInfo {
 }
 
 impl SessionInfo {
-
     pub fn from_proto(proto: session_info::Reader) -> SessionInfo {
         SessionInfo {
             client_id: proto.get_client_id(),
