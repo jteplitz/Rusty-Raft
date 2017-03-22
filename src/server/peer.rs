@@ -289,8 +289,6 @@ mod tests {
     use capnp::{message, serialize_packed};
     use capnp::serialize::OwnedSegments;
     use std::io::BufReader;
-    use std::net::SocketAddr;
-    use std::str::FromStr;
     use std::sync::mpsc::{channel};
     use std::sync::{Arc, Mutex};
     use super::*;

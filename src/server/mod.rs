@@ -668,6 +668,9 @@ struct AppendEntriesHandler {
 }
 
 impl AppendEntriesHandler {
+    ///# Panics 
+    /// * Panics if there are any errors with Disk IO
+    /// * Panics if the maint hread or the state machine thread have panicked
     fn handle_message(&self, message: append_entries::Reader, reply: &mut append_entries_reply::Builder) {
         let ref mut state = self.state.lock().unwrap();
         let current_term = state.current_term;
@@ -703,8 +706,8 @@ impl AppendEntriesHandler {
             .map(Entry::from_proto).collect();
         let commit_index = { // Append entries to log.
             let mut log = self.log.lock().unwrap();
-            log.roll_back(prev_log_index);
-            log.append_entries_blocking(entries);
+            log.roll_back(prev_log_index).unwrap();
+            log.append_entries_blocking(entries).unwrap();
             min(log.get_last_entry_index(), message.get_leader_commit() as usize)
         };
         debug_assert!(matches!(state.current_state, State::Follower));
@@ -825,7 +828,7 @@ mod tests {
         state_machine_rx: Receiver<StateMachineMessage>,
         server: Server,
         state_filename: String,
-        log_file: MockLogFileHandle
+        _log_file: MockLogFileHandle
     }
     
     impl Drop for MockServer {
@@ -871,7 +874,7 @@ mod tests {
         };
         MockServer {peer_rx: rx, state_machine_rx: rx1, server: server,
                     state_filename: state_filename,
-                    log_file: log_file_handle}
+                    _log_file: log_file_handle}
     }
 
     /// Makes sure peer threads receive appendEntries msesages
@@ -930,13 +933,10 @@ mod tests {
     fn mock_replicate_two_entries() -> MockServer {
         const NUM_PEERS: u64 = 4;
         let mut mock_server = mock_server(NUM_PEERS);
-        {
-            let state = mock_server.server.state.lock().unwrap();
-            mock_server.server.info.peers[0].match_index = 2;
-            mock_server.server.info.peers[1].match_index = 1;
-            mock_server.server.info.peers[2].match_index = 2;
-            mock_server.server.info.peers[3].match_index = 3;
-        }
+        mock_server.server.info.peers[0].match_index = 2;
+        mock_server.server.info.peers[1].match_index = 1;
+        mock_server.server.info.peers[2].match_index = 2;
+        mock_server.server.info.peers[3].match_index = 3;
 
         mock_server
     }
@@ -1147,7 +1147,7 @@ mod tests {
             assert_eq!(state.voted_for, None);
             assert!(matches!(state.current_state, State::Follower));
 
-            state.transition_to_candidate(OUR_ID);
+            state.transition_to_candidate(OUR_ID).unwrap();
             match state.current_state {
                 State::Candidate{num_votes, ..} => {
                     assert_eq!(state.current_term, 1);
@@ -1166,7 +1166,7 @@ mod tests {
             let s = &mut mock_server.server;
             let ref mut state = s.state.lock().unwrap();
             // we must be a candidate before we can become a leader
-            state.transition_to_candidate(OUR_ID);
+            state.transition_to_candidate(OUR_ID).unwrap();
             state.transition_to_leader(&mut s.info, s.log.clone());
             assert!(matches!(state.current_state, State::Leader{..}));
 
@@ -1199,7 +1199,7 @@ mod tests {
             let s = &mut mock_server.server;
             let ref mut state = s.state.lock().unwrap();
 
-            state.transition_to_candidate(OUR_ID);
+            state.transition_to_candidate(OUR_ID).unwrap();
             assert_eq!(state.current_term, 1);
             assert_eq!(state.voted_for, Some(OUR_ID));
             state.transition_to_follower(1, &s.info.state_machine.tx, Some(OUR_ID), s.log.clone()).unwrap();
@@ -1216,7 +1216,7 @@ mod tests {
             let mut mock_server = mock_server(NUM_PEERS);
             let s = &mut mock_server.server;
             let ref mut state = s.state.lock().unwrap();
-            state.transition_to_candidate(OUR_ID);
+            state.transition_to_candidate(OUR_ID).unwrap();
             assert_eq!(state.current_term, 1);
             assert_eq!(state.voted_for, Some(OUR_ID));
             state.transition_to_follower(NEW_TERM, &s.info.state_machine.tx, None, s.log.clone()).unwrap();
@@ -1227,7 +1227,6 @@ mod tests {
 
         #[test]
         fn transition_to_follower_persists_state() {
-            const OUR_ID: u64 = 1;
             const NUM_PEERS: u64 = 4;
             let mut mock_server = mock_server(NUM_PEERS);
             let s = &mut mock_server.server;
@@ -1242,7 +1241,6 @@ mod tests {
 
         #[test]
         fn transition_to_follower_persists_vote() {
-            const OUR_ID: u64 = 1;
             const NUM_PEERS: u64 = 4;
             const VOTE_ID: u64 = 3;
             let mut mock_server = mock_server(NUM_PEERS);
@@ -1264,7 +1262,7 @@ mod tests {
             let s = &mut mock_server.server;
 
             let mut state = s.state.lock().unwrap();
-            state.transition_to_candidate(1);
+            state.transition_to_candidate(1).unwrap();
 
             let mut state_file = StateFile::new_from_filename(&mock_server.state_filename).unwrap();
             let state = state_file.get_state().unwrap();

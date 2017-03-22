@@ -19,14 +19,11 @@ use std::sync::mpsc::{Receiver, channel};
 use std::time::Duration;
 use std::fs;
 
-// TODO: Ensure directory exists?
-const TEST_STATE_DIR: &'static str = "build/state";
-
 // Container around a MockStateMachine Receiver and a handle
 // to the raft server that is running that instance of the state machine
 struct StateMachineHandle {
     rx: Receiver<Vec<u8>>,
-    server_handle: ServerHandle,
+    _server_handle: ServerHandle,
     id: u64,
     state_filename: String,
     log_filename: String
@@ -65,7 +62,7 @@ fn start_raft_servers(relay_server: &mut RelayServer, addrs: &HashMap<u64, Socke
     (0..addrs.len() as u64)
     .map(|i| {
         // create a config object
-        let mut random_filename: String = thread_rng().gen_ascii_chars().take(STATE_FILENAME_LEN).collect();
+        let random_filename: String = thread_rng().gen_ascii_chars().take(STATE_FILENAME_LEN).collect();
         let state_filename = String::from("/tmp/state_") + &random_filename;
         let log_filename = String::from("/tmp/log_") + &random_filename;
 
@@ -79,7 +76,7 @@ fn start_raft_servers(relay_server: &mut RelayServer, addrs: &HashMap<u64, Socke
 
         // map this server through the relay server
         relay_server.relay_address(*addrs.get(&i).unwrap(), server_handle.get_local_addr());
-        StateMachineHandle {rx: rx, server_handle: server_handle, id: i,
+        StateMachineHandle {rx: rx, _server_handle: server_handle, id: i,
                             state_filename: state_filename, log_filename: log_filename}
     })
     .collect()
@@ -92,7 +89,7 @@ fn it_starts_up_a_cluster() {
     const NUM_SERVERS: u64 = 3;
 
     let (mut relay_server, addrs) = start_relay_server(NUM_SERVERS);
-    let state_machines = start_raft_servers(&mut relay_server, &addrs);
+    start_raft_servers(&mut relay_server, &addrs);
 }
 
 #[test]

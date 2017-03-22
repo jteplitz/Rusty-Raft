@@ -1,11 +1,11 @@
 use std::fmt;
-use std::io::{Read, Write, Result, BufReader, BufWriter, Seek, SeekFrom, Error, ErrorKind};
+use std::io::{Result, BufReader, BufWriter, Seek, SeekFrom, Error, ErrorKind};
 use std::fs::{File, OpenOptions};
 use raft_capnp::{entry};
 use capnp::serialize_packed;
 use capnp::message;
 use capnp::message::ReaderOptions;
-use super::super::common::{SessionInfo, raft_command};
+use super::super::common::{raft_command};
 use super::MainThreadMessage;
 use std::thread;
 use std::thread::JoinHandle;
@@ -215,7 +215,7 @@ impl Log {
         // write the entries to disk
         let mut writer = BufWriter::new(&self.file);
         for entry in indexed_entries {
-            let mut metadata = self.file.metadata()?;
+            let metadata = self.file.metadata()?;
             let cursor = metadata.len();
             let mut builder = message::Builder::new_default();
             entry.into_proto(&mut builder.init_root::<entry::Builder>());
@@ -335,7 +335,7 @@ impl Log {
         self.background_thread_tx.send(BackgroundThreadMessage::Flush).unwrap();
         let message = self.background_thread_rx.recv().unwrap();
         match message {
-            Flushed => {
+            BackgroundThreadReply::Flushed => {
                 self.flushed = true;
             }
         }
@@ -376,7 +376,7 @@ impl Log {
     /// Panics if the offsets vec lock is posioned
     fn background_append_entry(file: &mut File, e: Entry, entry_offsets: &Arc<Mutex<Vec<u64>>>) -> Result<()> {
         const MAX_RETRIES: u32 = 5; // maximum times to try writing an entry before giving up
-        let RETRY_WAIT_TIME = Duration::from_millis(50);
+        let retry_wait_time = Duration::from_millis(50);
 
         for i in 0..MAX_RETRIES {
             match Log::write_entry_to_disk(file, &e, &entry_offsets) {
@@ -386,7 +386,7 @@ impl Log {
                 Err(e) => {
                     if i != MAX_RETRIES - 1 {
                         warn!("Unable to write to log file. Will retry.");
-                        thread::sleep(RETRY_WAIT_TIME * (i + 1));
+                        thread::sleep(retry_wait_time * (i + 1));
                     } else {
                         return Err(e)
                     }
@@ -403,7 +403,7 @@ impl Log {
     /// Panics if the offsets vec lock is poisioned
     ///
     fn write_entry_to_disk(file: &mut File, e: &Entry, entry_offsets: &Arc<Mutex<Vec<u64>>>) -> Result<()> {
-        let mut metadata = file.metadata()?;
+        let metadata = file.metadata()?;
         let mut writer = BufWriter::new(file);
         let cursor = metadata.len();
 
@@ -478,11 +478,9 @@ impl Drop for Log {
 #[cfg(test)]
 pub mod mocks {
     use super::*;
-    use std::ops::{Deref, DerefMut};
     use std::fs;
     use rand::{thread_rng, Rng};
-    use rand::distributions::{IndependentSample, Range};
-    use std::sync::mpsc::{Receiver, Sender};
+    use std::sync::mpsc::{Receiver};
     use super::super::MainThreadMessage;
 
 
@@ -539,7 +537,7 @@ mod tests {
     #[test]
     /// Makes sure we return None if the index is out of the log
     fn get_entry_out_of_index() {
-        let (mut l, _file_handle) = new_mock_log();
+        let (l, _file_handle) = new_mock_log();
         { // _file_handle must outlive log
             let mut log = l;
             log.append_entry(random_entry());
@@ -549,7 +547,7 @@ mod tests {
 
     #[test]
     fn index_0_is_none() {
-        let (mut l, _file_handle) = new_mock_log();
+        let (l, _file_handle) = new_mock_log();
         { // _file_handle must outlive log
             let mut log = l;
             assert!(log.get_entry(0).is_none());
@@ -561,7 +559,7 @@ mod tests {
     #[test]
     /// Tests that simple append and get works for a two-element array.
     fn append_get_simple() {
-        let (mut l, _file_handle) = new_mock_log();
+        let (l, _file_handle) = new_mock_log();
         { // _file_handle must outlive log
             let mut log = l;
             let entry1 = random_entry();
@@ -636,7 +634,7 @@ mod tests {
         let length = 10;
         let (mut log, _file_handle) = create_filled_log(length);
         let new_length = 5;
-        log.roll_back(new_length);
+        log.roll_back(new_length).unwrap();
         // make sure log has been rolled back!
         assert_eq!(log.get_last_entry_index(), new_length);
     }
@@ -644,12 +642,12 @@ mod tests {
     #[test]
     fn roll_back_works_with_nothing_to_roll_back() {
         let (mut log, _file_handle) = new_mock_log();
-        log.roll_back(1);
+        log.roll_back(1).unwrap();
     }
 
     #[test]
     fn is_other_log_valid_rejects_previous_terms() {
-        let (mut l, _file_handle) = new_mock_log();
+        let (l, _file_handle) = new_mock_log();
         { // _file_handle must outlive log
             let mut log = l;
             log.append_entry(random_entry_with_term(1));
@@ -660,7 +658,7 @@ mod tests {
 
     #[test]
     fn is_other_log_valid_rejects_lower_indices() {
-        let (mut l, _file_handle) = new_mock_log();
+        let (l, _file_handle) = new_mock_log();
         { // _file_handle must outlive log
             let mut log = l;
             log.append_entry(random_entry_with_term(1));
@@ -672,7 +670,7 @@ mod tests {
 
     #[test]
     fn is_other_log_valid_accepts_same_index() {
-        let (mut l, _file_handle) = new_mock_log();
+        let (l, _file_handle) = new_mock_log();
         { // _file_handle must outlive log
             let mut log = l;
             log.append_entry(random_entry_with_term(1));
@@ -682,7 +680,7 @@ mod tests {
 
     #[test]
     fn is_other_log_valid_accepts_with_empty_log() {
-        let (mut log, _file_handle) = new_mock_log();
+        let (log, _file_handle) = new_mock_log();
         assert!(log.is_other_log_valid(0, 0));
     }
 
@@ -707,7 +705,7 @@ mod tests {
         log.append_entry(entry.clone());
         log.flush_background_thread();
 
-        let (tx, rx) = channel();
+        let (tx, _rx) = channel();
         let log_from_disk = Log::new_from_filename(&file_handle.name, tx).unwrap();
         assert_eq!(log_from_disk.get_last_entry_index(), 1);
         assert_eq!(*log_from_disk.get_entry(1).unwrap(), entry);
@@ -721,7 +719,7 @@ mod tests {
         let msg = file_handle.main_thread_rx.recv().unwrap();
         assert!(matches!(msg, MainThreadMessage::EntryPersisted(1)));
 
-        let (tx, rx) = channel();
+        let (tx, _rx) = channel();
         let log_from_disk = Log::new_from_filename(&file_handle.name, tx).unwrap();
         assert_eq!(log_from_disk.get_last_entry_index(), 1);
         assert_eq!(*log_from_disk.get_entry(1).unwrap(), entry);
@@ -733,7 +731,7 @@ mod tests {
         let entries = random_entries_with_term(8, 2);
         log.append_entries_blocking(entries.clone()).unwrap();
 
-        let (tx, rx) = channel();
+        let (tx, _rx) = channel();
         let log_from_disk = Log::new_from_filename(&file_handle.name, tx).unwrap();
         assert_eq!(log_from_disk.get_last_entry_index(), 8);
         assert_eq!(log_from_disk.get_entries_from(0).len(), entries.len());

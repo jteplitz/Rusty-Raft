@@ -88,8 +88,7 @@ pub fn state_machine_thread (log: Arc<Mutex<Log>>,
                     // if leadership changes (we're not leader anymore) in which case
                     // we should forward them the new leader.
                     while let Some(cmd) = outstanding_commands.pop() {
-                        if let StateMachineMessage::Command
-                            { command, response_channel} = cmd {
+                        if let StateMachineMessage::Command {response_channel, ..} = cmd {
                             response_channel.send(
                                 Err(RaftError::NotLeader(
                                 { state.lock().unwrap().last_leader_contact.1 })))

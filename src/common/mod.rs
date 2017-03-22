@@ -136,25 +136,22 @@ pub mod raft_command {
 
     #[cfg(test)]
     mod tests {
-        use super::{Request, Reply,
-                    request_to_proto, request_from_proto,
+        use super::{request_to_proto, request_from_proto,
                     reply_to_proto, reply_from_proto,
                     dummy_request, dummy_reply};
-        use super::super::{mock_session};
         use super::super::super::raft_capnp::{raft_command as proto};
         use super::super::super::rpc::client::Rpc;
 
         #[test]
         fn request_to_and_from_proto() {
             let mut rpc = Rpc::new(1);
-            let session = mock_session();
             let request = dummy_request();
             {
                 let mut builder = rpc.get_param_builder()
                                      .init_as::<proto::Builder>();
                 request_to_proto(request.clone(), &mut builder);
             }
-            let mut reader = rpc.get_param_builder().as_reader()
+            let reader = rpc.get_param_builder().as_reader()
                             .get_as::<proto::Reader>().unwrap();
             assert_eq!(request, request_from_proto(reader));
         }
@@ -262,7 +259,7 @@ pub mod raft_query {
                                      .init_as::<proto::Builder>();
                 request_to_proto(request.clone(), &mut builder);
             }
-            let mut reader = rpc.get_param_builder().as_reader()
+            let reader = rpc.get_param_builder().as_reader()
                             .get_as::<proto::Reader>().unwrap();
             assert_eq!(request, request_from_proto(reader));
         }
@@ -270,7 +267,6 @@ pub mod raft_query {
         #[test]
         fn reply_to_and_from_proto() {
             let mut rpc = Rpc::new(1);
-            let data = vec![5, 2, 7];
             let reply = dummy_reply();
             {
                 let mut builder = rpc.get_param_builder()
@@ -410,7 +406,7 @@ pub mod client_command {
         use super::{Request, Reply,
                     request_to_proto, request_from_proto,
                     reply_to_proto, reply_from_proto};
-        use super::super::{RaftError, raft_command, raft_query};
+        use super::super::{RaftError, raft_command};
         use super::super::super::raft_capnp::{client_request as proto};
         use super::super::super::rpc::client::Rpc;
         use std::string::String;
@@ -437,7 +433,7 @@ pub mod client_command {
                                      .init_as::<proto::Builder>();
                 request_to_proto(request.clone(), &mut builder);
             }
-            let mut reader = rpc.get_param_builder().as_reader()
+            let reader = rpc.get_param_builder().as_reader()
                             .get_as::<proto::Reader>().unwrap();
             assert_eq!(request, request_from_proto(reader));
         }
