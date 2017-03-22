@@ -11,11 +11,9 @@ use rpc::{RpcError};
 use rpc::server::{RpcObject, RpcServer};
 use client::state_machine::{ExactlyOnceStateMachine};
 use common::{Config, RaftError,
-             RaftCommand, RaftCommandReply,
-             RaftQuery, RaftQueryReply,
-             ClientRequest, ClientRequestReply,
-             client_request_from_proto,
-             client_request_reply_to_proto};
+             raft_command,
+             raft_query,
+             client_command};
 use common::constants;
 use std::net::SocketAddr;
 use std::time::{Duration, Instant};
@@ -55,7 +53,7 @@ pub struct RequestVoteReply {
 pub enum MainThreadMessage {
     AppendEntriesReply (AppendEntriesReply),
     RequestVoteReply (RequestVoteReply),
-    ClientAppendRequest (RaftCommand),
+    ClientAppendRequest (raft_command::Request),
     Shutdown
 }
 
@@ -295,7 +293,7 @@ fn handle_append_entries_reply(m: AppendEntriesReply, server_info: &mut ServerIn
 }
 
 /// Helper function to append a command to the log!
-fn append_to_log(log: Arc<Mutex<Log>>, op: RaftCommand, state: &ServerState) {
+fn append_to_log(log: Arc<Mutex<Log>>, op: raft_command::Request, state: &ServerState) {
     let entry = Entry {
         index: 0,
         term: state.current_term,
@@ -714,8 +712,8 @@ struct ClientRequestHandler {
 }
 
 impl ClientRequestHandler {
-    fn client_write_blocking(&self, op: RaftCommand)
-        -> Result<RaftCommandReply, RaftError>
+    fn client_write_blocking(&self, op: raft_command::Request)
+        -> Result<raft_command::Reply, RaftError>
     {
         let (to_me, from_sm) = channel();
         self.to_state_machine.lock().unwrap().send(
@@ -730,8 +728,8 @@ impl ClientRequestHandler {
     /// Client read. Blocks until most recent write is properly committed to the log,
     /// then returns result from client state machine query.
     ///
-    fn client_read_blocking(&self, op: RaftQuery)
-        -> Result<RaftQueryReply, RaftError>
+    fn client_read_blocking(&self, op: raft_query::Request)
+        -> Result<raft_query::Reply, RaftError>
     {
         let (to_me, from_sm) = channel();
         self.to_state_machine.lock().unwrap().send(
@@ -752,17 +750,17 @@ impl RpcObject for ClientRequestHandler {
             let mut reply = Err(RaftError::NotLeader(
                     {self.state.lock().unwrap().last_leader_contact.1}));
             if matches!(current_state, State::Leader { .. }) { 
-                let op = client_request_from_proto(client_request);
+                let op = client_command::request_from_proto(client_request);
                 reply = match op {
-                    ClientRequest::Command(op) =>
-                        self.client_write_blocking(op).map(ClientRequestReply::Command),
-                    ClientRequest::Query(op) =>
-                        self.client_read_blocking(op).map(ClientRequestReply::Query),
-                    _ => Ok(ClientRequestReply::Command(RaftCommandReply::Noop)),
+                    client_command::Request::Command(op) =>
+                        self.client_write_blocking(op).map(client_command::Reply::Command),
+                    client_command::Request::Query(op) =>
+                        self.client_read_blocking(op).map(client_command::Reply::Query),
+                    _ => Ok(client_command::Reply::Command(raft_command::Reply::Noop)),
                 };
             }
             let mut reply_proto = result.init_as::<client_request::reply::Builder>();
-            client_request_reply_to_proto(reply, &mut reply_proto);
+            client_command::reply_to_proto(reply, &mut reply_proto);
         })
         .map_err(RpcError::Capnp)
     }
@@ -1074,7 +1072,7 @@ mod tests {
         use super::mock_server;
         use super::super::{State};
         use super::super::peer::{PeerThreadMessage};
-        use super::super::super::common::{RaftCommand};
+        use super::super::super::common::{raft_command};
         use super::super::StateFile;
 
         #[test]
@@ -1115,7 +1113,7 @@ mod tests {
             let log = s.log.lock().unwrap();
             assert_eq!(log.get_last_entry_index(), 1);
             let entry = log.get_entry(1).unwrap();
-            assert!(matches!(entry.op, RaftCommand::Noop));
+            assert!(matches!(entry.op, raft_command::Request::Noop));
 
             // ensure that the dummy entry was broadcasted properly
             for _ in 0..s.info.peers.len() {

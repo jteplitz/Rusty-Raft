@@ -16,8 +16,8 @@ struct RaftCommand {
   struct Reply {
     union {
       stateMachineCommand  @0  :Void;
-      openSession          @1  :UInt64; # for openSession
-      setConfig            @2  :Void;   # for setConfig
+      openSession          @1  :UInt64;
+      setConfig            @2  :Void;
       noop                 @3  :Void;
     }
   }
@@ -30,8 +30,8 @@ struct RaftQuery {
   }
   struct Reply {
     union {
-      stateMachineQuery   @0  :Data;  # for statemachinequery
-      getConfig           @1  :Data;  # for getConfig
+      stateMachineQuery   @0  :Data;
+      getConfig           @1  :Data;
     }
   }
 }

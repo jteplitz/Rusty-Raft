@@ -6,7 +6,7 @@ use std::thread::JoinHandle;
 
 use super::{MainThreadMessage, ServerState};
 use super::super::client::state_machine::ExactlyOnceStateMachine;
-use super::super::common::{RaftError, RaftCommand, RaftCommandReply, RaftQuery, RaftQueryReply};
+use super::super::common::{RaftError, raft_command, raft_query};
 use super::log::{Log};
 
 ///
@@ -15,12 +15,12 @@ use super::log::{Log};
 #[derive(Clone)]
 pub enum StateMachineMessage {
     Command {
-        command: RaftCommand,
-        response_channel: Sender<Result<RaftCommandReply, RaftError>>
+        command: raft_command::Request,
+        response_channel: Sender<Result<raft_command::Reply, RaftError>>
     },
     Query { 
-        query: RaftQuery, 
-        response_channel: Sender<Result<RaftQueryReply, RaftError>>
+        query: raft_query::Request, 
+        response_channel: Sender<Result<raft_query::Reply, RaftError>>
     },
     Commit (usize),
     Flush,

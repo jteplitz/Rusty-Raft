@@ -3,8 +3,7 @@ use capnp::serialize::OwnedSegments;
 use capnp::message::Reader;
 use raft_capnp::{client_request};
 use rpc::client::Rpc;
-use common::{ClientRequest, ClientRequestReply, RaftQuery, RaftQueryReply, RaftCommand, RaftCommandReply, Config, RaftError, SessionInfo,
-client_request_to_proto, client_request_reply_from_proto};
+use common::{client_command, raft_query, raft_command, Config, RaftError, SessionInfo};
 use common::constants;
 
 use std::collections::HashMap;
@@ -74,12 +73,12 @@ impl RaftConnection {
         Rpc::get_result_reader(&msg)
             .map_err(|x| RaftError::ClientError(format!("{:?}", x)))// jank
             .and_then(|result| {
-                client_request_reply_from_proto(
+                client_command::reply_from_proto(
                 &mut result.get_as::<client_request::reply::Reader>().unwrap())
             })
             .and_then(|result| {
-                if let ClientRequestReply::Command(reply) = result {
-                  if let RaftCommandReply::OpenSession(client_id) = reply {
+                if let client_command::Reply::Command(reply) = result {
+                  if let raft_command::Reply::OpenSession(client_id) = reply {
                     return Ok(client_id)
                 }
                 }
@@ -96,8 +95,8 @@ impl RaftConnection {
             {
                 let mut params = rpc.get_param_builder()
                                     .init_as::<client_request::Builder>();
-                client_request_to_proto(
-                    ClientRequest::Command(RaftCommand::OpenSession),
+                client_command::request_to_proto(
+                    client_command::Request::Command(raft_command::Request::OpenSession),
                     &mut params);
             }
             rpc.send(leader_addr)
@@ -124,12 +123,12 @@ impl RaftConnection {
     /// Helper to construct a ClientRequest rpc from |buffer| (the data to pass
     /// to the request) and |op| (the type of the request).
     ///
-    fn construct_client_request_rpc(op: ClientRequest) -> Rpc {
+    fn construct_client_request_rpc(op: client_command::Request) -> Rpc {
         let mut rpc = Rpc::new(constants::CLIENT_REQUEST_OPCODE);
         {
             let mut params = rpc.get_param_builder()
                                 .init_as::<client_request::Builder>();
-            client_request_to_proto(op, &mut params);
+            client_command::request_to_proto(op, &mut params);
         }
         rpc
     }
@@ -142,11 +141,11 @@ impl RaftConnection {
     ///
     /// |msg| must contain a client_request_reply::Reader.
     ///
-    fn handle_client_reply(msg: Reader<OwnedSegments>) -> Result<ClientRequestReply, RaftError> {
+    fn handle_client_reply(msg: Reader<OwnedSegments>) -> Result<client_command::Reply, RaftError> {
         Rpc::get_result_reader(&msg)
             .map_err(|x| RaftError::ClientError(format!("{:?}", x)))// jank
             .and_then(|result| {
-                client_request_reply_from_proto(
+                client_command::reply_from_proto(
                     &mut result.get_as::<client_request::reply::Reader>().unwrap())
             })
     }
@@ -186,8 +185,8 @@ impl RaftConnection {
     ///
     /// Sends a client request to the leader of a cluster.
     ///
-    fn send_client_request(&mut self, op: ClientRequest)
-        -> Result<ClientRequestReply, RaftError> {
+    fn send_client_request(&mut self, op: client_command::Request)
+        -> Result<client_command::Reply, RaftError> {
         self.perform_leader_op(move |leader_addr|  {
             RaftConnection::construct_client_request_rpc(op.clone())
                 .send(leader_addr)
@@ -202,8 +201,8 @@ impl RaftConnection {
     ///
     pub fn command(&mut self, buffer: &[u8]) -> Result<(), RaftError> {
         let session = self.get_session();
-        self.send_client_request(ClientRequest::Command(
-                RaftCommand::StateMachineCommand {
+        self.send_client_request(client_command::Request::Command(
+                raft_command::Request::StateMachineCommand {
                 data: buffer.to_vec(),
                 session: session}))
             .map(|_| {}) // Command to client should not return data...
@@ -216,11 +215,11 @@ impl RaftConnection {
     /// RaftError if Rpc or Client's state machine fails.
     ///
     pub fn query(&mut self, buffer: &[u8]) -> Result<Vec<u8>, RaftError> {
-        self.send_client_request(ClientRequest::Query(
-                RaftQuery::StateMachineQuery(buffer.to_vec())))
+        self.send_client_request(client_command::Request::Query(
+                raft_query::Request::StateMachineQuery(buffer.to_vec())))
             .and_then(|reply| {
-                if let ClientRequestReply::Query(reply) = reply {
-                    if let RaftQueryReply::StateMachineQuery(data) = reply {
+                if let client_command::Reply::Query(reply) = reply {
+                    if let raft_query::Reply::StateMachineQuery(data) = reply {
                         return Ok(data);
                     }
                 }
@@ -234,10 +233,8 @@ mod tests {
     use super::{RaftConnection, BACKOFF_TIME_MS};
     use super::super::rpc::server::{RpcObject, RpcServer};
     use super::super::rpc::RpcError;
-    use super::super::common::{Config,
-    client_request_from_proto, client_request_reply_to_proto, RaftError,
-    successful_reply_for};
-    use super::super::raft_capnp::{client_request};
+    use super::super::common::{Config, client_command, RaftError };
+    use super::super::raft_capnp::{client_request as proto};
     use capnp;
     use std::collections::HashMap;
     use std::net::{SocketAddr};
@@ -255,10 +252,10 @@ mod tests {
         fn handle_rpc (&self, params: capnp::any_pointer::Reader, result: capnp::any_pointer::Builder) 
             -> Result<(), RpcError>
             {
-                let mut result_builder = result.init_as::<client_request::reply::Builder>();
+                let mut result_builder = result.init_as::<proto::reply::Builder>();
                 let redirect_addr = format!("{}:{}", LOCALHOST, self.redirect_port);
                 let err = RaftError::NotLeader(Some(SocketAddr::from_str(&*redirect_addr).unwrap()));
-                client_request_reply_to_proto(Err(err), &mut result_builder);
+                client_command::reply_to_proto(Err(err), &mut result_builder);
                 Ok(())
             }
     }
@@ -272,11 +269,11 @@ mod tests {
     fn handle_rpc (&self, params: capnp::any_pointer::Reader, result: capnp::any_pointer::Builder) 
         -> Result<(), RpcError>
         {
-            let op = client_request_from_proto(
-               params.get_as::<client_request::Reader>().unwrap());
-            let reply = successful_reply_for(op);
-            let mut result_builder = result.init_as::<client_request::reply::Builder>();
-            client_request_reply_to_proto(Ok(reply), &mut result_builder);
+            let op = client_command::request_from_proto(
+               params.get_as::<proto::Reader>().unwrap());
+            let reply = client_command::successful_reply_for(op);
+            let mut result_builder = result.init_as::<proto::reply::Builder>();
+            client_command::reply_to_proto(Ok(reply), &mut result_builder);
             Ok(())
         }
     }

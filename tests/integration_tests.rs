@@ -96,11 +96,11 @@ fn it_starts_up_a_cluster() {
 }
 
 /// Returns a new Rpc 
-fn create_client_request(request: ClientRequest) -> Rpc {
+fn create_client_request(request: client_command::Request) -> Rpc {
     let mut rpc = Rpc::new(CLIENT_REQUEST_OPCODE); 
     {
         let mut param_builder = rpc.get_param_builder().init_as::<client_request::Builder>();
-        client_request_to_proto(request, &mut param_builder);
+        client_command::request_to_proto(request, &mut param_builder);
     }
     rpc
 }
@@ -119,8 +119,8 @@ fn send_client_request(addrs: &HashMap<u64, SocketAddr>, data: &[u8], skip_id: O
     })
     .map(|(_, &to_addr)| {
         let rpc = create_client_request(
-            ClientRequest::Command(
-                RaftCommand::StateMachineCommand{
+            client_command::Request::Command(
+                raft_command::Request::StateMachineCommand{
                     data: data.to_vec(),
                     // TODO (sydli): Actually ask for a real session here
                     session: mock_session()}));
@@ -131,7 +131,7 @@ fn send_client_request(addrs: &HashMap<u64, SocketAddr>, data: &[u8], skip_id: O
     .into_iter()
     .filter(|msg| {
         let reply = Rpc::get_result_reader(&msg).unwrap();
-        client_request_reply_from_proto(
+        client_command::reply_from_proto(
             &mut reply.get_as::<client_request::reply::Reader>().unwrap()).is_ok()
     })
     .collect::<Vec<Reader<OwnedSegments>>>()

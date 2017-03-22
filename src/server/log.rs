@@ -1,7 +1,6 @@
 use std::fmt;
 use raft_capnp::{entry};
-use super::super::common::{RaftCommand, SessionInfo, mock_session,
-                           raft_command_from_proto, raft_command_to_proto};
+use super::super::common::{SessionInfo, mock_session, raft_command};
 
 ///
 /// Abstraction for a single Entry for our log.
@@ -10,7 +9,7 @@ use super::super::common::{RaftCommand, SessionInfo, mock_session,
 pub struct Entry {
     pub index: usize,       // index of this Entry in the log
     pub term: u64,          // term for which this Entry is committed
-    pub op: RaftCommand,    // operation represented by this Entry
+    pub op: raft_command::Request,    // operation represented by this Entry
 }
 
 #[cfg(test)]
@@ -24,7 +23,7 @@ pub fn random_entry_with_term(term: u64) -> Entry {
   Entry {
       index: 0,
       term: term,
-      op: RaftCommand::StateMachineCommand {
+      op: raft_command::Request::StateMachineCommand {
               data: vec, session: mock_session()},
   }
 }
@@ -48,7 +47,7 @@ impl Entry {
         Entry {
             index: 0,
             term: term,
-            op: RaftCommand::Noop,
+            op: raft_command::Request::Noop,
         }
     }
 
@@ -62,7 +61,7 @@ impl Entry {
         Entry {
             index: entry_proto.get_index() as usize,
             term: entry_proto.get_term(),
-            op: raft_command_from_proto(entry_proto.get_op().unwrap()),
+            op: raft_command::request_from_proto(entry_proto.get_op().unwrap()),
         }
     }
 
@@ -72,7 +71,7 @@ impl Entry {
     pub fn into_proto(&self, builder: &mut entry::Builder) {
         builder.set_term(self.term);
         builder.set_index(self.index as u64);
-        raft_command_to_proto(self.op.clone(), &mut builder.borrow()
+        raft_command::request_to_proto(self.op.clone(), &mut builder.borrow()
                                 .init_op());
     }
 
@@ -81,7 +80,8 @@ impl Entry {
     ///
     fn get_data(&self) -> Vec<u8> {
         match self.op {
-            RaftCommand::StateMachineCommand {ref data, ..} => data.to_vec(),
+            raft_command::Request::StateMachineCommand
+                {ref data, ..} => data.to_vec(),
             _ => vec![],
         }
     }

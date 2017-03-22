@@ -1,9 +1,8 @@
 pub mod constants;
 use std::collections::HashMap;
 use std::net::SocketAddr;
-use std::str::FromStr;
 use std::time::Duration;
-use raft_capnp::{session_info, client_request, raft_command, raft_query, raft_error};
+use raft_capnp::{session_info, client_request, raft_error};
 use rpc::RpcError;
 
 #[derive(Debug, Clone)]
@@ -17,247 +16,260 @@ pub enum RaftError {
     Unknown,
 }
 
-///
-/// Changes to ClientRequest should be reflected in the
-/// equivalent protocols in protocol/raft.capnp
-///
-#[derive(Clone, Debug, PartialEq)]
-pub enum RaftCommand {
-    StateMachineCommand { data: Vec<u8>, session: SessionInfo },
-    OpenSession,
-    SetConfig,
-    Noop,
-}
+pub mod raft_command {
+    use super::SessionInfo;
+    use super::super::raft_capnp::raft_command as proto;
 
-#[derive(Clone, Debug)]
-pub enum RaftCommandReply {
-    StateMachineCommand,
-    OpenSession (u64),
-    SetConfig,
-    Noop,
-}
+    ///
+    /// Changes to ClientRequest should be reflected in the
+    /// equivalent protocols in protocol/raft.capnp
+    ///
+    #[derive(Clone, Debug, PartialEq)]
+    pub enum Request {
+        StateMachineCommand { data: Vec<u8>, session: SessionInfo },
+        OpenSession,
+        SetConfig,
+        Noop,
+    }
 
-#[derive(Clone, Debug)]
-pub enum RaftQuery {
-    StateMachineQuery ( Vec<u8> ),
-    GetConfig,
-}
+    #[derive(Clone, Debug)]
+    pub enum Reply {
+        StateMachineCommand,
+        OpenSession (u64),
+        SetConfig,
+        Noop,
+    }
 
-#[derive(Clone, Debug)]
-pub enum RaftQueryReply {
-    StateMachineQuery ( Vec<u8> ),
-    GetConfig ( Vec<u8> ),
-}
+    pub fn request_to_proto(command: Request, builder: &mut proto::Builder){
+        match command {
+            Request::StateMachineCommand { data, session } => {
+                let mut command = builder.borrow().init_state_machine_command();
+                command.set_data(&data);
+                session.into_proto(&mut command.init_session());
+            },
+            Request::OpenSession => builder.set_open_session(()),
+            Request::SetConfig => builder.set_set_config(()),
+            Request::Noop => builder.set_noop(()),
+        }
+    }
 
-#[derive(Clone, Debug)]
-pub enum ClientRequest {
-    Command(RaftCommand),
-    Query(RaftQuery),
-    Unknown,
-}
-
-#[derive(Clone, Debug)]
-pub enum ClientRequestReply {
-    Command(RaftCommandReply),
-    Query(RaftQueryReply),
-}
-
-#[cfg(test)]
-pub fn successful_reply_for(op: ClientRequest) -> ClientRequestReply {
-    match op {
-        ClientRequest::Command(data) => {
-            ClientRequestReply::Command(
-                match data {
-                    RaftCommand::StateMachineCommand{..} => 
-                        RaftCommandReply::StateMachineCommand,
-                    RaftCommand::OpenSession => 
-                        RaftCommandReply::OpenSession(0),
-                    RaftCommand::SetConfig => RaftCommandReply::SetConfig,
-                    RaftCommand::Noop => RaftCommandReply::Noop
+    pub fn request_from_proto(proto: proto::Reader) -> Request {
+        match proto.which().unwrap() {
+            proto::StateMachineCommand(command) => {
+                let command = command.unwrap();
+                Request::StateMachineCommand {
+                   data: command.get_data().unwrap().to_vec(),
+                   session: SessionInfo::from_proto(command.get_session().unwrap()),
                 }
-            )
-        },
-        ClientRequest::Query(data) => {
-            ClientRequestReply::Query(
-                match data {
-                    RaftQuery::StateMachineQuery(_) =>
-                        RaftQueryReply::StateMachineQuery(vec![]),
-                    RaftQuery::GetConfig => RaftQueryReply::GetConfig(vec![]),
-                }
-            )
-        },
-        _ => ClientRequestReply::Command(RaftCommandReply::Noop),
+            },
+            proto::OpenSession(_) => Request::OpenSession,
+            proto::SetConfig(_) => Request::SetConfig,
+            proto::Noop(_) => Request::Noop,
+        }
+    }
+
+
+    pub fn reply_to_proto(reply: Reply,
+                                   builder: &mut proto::reply::Builder) {
+        match reply {
+            Reply::StateMachineCommand => builder.set_state_machine_command(()),
+            Reply::OpenSession(client_id) => builder.set_open_session(client_id),
+            Reply::SetConfig => builder.set_set_config(()),
+            Reply::Noop => builder.set_noop(()),
+        }
+    }
+
+    pub fn reply_from_proto(proto: &mut proto::reply::Reader) -> Reply {
+        match proto.which().unwrap() {
+            proto::reply::StateMachineCommand(_) => Reply::StateMachineCommand,
+            proto::reply::OpenSession(client_id) => Reply::OpenSession(client_id),
+            proto::reply::SetConfig(_) => Reply::SetConfig,
+            proto::reply::Noop(_) => Reply::Noop,
+        }
     }
 }
+pub mod raft_query {
+    use super::SessionInfo;
+    use super::super::raft_capnp::raft_query as proto;
 
-pub fn raft_command_from_proto(proto: raft_command::Reader) -> RaftCommand {
-    match proto.which().unwrap() {
-        raft_command::StateMachineCommand(command) => {
-            let command = command.unwrap();
-            RaftCommand::StateMachineCommand {
-               data: command.get_data().unwrap().to_vec(),
-               session: SessionInfo::from_proto(command.get_session().unwrap()),
-            }
-        },
-        raft_command::OpenSession(_) => RaftCommand::OpenSession,
-        raft_command::SetConfig(_) => RaftCommand::SetConfig,
-        raft_command::Noop(_) => RaftCommand::Noop,
+    #[derive(Clone, Debug)]
+    pub enum Request {
+        StateMachineQuery ( Vec<u8> ),
+        GetConfig,
     }
-}
 
-fn raft_query_from_proto(proto: raft_query::Reader) -> RaftQuery {
-    match proto.which().unwrap() {
-        raft_query::StateMachineQuery(query) => {
-            RaftQuery::StateMachineQuery(query.unwrap().to_vec())
-        },
-        raft_query::GetConfig(_) => RaftQuery::GetConfig,
+    #[derive(Clone, Debug)]
+    pub enum Reply {
+        StateMachineQuery ( Vec<u8> ),
+        GetConfig ( Vec<u8> ),
     }
-}
 
-pub fn client_request_from_proto(proto: client_request::Reader) -> ClientRequest {
-    match proto.which().unwrap() {
-        client_request::Command(raft_command) => {
-            ClientRequest::Command(
-                raft_command_from_proto(raft_command.unwrap()))
-        },
-        client_request::Query(raft_query) => {
-            ClientRequest::Query(
-                raft_query_from_proto(raft_query.unwrap()))
-        },
-        client_request::Unknown(_) => ClientRequest::Unknown,
+    pub fn request_from_proto(proto: proto::Reader) -> Request {
+        match proto.which().unwrap() {
+            proto::StateMachineQuery(query) => {
+                Request::StateMachineQuery(query.unwrap().to_vec())
+            },
+            proto::GetConfig(_) => Request::GetConfig,
+        }
     }
-}
 
-fn raft_query_to_proto(query: RaftQuery, builder: &mut raft_query::Builder){
-    match query {
-        RaftQuery::StateMachineQuery(data) => {
-            builder.set_state_machine_query(&data);
-        },
-        RaftQuery::GetConfig => builder.set_get_config(()),
+    pub fn request_to_proto(query: Request, builder: &mut proto::Builder){
+        match query {
+            Request::StateMachineQuery(data) => {
+                builder.set_state_machine_query(&data);
+            },
+            Request::GetConfig => builder.set_get_config(()),
+        }
     }
-}
 
-pub fn raft_command_to_proto(command: RaftCommand, builder: &mut raft_command::Builder){
-    match command {
-        RaftCommand::StateMachineCommand { data, session } => {
-            let mut command = builder.borrow().init_state_machine_command();
-            command.set_data(&data);
-            session.into_proto(&mut command.init_session());
-        },
-        RaftCommand::OpenSession => builder.set_open_session(()),
-        RaftCommand::SetConfig => builder.set_set_config(()),
-        RaftCommand::Noop => builder.set_noop(()),
+    pub fn reply_to_proto(reply: Reply, builder: &mut proto::reply::Builder) {
+        match reply {
+            Reply::StateMachineQuery(data) => builder.set_state_machine_query(&data),
+            Reply::GetConfig(data) => builder.set_get_config(&data),
+        }
     }
-}
 
-fn raft_query_reply_to_proto(reply: RaftQueryReply,
-                             builder: &mut raft_query::reply::Builder) {
-    match reply {
-        RaftQueryReply::StateMachineQuery(data) => builder.set_state_machine_query(&data),
-        RaftQueryReply::GetConfig(data) => builder.set_get_config(&data),
-    }
-}
-
-fn raft_command_reply_to_proto(reply: RaftCommandReply,
-                               builder: &mut raft_command::reply::Builder) {
-    match reply {
-        RaftCommandReply::StateMachineCommand => builder.set_state_machine_command(()),
-        RaftCommandReply::OpenSession(client_id) => builder.set_open_session(client_id),
-        RaftCommandReply::SetConfig => builder.set_set_config(()),
-        RaftCommandReply::Noop => builder.set_noop(()),
-    }
-}
-
-fn raft_error_to_proto(err: RaftError, builder: &mut raft_error::Builder) {
-    match err {
-        RaftError::ClientError(err) => builder.set_client_error(err.as_str()),
-        RaftError::NotLeader(leader) => {
-            let leader_str = leader.map(|x| x.to_string())
-                                   .unwrap_or_default();
-            builder.set_not_leader(leader_str.as_str())
-        },
-        RaftError::SessionError => builder.set_session_error(()),
-        RaftError::RpcError(_) | RaftError::Unknown => builder.set_unknown(()),
-    }
-}
-
-pub fn client_request_reply_to_proto(op: Result<ClientRequestReply, RaftError>,
-                                     builder: &mut client_request::reply::Builder) {
-    match op {
-        Ok(reply) => {
-            match reply {
-                ClientRequestReply::Command(command) =>
-                    raft_command_reply_to_proto(command,
-                                               &mut builder.borrow().init_command_reply()),
-                ClientRequestReply::Query(query) => 
-                    raft_query_reply_to_proto(query,
-                                              &mut builder.borrow().init_query_reply()),
-            }
-        }, 
-        Err(err) => {
-            raft_error_to_proto(err, &mut builder.borrow().init_error());
+    pub fn reply_from_proto(proto: &mut proto::reply::Reader) -> Reply {
+        match proto.which().unwrap() {
+            proto::reply::StateMachineQuery(data) =>
+                Reply::StateMachineQuery(data.unwrap().to_vec()),
+            proto::reply::GetConfig(data) =>
+                Reply::GetConfig(data.unwrap().to_vec()),
         }
     }
 }
 
-fn raft_query_reply_from_proto(proto: &mut raft_query::reply::Reader) -> RaftQueryReply {
-    match proto.which().unwrap() {
-        raft_query::reply::StateMachineQuery(data) =>
-            RaftQueryReply::StateMachineQuery(data.unwrap().to_vec()),
-        raft_query::reply::GetConfig(data) =>
-            RaftQueryReply::GetConfig(data.unwrap().to_vec()),
-    }
-}
+pub mod client_command {
+    use super::{raft_command, raft_query, RaftError};
+    use super::super::raft_capnp::{client_request as proto, raft_error};
+    use std::net::SocketAddr;
+    use std::str::FromStr;
 
-fn raft_command_reply_from_proto(proto: &mut raft_command::reply::Reader) -> RaftCommandReply {
-    match proto.which().unwrap() {
-        raft_command::reply::StateMachineCommand(_) =>
-            RaftCommandReply::StateMachineCommand,
-        raft_command::reply::OpenSession(client_id) =>
-            RaftCommandReply::OpenSession(client_id),
-        raft_command::reply::SetConfig(_) =>
-            RaftCommandReply::SetConfig,
-        raft_command::reply::Noop(_) =>
-            RaftCommandReply::Noop,
+    #[derive(Clone, Debug)]
+    pub enum Request {
+        Command(raft_command::Request),
+        Query(raft_query::Request),
+        Unknown,
     }
-}
 
-fn raft_error_from_proto(proto: &mut raft_error::Reader) -> RaftError {
-    match proto.which().unwrap() {
-        raft_error::ClientError(err) => RaftError::ClientError(err.unwrap().to_string()),
-        raft_error::NotLeader(leader) =>
-            RaftError::NotLeader(
-                leader.ok().and_then(|x| SocketAddr::from_str(x).ok())),
-        raft_error::SessionError(_) => RaftError::SessionError,
-        raft_error::Unknown(_) => RaftError::Unknown,
+    #[derive(Clone, Debug)]
+    pub enum Reply {
+        Command(raft_command::Reply),
+        Query(raft_query::Reply),
     }
-}
 
-pub fn client_request_reply_from_proto(proto: &mut client_request::reply::Reader)
-    -> Result<ClientRequestReply, RaftError> {
-    match proto.which().unwrap() {
-        client_request::reply::Error(err) =>
-            Err(raft_error_from_proto(&mut err.unwrap())),
-        client_request::reply::CommandReply(command) =>
-            Ok(ClientRequestReply::Command(
-                    raft_command_reply_from_proto(&mut command.unwrap()))),
-        client_request::reply::QueryReply(query) =>
-            Ok(ClientRequestReply::Query(
-                    raft_query_reply_from_proto(&mut query.unwrap()))),
+    pub fn request_from_proto(proto: proto::Reader) -> Request {
+        match proto.which().unwrap() {
+            proto::Command(raft_command) => {
+                Request::Command(
+                    raft_command::request_from_proto(raft_command.unwrap()))
+            },
+            proto::Query(raft_query) => {
+                Request::Query(
+                    raft_query::request_from_proto(raft_query.unwrap()))
+            },
+            proto::Unknown(_) => Request::Unknown,
+        }
     }
-}
 
-pub fn client_request_to_proto(op: ClientRequest, builder: &mut client_request::Builder){
-    match op {
-        ClientRequest::Command(raft_command) => {
-            raft_command_to_proto(raft_command,
-                                  &mut builder.borrow().init_command());
-        },
-        ClientRequest::Query(raft_query) => {
-            raft_query_to_proto(raft_query,
-                                &mut builder.borrow().init_query());
-        },
-        ClientRequest::Unknown => builder.set_unknown(()),
+    pub fn reply_to_proto(op: Result<Reply, RaftError>,
+                                         builder: &mut proto::reply::Builder) {
+        match op {
+            Ok(reply) => {
+                match reply {
+                    Reply::Command(command) =>
+                        raft_command::reply_to_proto(
+                            command, &mut builder.borrow().init_command_reply()),
+                    Reply::Query(query) => 
+                        raft_query::reply_to_proto(
+                            query, &mut builder.borrow().init_query_reply()),
+                }
+            }, 
+            Err(err) => {
+                raft_error_to_proto(err, &mut builder.borrow().init_error());
+            }
+        }
+    }
+
+    #[cfg(test)]
+    pub fn successful_reply_for(op: Request) -> Reply {
+        match op {
+            Request::Command(data) => {
+                Reply::Command(
+                    match data {
+                        raft_command::Request::StateMachineCommand{..} => 
+                            raft_command::Reply::StateMachineCommand,
+                        raft_command::Request::OpenSession => 
+                            raft_command::Reply::OpenSession(0),
+                        raft_command::Request::SetConfig => raft_command::Reply::SetConfig,
+                        raft_command::Request::Noop => raft_command::Reply::Noop
+                    }
+                )
+            },
+            Request::Query(data) => {
+                Reply::Query(
+                    match data {
+                        raft_query::Request::StateMachineQuery(_) =>
+                            raft_query::Reply::StateMachineQuery(vec![]),
+                        raft_query::Request::GetConfig => raft_query::Reply::GetConfig(vec![]),
+                    }
+                )
+            },
+            _ => Reply::Command(raft_command::Reply::Noop),
+        }
+    }
+
+    pub fn request_to_proto(op: Request, builder: &mut proto::Builder){
+        match op {
+            Request::Command(raft_command) => {
+                raft_command::request_to_proto(raft_command,
+                                      &mut builder.borrow().init_command());
+            },
+            Request::Query(raft_query) => {
+                raft_query::request_to_proto(raft_query,
+                                    &mut builder.borrow().init_query());
+            },
+            Request::Unknown => builder.set_unknown(()),
+        }
+    }
+
+    pub fn reply_from_proto(proto: &mut proto::reply::Reader)
+        -> Result<Reply, RaftError> {
+        match proto.which().unwrap() {
+            proto::reply::Error(err) =>
+                Err(raft_error_from_proto(&mut err.unwrap())),
+            proto::reply::CommandReply(command) =>
+                Ok(Reply::Command(
+                        raft_command::reply_from_proto(&mut command.unwrap()))),
+            proto::reply::QueryReply(query) =>
+                Ok(Reply::Query(
+                        raft_query::reply_from_proto(&mut query.unwrap()))),
+        }
+    }
+
+    fn raft_error_to_proto(err: RaftError, builder: &mut raft_error::Builder) {
+        match err {
+            RaftError::ClientError(err) => builder.set_client_error(err.as_str()),
+            RaftError::NotLeader(leader) => {
+                let leader_str = leader.map(|x| x.to_string())
+                                       .unwrap_or_default();
+                builder.set_not_leader(leader_str.as_str())
+            },
+            RaftError::SessionError => builder.set_session_error(()),
+            RaftError::RpcError(_) | RaftError::Unknown => builder.set_unknown(()),
+        }
+    }
+
+    fn raft_error_from_proto(proto: &mut raft_error::Reader) -> RaftError {
+        match proto.which().unwrap() {
+            raft_error::ClientError(err) => RaftError::ClientError(
+                err.unwrap().to_string()),
+            raft_error::NotLeader(leader) =>
+                RaftError::NotLeader(
+                    leader.ok().and_then(|x| SocketAddr::from_str(x).ok())),
+            raft_error::SessionError(_) => RaftError::SessionError,
+            raft_error::Unknown(_) => RaftError::Unknown,
+        }
     }
 }
 

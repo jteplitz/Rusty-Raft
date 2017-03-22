@@ -1,8 +1,7 @@
 use rand;
 use rand::Rng;
 use std::collections::HashMap;
-use super::super::common::{RaftError, RaftCommandReply,
-                           RaftQueryReply, RaftCommand, RaftQuery};
+use super::super::common::{RaftError, raft_command, raft_query};
 
 ///
 /// State machine trait for clients to implement. Client should define
@@ -31,7 +30,7 @@ pub trait StateMachine: Sync + Send {
 
 #[derive(Clone)]
 pub struct Session {
-    responses: HashMap<u64, Result<RaftCommandReply, RaftError>>,
+    responses: HashMap<u64, Result<raft_command::Reply, RaftError>>,
 }
 
 pub struct ExactlyOnceStateMachine {
@@ -65,10 +64,10 @@ impl ExactlyOnceStateMachine {
         session_id
     }
 
-    pub fn command (&mut self, data: &RaftCommand)
-        -> Result<RaftCommandReply, RaftError> {
+    pub fn command (&mut self, data: &raft_command::Request)
+        -> Result<raft_command::Reply, RaftError> {
         match *data {
-            RaftCommand::StateMachineCommand{ref data, session} => {
+            raft_command::Request::StateMachineCommand{ref data, session} => {
                 self.get_session(session.client_id)
                     .ok_or(RaftError::SessionError)
                     .and_then(|this_session| {
@@ -76,22 +75,23 @@ impl ExactlyOnceStateMachine {
                             .get(&session.sequence_number).cloned()
                             .unwrap_or_else(||
                                 self.client_state_machine.command(data)
-                                    .map(|_| RaftCommandReply::StateMachineCommand)
+                                    .map(|_| raft_command::Reply::StateMachineCommand)
                                 )
                    })
             },
-            RaftCommand::OpenSession => {
-                Ok(RaftCommandReply::OpenSession(self.new_session()))
+            raft_command::Request::OpenSession => {
+                Ok(raft_command::Reply::OpenSession(self.new_session()))
             },
-            _ => Ok(RaftCommandReply::Noop),
+            _ => Ok(raft_command::Reply::Noop),
         }
     }
 
-    pub fn query (&self, data: &RaftQuery) -> Result<RaftQueryReply, RaftError> {
+    pub fn query (&self, data: &raft_query::Request)
+        -> Result<raft_query::Reply, RaftError> {
         match *data {
-            RaftQuery::StateMachineQuery(ref buffer) =>
+            raft_query::Request::StateMachineQuery(ref buffer) =>
                 self.client_state_machine.query(buffer)
-                    .map(RaftQueryReply::StateMachineQuery),
+                    .map(raft_query::Reply::StateMachineQuery),
             _ => Err(RaftError::Unknown),
         }
     }
