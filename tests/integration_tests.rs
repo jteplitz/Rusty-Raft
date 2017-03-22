@@ -34,13 +34,15 @@ struct StateMachineHandle {
     rx: Receiver<Vec<u8>>,
     server_handle: ServerHandle,
     id: u64,
-    state_filename: String
+    state_filename: String,
+    log_filename: String
 }
 
 impl Drop for StateMachineHandle {
-    /// Deletes the state file
+    /// Deletes the state and log files
     fn drop (&mut self) {
-        fs::remove_file(self.state_filename.clone()).unwrap();
+        fs::remove_file(&self.state_filename).unwrap();
+        fs::remove_file(&self.log_filename).unwrap();
     }
 }
 
@@ -69,18 +71,22 @@ fn start_raft_servers(relay_server: &mut RelayServer, addrs: &HashMap<u64, Socke
     (0..addrs.len() as u64)
     .map(|i| {
         // create a config object
-        let mut state_filename: String = thread_rng().gen_ascii_chars().take(STATE_FILENAME_LEN).collect();
-        state_filename = String::from("/tmp/") + &state_filename;
+        let mut random_filename: String = thread_rng().gen_ascii_chars().take(STATE_FILENAME_LEN).collect();
+        let state_filename = String::from("/tmp/state_") + &random_filename;
+        let log_filename = String::from("/tmp/log_") + &random_filename;
 
-        let config = Config::new (addrs.clone(), i, "127.0.0.1:0".to_socket_addrs().unwrap().next().unwrap(),
-                Duration::from_millis(HEARTBEAT_TIMEOUT), state_filename.clone());
         let (tx, rx) = channel();
         let state_machine = Box::new(MockStateMachine::new_with_sender(tx));
-        let server_handle = start_server(config, move || state_machine).unwrap();
+        let server_handle = {
+            let config = Config::new (addrs.clone(), i, "127.0.0.1:0".to_socket_addrs().unwrap().next().unwrap(),
+                    Duration::from_millis(HEARTBEAT_TIMEOUT), state_filename.clone(), &log_filename);
+            start_server(config, move || state_machine).unwrap()
+        };
 
         // map this server through the relay server
         relay_server.relay_address(*addrs.get(&i).unwrap(), server_handle.get_local_addr());
-        StateMachineHandle {rx: rx, server_handle: server_handle, id: i, state_filename: state_filename}
+        StateMachineHandle {rx: rx, server_handle: server_handle, id: i,
+                            state_filename: state_filename, log_filename: log_filename}
     })
     .collect()
 }

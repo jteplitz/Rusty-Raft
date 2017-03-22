@@ -7,7 +7,7 @@ use std::thread::JoinHandle;
 use super::{MainThreadMessage, ServerState};
 use super::super::client::state_machine::ExactlyOnceStateMachine;
 use super::super::common::{RaftError, raft_command, raft_query};
-use super::log::{Log};
+use super::log::{Log, MemoryLog};
 
 ///
 /// Messages to be sent to the state machine thread.
@@ -48,7 +48,7 @@ pub struct StateMachineHandle {
 ///
 /// Returns a handle to this thread.
 ///
-pub fn state_machine_thread (log: Arc<Mutex<Log>>,
+pub fn state_machine_thread (log: Arc<Mutex<MemoryLog>>,
                              start_index: usize,
                              mut state_machine: Box<ExactlyOnceStateMachine>,
                              state: Arc<Mutex<ServerState>>,
@@ -109,7 +109,7 @@ pub fn state_machine_thread (log: Arc<Mutex<Log>>,
 /// Applies entries (next_index, to_commit) exclusive, exclusive from |log|
 /// to the |state_machine|. Returns the new committed index.
 pub fn apply_commands(next_index: usize, to_commit: usize,
-                      log: Arc<Mutex<Log>>,
+                      log: Arc<Mutex<MemoryLog>>,
                       state_machine: &mut Box<ExactlyOnceStateMachine>,
                       outstanding_messages: &mut Vec<StateMachineMessage>)
         -> usize {

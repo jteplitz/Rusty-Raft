@@ -446,23 +446,26 @@ pub mod client_command {
     }
 }
 
-pub struct Config {
+pub struct Config<'a> {
     // Each server has a unique 64bit integer id that and a socket address
     // These mappings MUST be identical for each server in the cluster
     pub cluster: HashMap<u64, SocketAddr>,
     pub me: (u64, SocketAddr),
     pub heartbeat_timeout: Duration,
-    pub state_filename: String
+    pub state_filename: String,
+    pub log_filename: &'a str
 }
 
-impl Config {
+impl<'a> Config<'a> {
     pub fn new (cluster: HashMap<u64, SocketAddr>, my_id: u64,
-                my_addr: SocketAddr, heartbeat_timeout: Duration, state_filename: String) -> Config {
+                my_addr: SocketAddr, heartbeat_timeout: Duration, state_filename: String,
+                log_filename: &str) -> Config {
         Config {
             cluster: cluster,
             me: (my_id, my_addr),
             heartbeat_timeout: heartbeat_timeout,
-            state_filename: state_filename
+            state_filename: state_filename,
+            log_filename: log_filename
         }
     }
 }

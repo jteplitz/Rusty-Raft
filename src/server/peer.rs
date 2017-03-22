@@ -301,6 +301,7 @@ mod tests {
     use super::*;
     use super::super::constants;
     use super::super::log::{Entry, random_entry_with_term, random_entries_with_term, Log, MemoryLog};
+    use super::super::log::mocks::{new_mock_log, new_random_with_term};
     use super::super::super::raft_capnp::{request_vote, request_vote_reply,
                                           append_entries, append_entries_reply};
     use super::super::super::rpc_capnp::rpc_response;
@@ -392,7 +393,8 @@ mod tests {
             match_index: PEER_NEXT_INDEX - 1,
             thread: None
         };
-        let log: Arc<Mutex<Log>> = Arc::new(Mutex::new(MemoryLog::new_random_with_term(LOG_SIZE, TERM)));
+        let (mock_log, _log_file_handle) = new_random_with_term(LOG_SIZE, TERM);
+        let log: Arc<Mutex<Log>> = Arc::new(Mutex::new(mock_log));
         handle.append_entries_nonblocking(LEADER_ID, leader_addr,
                                           COMMIT_INDEX, TERM, log.clone());
         match rx.recv().unwrap() {
@@ -430,11 +432,12 @@ mod tests {
             match_index: PEER_NEXT_INDEX - 1,
             thread: None
         };
-        let log: Arc<Mutex<Log>> = Arc::new(Mutex::new(MemoryLog::new()));
+        let (mock_log, _log_file_handle) = new_mock_log();
+        let log: Arc<Mutex<Log>> = Arc::new(Mutex::new(mock_log));
         {
             let mut log = log.lock().unwrap();
-            log.append_entries(random_entries_with_term(COMMIT_INDEX, TERM - 1));
-            log.append_entries(random_entries_with_term(LOG_SIZE - (COMMIT_INDEX), TERM));
+            log.append_entries_blocking(random_entries_with_term(COMMIT_INDEX, TERM - 1)).unwrap();
+            log.append_entries_blocking(random_entries_with_term(LOG_SIZE - (COMMIT_INDEX), TERM)).unwrap();
         }
         handle.append_entries_nonblocking(LEADER_ID, leader_addr, COMMIT_INDEX, TERM, log.clone());
         match rx.recv().unwrap() {

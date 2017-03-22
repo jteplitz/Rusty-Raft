@@ -1,4 +1,5 @@
 #[macro_use] extern crate matches;
+#[macro_use] extern crate log;
 
 /// Simple Rpc Module.
 /// See the submodules for information on how to set up a server and a client.

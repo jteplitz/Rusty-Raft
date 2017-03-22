@@ -306,13 +306,14 @@ mod tests {
                                       {}))
     }
 
-    fn get_dummy_config(cluster: HashMap<u64, SocketAddr>) -> Config {
+    fn get_dummy_config<'a> (cluster: HashMap<u64, SocketAddr>) -> Config<'a> {
         Config {
             cluster: cluster,
             // dummy "me" entry
             me: (1, SocketAddr::from_str("127.0.0.1:8005").unwrap()),
             heartbeat_timeout: Duration::from_millis(100),
-            state_filename: String::from("")
+            state_filename: String::from(""),
+            log_filename: ""
         }
     }
 
