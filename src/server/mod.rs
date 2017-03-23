@@ -9,7 +9,7 @@ use raft_capnp::{append_entries, append_entries_reply,
                  client_request};
 use rpc::{RpcError};
 use rpc::server::{RpcObject, RpcServer};
-use client::state_machine::{RaftStateMachine};
+use client::state_machine::{RaftStateMachine, StateMachine};
 use common::{Config, RaftError,
              raft_command,
              raft_query,
@@ -31,6 +31,7 @@ use self::peer::{Peer, PeerHandle, PeerThreadMessage, RequestVoteMessage};
 use self::state_file::StateFile;
 use std::io::Error as IoError;
 use rand::distributions::{IndependentSample, Range};
+use rand::{thread_rng, Rng};
 
 
 ///
@@ -233,13 +234,30 @@ impl Drop for ServerHandle {
     }
 }
 
+pub fn start_server(id: u64, cluster: &HashMap<u64, SocketAddr>,
+                    state_machine: Box<StateMachine>) -> Result<ServerHandle, IoError> {
+        const HEARTBEAT_TIMEOUT: u64 = 75;
+        const STATE_FILENAME_LEN: usize = 20;
+        // create a config object
+        let mut random_filename: String = thread_rng().gen_ascii_chars().take(STATE_FILENAME_LEN).collect();
+        let state_filename = String::from("/tmp/state_") + &random_filename;
+        let log_filename = String::from("/tmp/log_") + &random_filename;
+
+        let state_machine = RaftStateMachine::new(state_machine);
+        let config = Config::new (cluster.clone(),
+        id,
+        cluster.get(&id).unwrap().clone(),
+        Duration::from_millis(HEARTBEAT_TIMEOUT),
+        state_filename.clone(),
+        &log_filename);
+        start_server_with_config(config, move || Box::new(state_machine))
+}
+
 ///
 /// Starts up a new raft server with the given config.
 /// This is mostly just a bootstrapper for now. It probably won't end up in the public API
-/// As of right now this function does not return. It just runs the state machine as long as it's
-/// in a live thread.
 ///
-pub fn start_server<F> (config: Config, load_state_machine: F) -> Result<ServerHandle, IoError>
+pub fn start_server_with_config<F> (config: Config, load_state_machine: F) -> Result<ServerHandle, IoError>
     where F: FnOnce() -> Box<RaftStateMachine> {
     let (tx, rx) = channel();
     let tx_clone = tx.clone();

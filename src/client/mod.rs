@@ -67,6 +67,7 @@ impl RaftConnection {
         if self.client_id.is_none() {
             self.register_client().unwrap();
         }
+        self.sequence_number += 1;
         SessionInfo {
             client_id: self.client_id.unwrap(),
             sequence_number: self.sequence_number,

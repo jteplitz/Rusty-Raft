@@ -6,7 +6,7 @@ mod mock_state_machine;
 
 use mock_state_machine::*;
 use relay_server::*;
-use rusty_raft::server::{start_server, ServerHandle};
+use rusty_raft::server::{start_server_with_config, ServerHandle};
 use rusty_raft::client::RaftConnection;
 use rusty_raft::common::Config;
 
@@ -74,7 +74,7 @@ fn start_raft_servers(relay_server: &mut RelayServer, addrs: &HashMap<u64, Socke
         let server_handle = {
             let config = Config::new (addrs.clone(), i, "127.0.0.1:0".to_socket_addrs().unwrap().next().unwrap(),
                     Duration::from_millis(HEARTBEAT_TIMEOUT), state_filename.clone(), &log_filename);
-            start_server(config, move || state_machine).unwrap()
+            start_server_with_config(config, move || state_machine).unwrap()
         };
 
         // map this server through the relay server

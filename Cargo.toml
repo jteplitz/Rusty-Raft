@@ -10,6 +10,7 @@ rand = "0.3"
 matches = "0.1.4"
 mio="0.6.5"
 log="0.3.7"
+rustc-serialize = "0.3"
 
 [build-dependencies]
 capnpc = "*"
