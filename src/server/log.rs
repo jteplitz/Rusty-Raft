@@ -1,11 +1,11 @@
 use std::fmt;
-use std::io::{Read, Write, Result, BufReader, BufWriter, Seek, SeekFrom, Error, ErrorKind};
+use std::io::{Result, BufReader, BufWriter, Seek, SeekFrom, Error, ErrorKind};
 use std::fs::{File, OpenOptions};
 use raft_capnp::{entry};
 use capnp::serialize_packed;
 use capnp::message;
 use capnp::message::ReaderOptions;
-use super::super::common::{SessionInfo, raft_command};
+use super::super::common::{raft_command};
 use super::MainThreadMessage;
 use std::thread;
 use std::thread::JoinHandle;
@@ -113,84 +113,6 @@ impl PartialEq for Entry {
     }
 }
 
-///
-/// Abstraction for a log of "commands" to apply to the client state machine,
-/// stored locally.
-/// Small wrapper over a list of Entries that handles pushing to persistent storage --
-/// eventually should also abstract away automatically snapshotting (TODO)
-///
-/// TODO: remove this trait and just use the one log
-/// also rename it
-pub trait Log {
-    /// 
-    /// Retrieves read-only reference to an Entry in the log, specified by |index|.
-    /// Returns None if the index is out of bounds
-    ///
-    fn get_entry(&self, index: usize) -> Option<&Entry>;
-
-    /// 
-    /// Retrieves read-only reference to a slice of all Entries in the log past |start_index|.
-    /// Slice does not include |start_index|
-    ///
-    fn get_entries_from(&self, start_index: usize) -> &[Entry];
-
-    ///
-    /// Appends a copy of each entry in |entries| to log. Will correctly modify
-    /// |index| field in each Entry to match its index in the log.
-    /// Returns this log object.
-    ///
-    fn append_entries_blocking(&mut self, entries: Vec<Entry>) -> Result<&Log>;
-
-    ///
-    /// Appends a copy of |entry| to the log. Will correclty modify 
-    /// |index| field in |entry| to match its index in the log.
-    /// Returns this log object.
-    ///
-    fn append_entry(&mut self, entry: Entry) -> &Log;
-
-    ///
-    /// Retrieves the index of the last entry in our log.
-    ///
-    fn get_last_entry_index(&self) -> usize;
-
-    ///
-    /// Retrieves the term of the last entry in our log. 
-    ///
-    fn get_last_entry_term(&self) -> u64;
-
-    ///
-    /// Rolls back log so that the most recent entry is located at |index|.
-    /// Returns this log object.
-    ///
-    /// #Panics
-    /// Panics if you try to roll back entries that are < start_index
-    /// because you should never try to roll back snapshotted entries
-    ///
-    /// #Error
-    /// Returns an error if there was an issue rolling back the log on disk
-    ///
-    fn roll_back(&mut self, index: usize) -> Result<&Log>;
-
-    ///
-    /// Returns true if the log represented by other_log_index,other_log_term is at least as
-    /// complete as this log object.
-    ///
-    /// Completeness is determined by whichever log has a later term. If both logs have the same
-    /// last commited term, then whichever log's index is larger is considered more complete
-    ///
-    fn is_other_log_valid(&self, other_log_index: usize, other_log_term: u64) -> bool;
-
-    /// Blocks until the background thread has been flushed to disk.
-    /// This must be called before transitioning away from the leader state
-    /// because otherwise the background thread could race with this thread when
-    /// writing to the log
-    ///
-    /// #Panics
-    /// Panics if the basckground thread panicked, which can happen if the file
-    /// is unwrittable for too long
-    fn flush_background_thread(&mut self);
-}
-
 #[derive(Debug, PartialEq)]
 enum BackgroundThreadMessage {
     AppendEntry (Entry),
@@ -204,10 +126,11 @@ enum BackgroundThreadReply {
 }
 
 ///
-/// Simple implementation of Log that stores all logs in memory.
-/// TODO: Rename to imply that it persists entries to disk
-///
-pub struct MemoryLog {
+/// Abstraction for a log of "commands" to apply to the client state machine,
+/// stored locally.
+/// Small wrapper over a list of Entries that handles pushing to persistent storage --
+/// eventually should also abstract away automatically snapshotting (TODO)
+pub struct Log {
     file: File,
     entries: Vec<Entry>,
     start_index: usize,
@@ -219,27 +142,10 @@ pub struct MemoryLog {
     flushed: bool
 }
 
-impl Drop for MemoryLog {
-    /// Blocks until the background thread shuts down
-    ///
-    /// #Panics
-    /// Panics if the background thread has panicked
-    fn drop (&mut self) {
-        let thread = mem::replace(&mut self.background_thread, None);
-        match thread {
-            Some(t) => {
-                self.background_thread_tx.send(BackgroundThreadMessage::Shutdown).unwrap();
-                t.join().unwrap();
-            },
-            None => {/* Nothing to shutdown*/}
-        }
-    }
-}
-
-impl MemoryLog {
-    pub fn new_from_filename(filename: &str, to_main_thread: Sender<MainThreadMessage>) -> Result<MemoryLog> {
+impl Log {
+    pub fn new_from_filename(filename: &str, to_main_thread: Sender<MainThreadMessage>) -> Result<Log> {
         let mut f = OpenOptions::new().write(true).read(true).create(true).open(filename)?;
-        let (entries, offsets) = MemoryLog::read_entries(&mut f)?;
+        let (entries, offsets) = Log::read_entries(&mut f)?;
         // start index is always 1 until we implement snapshotting
         let (to_background_thread, from_log_thread) = channel();
         let (to_log_thread, from_background_thread) = channel();
@@ -247,8 +153,8 @@ impl MemoryLog {
 
         let entry_offsets = Arc::new(Mutex::new(offsets));
         let offsets_clone = entry_offsets.clone();
-        let t = thread::spawn(move || MemoryLog::background_thread_repl(f_clone, to_main_thread, to_log_thread, from_log_thread, offsets_clone));
-        Ok(MemoryLog {
+        let t = thread::spawn(move || Log::background_thread_repl(f_clone, to_main_thread, to_log_thread, from_log_thread, offsets_clone));
+        Ok(Log {
             file: f,
             entries: entries,
             start_index: 1,
@@ -260,10 +166,183 @@ impl MemoryLog {
         })
     }
 
+    /// 
+    /// Retrieves read-only reference to an Entry in the log, specified by |index|.
+    /// Returns None if the index is out of bounds
+    ///
+    pub fn get_entry(&self, index: usize) -> Option<&Entry> {
+        if index < self.start_index {
+            return None;
+        }
+
+        self.entries.get(index - self.start_index)
+    }
+
+    /// 
+    /// Retrieves read-only reference to a slice of all Entries in the log past |start_index|.
+    /// Slice does not include |start_index|
+    ///
+    pub fn get_entries_from(&self, mut start_index: usize) -> &[Entry] {
+        if start_index < self.start_index {
+            // We should return a slice containing the full memory log
+            start_index = self.start_index - 1;
+        }
+
+        start_index -= self.start_index - 1;
+        if start_index > self.entries.len() {
+            return &[];
+        }
+
+        &self.entries[start_index ..]
+    }
+
+    ///
+    /// Appends a copy of each entry in |entries| to log. Will correctly modify
+    /// |index| field in each Entry to match its index in the log.
+    /// Returns this log object.
+    /// Blocks until these entries are persisted to disk
+    ///
+    pub fn append_entries_blocking(&mut self, entries: Vec<Entry>) -> Result<&Log> {
+        debug_assert!(self.flushed, "Attempt to syncronously push entry into unflushed log");
+        let mut start_index = self.entries.len() + self.start_index;
+        let indexed_entries = entries.into_iter().map(|mut entry| {
+            debug_assert!(entry.term > 0); // can't commit in term 0
+            entry.index = start_index;
+            start_index += 1;
+            entry
+        });
+        
+        // write the entries to disk
+        let mut writer = BufWriter::new(&self.file);
+        for entry in indexed_entries {
+            let metadata = self.file.metadata()?;
+            let cursor = metadata.len();
+            let mut builder = message::Builder::new_default();
+            entry.into_proto(&mut builder.init_root::<entry::Builder>());
+            serialize_packed::write_message(&mut writer, &builder)?;
+
+            self.entries.push(entry);
+            self.entry_offsets.lock().unwrap().push(cursor);
+        }
+
+        self.file.sync_all()?;
+        Ok(self)
+    }
+
+
+    ///
+    /// Appends a copy of |entry| to the log. Will correclty modify 
+    /// |index| field in |entry| to match its index in the log.
+    /// Returns this log object.
+    ///
+    /// |entry| will be synced to disk in the background. You must
+    /// call flush_background_thread, before attempting to do anymore
+    /// IO to the disk on this thread. Specifically you must flush
+    /// before calling roll_back or append_entries_blocking
+    ///
+    ///
+    /// #Panics
+    /// Panics if the background thread has panicked
+    ///
+    pub fn append_entry(&mut self, mut entry: Entry) -> &Log {
+        debug_assert!(entry.term > 0); // can't commit in term 0
+        entry.index = self.entries.len() + self.start_index;
+        // TODO(perf): We could wrap entry in an Arc and avoid having to make the copy here
+        self.entries.push(entry.clone());
+
+        self.background_thread_tx.send(BackgroundThreadMessage::AppendEntry(entry)).unwrap();
+
+        self.flushed = false;
+        self
+    }
+
+    ///
+    /// Retrieves the index of the last entry in our log.
+    ///
+    pub fn get_last_entry_index(&self) -> usize {
+        self.entries.len() - (self.start_index - 1)
+    }
+
+    ///
+    /// Retrieves the term of the last entry in our log. 
+    ///
+    pub fn get_last_entry_term(&self) -> u64 {
+        if self.entries.len() == 0 {
+            return 0;
+        }
+
+        self.get_entry(self.get_last_entry_index())
+            .map_or(0, |e| e.term)
+    }
+
+    ///
+    /// Rolls back log so that the most recent entry is located at |index|.
+    /// Returns this log object.
+    ///
+    /// If this operation rolls back entries that are on disk
+    /// this operation will block until the on disk log is truncated
+    ///
+    /// #Panics
+    /// * Panics if you try to roll back entries that are < start_index
+    /// because you should never try to roll back snapshotted entries
+    /// * Panics if the file on disk has been closed
+    ///
+    /// #Error
+    /// Returns an error if there was an issue rolling back the log on disk
+    ///
+    pub fn roll_back(&mut self, index: usize) -> Result<&Log> {
+        debug_assert!(self.flushed, "Attempt to roll back unflushed log");
+        let start_index = index + 1 - self.start_index;
+        if start_index >= self.entries.len() {
+            return Ok(self); // nothing to remove
+        }
+
+        self.entries.drain(start_index ..);
+
+        // we may be rolling back entries that only exist in memory
+        let mut entry_offsets = self.entry_offsets.lock().unwrap();
+        if start_index < entry_offsets.len() {
+            self.file.set_len(entry_offsets[start_index])?;
+            entry_offsets.drain(start_index ..);
+        }
+
+        Ok(self)
+    }
+
+    ///
+    /// Returns true if the log represented by other_log_index,other_log_term is at least as
+    /// complete as this log object.
+    ///
+    /// Completeness is determined by whichever log has a later term. If both logs have the same
+    /// last commited term, then whichever log's index is larger is considered more complete
+    ///
+    pub fn is_other_log_valid (&self, other_log_index: usize, other_log_term: u64) -> bool {
+        let last_log_term = self.get_last_entry_term();
+        other_log_term > last_log_term ||
+            (other_log_term == last_log_term &&
+            other_log_index >= self.get_last_entry_index())
+    }
+
+    /// Blocks until the background thread has been flushed to disk.
+    /// This must be called before transitioning away from the leader state
+    /// because otherwise the background thread could race with this thread when
+    /// writing to the log
+    ///
+    /// #Panics
+    /// Panics if the basckground thread panicked, which can happen if the file
+    /// is unwrittable for too long
+    pub fn flush_background_thread(&mut self) {
+        self.background_thread_tx.send(BackgroundThreadMessage::Flush).unwrap();
+        let message = self.background_thread_rx.recv().unwrap();
+        match message {
+            BackgroundThreadReply::Flushed => {
+                self.flushed = true;
+            }
+        }
+    }
+
     fn background_thread_repl(mut file: File, to_main_thread: Sender<MainThreadMessage>, to_log_thread: Sender<BackgroundThreadReply>,
                               from_log_thread: Receiver<BackgroundThreadMessage>, entry_offsets: Arc<Mutex<Vec<u64>>>) {
-        const MAX_RETRIES: u32 = 5; // maximum times to try writing an entry before giving up
-        let RETRY_WAIT_TIME = Duration::from_millis(50);
         loop {
             match from_log_thread.recv().unwrap() {
                 BackgroundThreadMessage::Flush => {
@@ -272,31 +351,50 @@ impl MemoryLog {
                     to_log_thread.send(BackgroundThreadReply::Flushed).unwrap();
                 },
                 BackgroundThreadMessage::AppendEntry(e) => {
-                    // TODO Move to different fn
                     // Panic if we can't write the entry after trying for MAX_RETRIES
-                    let mut success = false;
-                    for i in 0..MAX_RETRIES {
-                        match MemoryLog::write_entry_to_disk(&mut file, &e, &entry_offsets) {
-                            Ok(_) => {
-                                success = true;
-                                break;
-                            },
-                            Err(e) => {
-                                warn!("Unable to write to log file. Will retry.");
-                                thread::sleep(RETRY_WAIT_TIME * (i + 1));
-                            }
+                    let index = e.index;
+                    match Log::background_append_entry(&mut file, e, &entry_offsets) {
+                        Ok(_) => to_main_thread.send(MainThreadMessage::EntryPersisted(index)).unwrap(),
+                        Err(e) => {
+                            error!("Unable to write to log file. This is unrecoverable, and the server will shut down. {}", e);
+                            panic!("Unable to write to log file.");
                         }
-                    }
-                    if !success {
-                        error!("Unable to write to log file. This is unrecoverable, and the server will shut down.");
-                        panic!("Unable to write to log file.");
-                    } else {
-                        to_main_thread.send(MainThreadMessage::EntryPersisted(e.index));
-                    }
+                    };
                 },
                 BackgroundThreadMessage::Shutdown => break
             }
         }
+    }
+
+    /// Tries to write e to file. Puts its start offset into entry_offsets if sucessful.
+    ///
+    /// #Error
+    /// Returns an IO error if it fails to write the entry after 5 retries or if
+    /// it fails to flush the entry to disk after writing it
+    ///
+    /// #Panics
+    /// Panics if the offsets vec lock is posioned
+    fn background_append_entry(file: &mut File, e: Entry, entry_offsets: &Arc<Mutex<Vec<u64>>>) -> Result<()> {
+        const MAX_RETRIES: u32 = 5; // maximum times to try writing an entry before giving up
+        let retry_wait_time = Duration::from_millis(50);
+
+        for i in 0..MAX_RETRIES {
+            match Log::write_entry_to_disk(file, &e, &entry_offsets) {
+                Ok(_) => {
+                    break;
+                },
+                Err(e) => {
+                    if i != MAX_RETRIES - 1 {
+                        warn!("Unable to write to log file. Will retry.");
+                        thread::sleep(retry_wait_time * (i + 1));
+                    } else {
+                        return Err(e)
+                    }
+                }
+            }
+        }
+
+        file.sync_all()
     }
 
     /// Takes in a file (assumed to be pointed at EOF) and writes the given entry to the file.
@@ -305,7 +403,7 @@ impl MemoryLog {
     /// Panics if the offsets vec lock is poisioned
     ///
     fn write_entry_to_disk(file: &mut File, e: &Entry, entry_offsets: &Arc<Mutex<Vec<u64>>>) -> Result<()> {
-        let mut metadata = file.metadata()?;
+        let metadata = file.metadata()?;
         let mut writer = BufWriter::new(file);
         let cursor = metadata.len();
 
@@ -360,131 +458,19 @@ impl MemoryLog {
     }
 }
 
-impl Log for MemoryLog {
-    fn get_entry(&self, index: usize) -> Option<&Entry> {
-        if index < self.start_index {
-            return None;
-        }
-
-        self.entries.get(index - self.start_index)
-    }
-
-    fn get_entries_from(&self, mut start_index: usize) -> &[Entry] {
-        if start_index < self.start_index {
-            // We should return a slice containing the full memory log
-            start_index = self.start_index - 1;
-        }
-
-        start_index -= self.start_index - 1;
-        if start_index > self.entries.len() {
-            return &[];
-        }
-
-        &self.entries[start_index ..]
-    }
-
-    ///
-    /// Appends a copy of each entry in |entries| to log. Will correctly modify
-    /// |index| field in each Entry to match its index in the log.
-    /// Returns this log object.
-    /// Blocks until these entries are persisted to disk
-    ///
-    fn append_entries_blocking(&mut self, entries: Vec<Entry>) -> Result<&Log> {
-        debug_assert!(self.flushed, "Attempt to syncronously push entry into unflushed log");
-        let mut start_index = self.entries.len() + self.start_index;
-        let indexed_entries = entries.into_iter().map(|mut entry| {
-            debug_assert!(entry.term > 0); // can't commit in term 0
-            entry.index = start_index;
-            start_index += 1;
-            entry
-        });
-        
-        let mut writer = BufWriter::new(&self.file);
-        for entry in indexed_entries {
-            let mut metadata = self.file.metadata()?;
-            let cursor = metadata.len();
-            let mut builder = message::Builder::new_default();
-            entry.into_proto(&mut builder.init_root::<entry::Builder>());
-            serialize_packed::write_message(&mut writer, &builder)?;
-
-            self.entries.push(entry);
-            self.entry_offsets.lock().unwrap().push(cursor);
-        }
-
-        // write the entries to disk
-        Ok(self)
-    }
-
-    fn append_entry(&mut self, mut entry: Entry) -> &Log {
-        debug_assert!(entry.term > 0); // can't commit in term 0
-        entry.index = self.entries.len() + self.start_index;
-        // TODO(perf): We could wrap entry in an Arc and avoid having to make the copy here
-        self.entries.push(entry.clone());
-
-        self.background_thread_tx.send(BackgroundThreadMessage::AppendEntry(entry)).unwrap();
-
-        self.flushed = false;
-        self
-    }
-
-    fn get_last_entry_index(&self) -> usize {
-        self.entries.len() - (self.start_index - 1)
-    }
-
-    fn get_last_entry_term(&self) -> u64 {
-        if self.entries.len() == 0 {
-            return 0;
-        }
-
-        self.get_entry(self.get_last_entry_index())
-            .map_or(0, |e| e.term)
-    }
-
-    ///
-    /// Rolls back log so that the most recent entry is located at |index|.
-    /// Returns this log object.
-    ///
-    /// If this operation rolls back entries that are on disk
-    /// this operation will block until the on disk log is truncated
+impl Drop for Log {
+    /// Blocks until the background thread shuts down
     ///
     /// #Panics
-    /// Panics if you try to roll back entries that are < start_index
-    /// because you should never try to roll back snapshotted entries
-    /// Panics if the file on disk has been closed
-    ///
-    fn roll_back(&mut self, index: usize) -> Result<&Log> {
-        debug_assert!(self.flushed, "Attempt to roll back unflushed log");
-        let start_index = index + 1 - self.start_index;
-        if start_index >= self.entries.len() {
-            return Ok(self); // nothing to remove
-        }
-
-        self.entries.drain(start_index ..);
-
-        // we may be rolling back entries that only exist in memory
-        let mut entry_offsets = self.entry_offsets.lock().unwrap();
-        if start_index < entry_offsets.len() {
-            self.file.set_len(entry_offsets[start_index])?;
-            entry_offsets.drain(start_index ..);
-        }
-
-        Ok(self)
-    }
-
-    fn is_other_log_valid (&self, other_log_index: usize, other_log_term: u64) -> bool {
-        let last_log_term = self.get_last_entry_term();
-        other_log_term > last_log_term ||
-            (other_log_term == last_log_term &&
-            other_log_index >= self.get_last_entry_index())
-    }
-
-    fn flush_background_thread(&mut self) {
-        self.background_thread_tx.send(BackgroundThreadMessage::Flush).unwrap();
-        let message = self.background_thread_rx.recv().unwrap();
-        match message {
-            Flushed => {
-                self.flushed = true;
-            }
+    /// Panics if the background thread has panicked
+    fn drop (&mut self) {
+        let thread = mem::replace(&mut self.background_thread, None);
+        match thread {
+            Some(t) => {
+                self.background_thread_tx.send(BackgroundThreadMessage::Shutdown).unwrap();
+                t.join().unwrap();
+            },
+            None => {/* Nothing to shutdown*/}
         }
     }
 }
@@ -492,11 +478,9 @@ impl Log for MemoryLog {
 #[cfg(test)]
 pub mod mocks {
     use super::*;
-    use std::ops::{Deref, DerefMut};
     use std::fs;
     use rand::{thread_rng, Rng};
-    use rand::distributions::{IndependentSample, Range};
-    use std::sync::mpsc::{Receiver, Sender};
+    use std::sync::mpsc::{Receiver};
     use super::super::MainThreadMessage;
 
 
@@ -506,19 +490,19 @@ pub mod mocks {
         pub main_thread_rx: Receiver<MainThreadMessage>
     }
 
-    /// Returns a new MemoryLog and a handle to the file backing that log on disk.
+    /// Returns a new Log and a handle to the file backing that log on disk.
     /// The file will be automatically deleted when the MockLogFileHandle goes out of scope,
-    /// so take care to keep it in scope as long as the MemoryLog
-    pub fn new_mock_log() -> (MemoryLog, MockLogFileHandle) {
+    /// so take care to keep it in scope as long as the Log 
+    pub fn new_mock_log() -> (Log, MockLogFileHandle) {
         const LOG_FILENAME_LEN: usize = 20;
         let mut log_filename: String = thread_rng().gen_ascii_chars().take(LOG_FILENAME_LEN).collect();
         log_filename = String::from("/tmp/") + &log_filename;
 
         let (tx, rx) = channel();
-        (MemoryLog::new_from_filename(&log_filename, tx).unwrap(), MockLogFileHandle {name: log_filename, main_thread_rx: rx})
+        (Log::new_from_filename(&log_filename, tx).unwrap(), MockLogFileHandle {name: log_filename, main_thread_rx: rx})
     }
 
-    pub fn new_random_with_term(size: usize, term: u64) -> (MemoryLog, MockLogFileHandle) {
+    pub fn new_random_with_term(size: usize, term: u64) -> (Log, MockLogFileHandle) {
         let (mut log, _file_handle) = mocks::new_mock_log();
         log.append_entries_blocking(
             (0 .. size - 1).map(|_| random_entry_with_term(term)).collect()).unwrap();
@@ -527,7 +511,7 @@ pub mod mocks {
 
     impl Drop for MockLogFileHandle {
         fn drop (&mut self) {
-            //fs::remove_file(&self.name).unwrap();
+            fs::remove_file(&self.name).unwrap();
         }
     }
 }
@@ -538,13 +522,13 @@ pub mod mocks {
 mod tests {
     use super::super::super::rpc::client::Rpc;
     use super::super::super::raft_capnp::entry;
-    use super::{Log, MemoryLog, random_entry, random_entry_with_term, random_entries_with_term};
+    use super::{Log, random_entry, random_entry_with_term, random_entries_with_term};
     use super::Entry;
     use super::mocks::{new_mock_log, MockLogFileHandle};
     use super::super::MainThreadMessage;
     use std::sync::mpsc::channel;
     
-    fn create_filled_log (length: usize) -> (MemoryLog, MockLogFileHandle) {
+    fn create_filled_log (length: usize) -> (Log, MockLogFileHandle) {
         let (mut log, _file_handle) = new_mock_log();
         log.append_entries_blocking( vec![random_entry(); length] ).unwrap();
         (log, _file_handle)
@@ -553,33 +537,42 @@ mod tests {
     #[test]
     /// Makes sure we return None if the index is out of the log
     fn get_entry_out_of_index() {
-        let (mut log, _file_handle) = new_mock_log();
-        log.append_entry(random_entry());
-        assert!(log.get_entry(2).is_none());
+        let (l, _file_handle) = new_mock_log();
+        { // _file_handle must outlive log
+            let mut log = l;
+            log.append_entry(random_entry());
+            assert!(log.get_entry(2).is_none());
+        }
     }
 
     #[test]
     fn index_0_is_none() {
-        let (mut log, _file_handle) = new_mock_log();
-        assert!(log.get_entry(0).is_none());
-        log.append_entry(random_entry());
-        assert!(log.get_entry(0).is_none());
+        let (l, _file_handle) = new_mock_log();
+        { // _file_handle must outlive log
+            let mut log = l;
+            assert!(log.get_entry(0).is_none());
+            log.append_entry(random_entry());
+            assert!(log.get_entry(0).is_none());
+        }
     }
 
     #[test]
     /// Tests that simple append and get works for a two-element array.
     fn append_get_simple() {
-        let (mut log, _file_handle) = new_mock_log();
-        let entry1 = random_entry();
-        let entry2 = random_entry();
+        let (l, _file_handle) = new_mock_log();
+        { // _file_handle must outlive log
+            let mut log = l;
+            let entry1 = random_entry();
+            let entry2 = random_entry();
 
-        // Append operations
-        log.append_entry(entry1.clone());
-        log.append_entry(entry2.clone());
+            // Append operations
+            log.append_entry(entry1.clone());
+            log.append_entry(entry2.clone());
 
-        // Data should be the same
-        assert_eq!(entry1.get_data(), log.get_entry(1).unwrap().get_data());
-        assert_eq!(entry2.get_data(), log.get_entry(2).unwrap().get_data());
+            // Data should be the same
+            assert_eq!(entry1.get_data(), log.get_entry(1).unwrap().get_data());
+            assert_eq!(entry2.get_data(), log.get_entry(2).unwrap().get_data());
+        }
     }
 
     #[test]
@@ -641,7 +634,7 @@ mod tests {
         let length = 10;
         let (mut log, _file_handle) = create_filled_log(length);
         let new_length = 5;
-        log.roll_back(new_length);
+        log.roll_back(new_length).unwrap();
         // make sure log has been rolled back!
         assert_eq!(log.get_last_entry_index(), new_length);
     }
@@ -649,36 +642,45 @@ mod tests {
     #[test]
     fn roll_back_works_with_nothing_to_roll_back() {
         let (mut log, _file_handle) = new_mock_log();
-        log.roll_back(1);
+        log.roll_back(1).unwrap();
     }
 
     #[test]
     fn is_other_log_valid_rejects_previous_terms() {
-        let (mut log, _file_handle) = new_mock_log();
-        log.append_entry(random_entry_with_term(1));
-        log.append_entry(random_entry_with_term(2));
-        assert!(!log.is_other_log_valid(3, 1));
+        let (l, _file_handle) = new_mock_log();
+        { // _file_handle must outlive log
+            let mut log = l;
+            log.append_entry(random_entry_with_term(1));
+            log.append_entry(random_entry_with_term(2));
+            assert!(!log.is_other_log_valid(3, 1));
+        }
     }
 
     #[test]
     fn is_other_log_valid_rejects_lower_indices() {
-        let (mut log, _file_handle) = new_mock_log();
-        log.append_entry(random_entry_with_term(1));
-        log.append_entry(random_entry_with_term(1));
-        log.append_entry(random_entry_with_term(2));
-        assert!(!log.is_other_log_valid(1, 2));
+        let (l, _file_handle) = new_mock_log();
+        { // _file_handle must outlive log
+            let mut log = l;
+            log.append_entry(random_entry_with_term(1));
+            log.append_entry(random_entry_with_term(1));
+            log.append_entry(random_entry_with_term(2));
+            assert!(!log.is_other_log_valid(1, 2));
+        }
     }
 
     #[test]
     fn is_other_log_valid_accepts_same_index() {
-        let (mut log, _file_handle) = new_mock_log();
-        log.append_entry(random_entry_with_term(1));
-        assert!(log.is_other_log_valid(1, 1));
+        let (l, _file_handle) = new_mock_log();
+        { // _file_handle must outlive log
+            let mut log = l;
+            log.append_entry(random_entry_with_term(1));
+            assert!(log.is_other_log_valid(1, 1));
+        }
     }
 
     #[test]
     fn is_other_log_valid_accepts_with_empty_log() {
-        let (mut log, _file_handle) = new_mock_log();
+        let (log, _file_handle) = new_mock_log();
         assert!(log.is_other_log_valid(0, 0));
     }
 
@@ -703,8 +705,8 @@ mod tests {
         log.append_entry(entry.clone());
         log.flush_background_thread();
 
-        let (tx, rx) = channel();
-        let log_from_disk = MemoryLog::new_from_filename(&file_handle.name, tx).unwrap();
+        let (tx, _rx) = channel();
+        let log_from_disk = Log::new_from_filename(&file_handle.name, tx).unwrap();
         assert_eq!(log_from_disk.get_last_entry_index(), 1);
         assert_eq!(*log_from_disk.get_entry(1).unwrap(), entry);
     }
@@ -717,8 +719,8 @@ mod tests {
         let msg = file_handle.main_thread_rx.recv().unwrap();
         assert!(matches!(msg, MainThreadMessage::EntryPersisted(1)));
 
-        let (tx, rx) = channel();
-        let log_from_disk = MemoryLog::new_from_filename(&file_handle.name, tx).unwrap();
+        let (tx, _rx) = channel();
+        let log_from_disk = Log::new_from_filename(&file_handle.name, tx).unwrap();
         assert_eq!(log_from_disk.get_last_entry_index(), 1);
         assert_eq!(*log_from_disk.get_entry(1).unwrap(), entry);
     }
@@ -729,8 +731,8 @@ mod tests {
         let entries = random_entries_with_term(8, 2);
         log.append_entries_blocking(entries.clone()).unwrap();
 
-        let (tx, rx) = channel();
-        let log_from_disk = MemoryLog::new_from_filename(&file_handle.name, tx).unwrap();
+        let (tx, _rx) = channel();
+        let log_from_disk = Log::new_from_filename(&file_handle.name, tx).unwrap();
         assert_eq!(log_from_disk.get_last_entry_index(), 8);
         assert_eq!(log_from_disk.get_entries_from(0).len(), entries.len());
         assert_eq!(log_from_disk.get_entries_from(0), &entries[..]);

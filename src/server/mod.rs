@@ -25,7 +25,7 @@ use std::mem;
 use std::cmp::min;
 use std::collections::HashMap;
 
-use self::log::{Log, MemoryLog, Entry};
+use self::log::{Log, Entry};
 use self::state_machine::{StateMachineMessage, state_machine_thread, StateMachineHandle};
 use self::peer::{Peer, PeerHandle, PeerThreadMessage, RequestVoteMessage};
 use self::state_file::StateFile;
@@ -150,7 +150,7 @@ impl ServerState {
 pub struct Server {
     // TODO: Rename properties?
     state: Arc<Mutex<ServerState>>,
-    log: Arc<Mutex<MemoryLog>>,
+    log: Arc<Mutex<Log>>,
     info: ServerInfo
 }
 
@@ -371,7 +371,7 @@ impl Server {
         let mut state_file = StateFile::new_from_filename(&config.state_filename)?;
         let persisted_state = state_file.get_state()?;
         let (last_persisted_index, log) = {
-            let l = MemoryLog::new_from_filename(config.log_filename, tx.clone())?;
+            let l = Log::new_from_filename(config.log_filename, tx.clone())?;
             (l.get_last_entry_index(), Arc::new(Mutex::new(l)))
         };
         let state = Arc::new(Mutex::new(ServerState {
@@ -608,7 +608,7 @@ impl Server {
 
 struct RequestVoteHandler {
     state: Arc<Mutex<ServerState>>,
-    log: Arc<Mutex<MemoryLog>>,
+    log: Arc<Mutex<Log>>,
     to_state_machine: Arc<Mutex<Sender<StateMachineMessage>>>,
 }
 
@@ -681,11 +681,14 @@ impl RpcObject for RequestVoteHandler {
 
 struct AppendEntriesHandler {
     state: Arc<Mutex<ServerState>>,
-    log: Arc<Mutex<MemoryLog>>,
+    log: Arc<Mutex<Log>>,
     to_state_machine: Arc<Mutex<Sender<StateMachineMessage>>>,
 }
 
 impl AppendEntriesHandler {
+    ///# Panics 
+    /// * Panics if there are any errors with Disk IO
+    /// * Panics if the maint hread or the state machine thread have panicked
     fn handle_message(&self, message: append_entries::Reader, reply: &mut append_entries_reply::Builder) {
         let ref mut state = self.state.lock().unwrap();
         let current_term = state.current_term;
@@ -721,8 +724,8 @@ impl AppendEntriesHandler {
             .map(Entry::from_proto).collect();
         let commit_index = { // Append entries to log.
             let mut log = self.log.lock().unwrap();
-            log.roll_back(prev_log_index);
-            log.append_entries_blocking(entries);
+            log.roll_back(prev_log_index).unwrap();
+            log.append_entries_blocking(entries).unwrap();
             min(log.get_last_entry_index(), message.get_leader_commit() as usize)
         };
         debug_assert!(matches!(state.current_state, State::Follower));
@@ -769,11 +772,13 @@ impl ClientRequestHandler {
         -> Result<raft_command::Reply, RaftError>
     {
         let (to_me, from_sm) = channel();
-        self.to_state_machine.lock().unwrap().send(
-            StateMachineMessage::Command {
-                command: op,
-                response_channel: to_me,
-            }).unwrap();
+        {
+            self.to_state_machine.lock().unwrap().send(
+                StateMachineMessage::Command {
+                    command: op,
+                    response_channel: to_me,
+                }).unwrap();
+        }
         from_sm.recv().unwrap()
     }
 
@@ -785,11 +790,13 @@ impl ClientRequestHandler {
         -> Result<raft_query::Reply, RaftError>
     {
         let (to_me, from_sm) = channel();
-        self.to_state_machine.lock().unwrap().send(
-            StateMachineMessage::Query {
-                query: op,
-                response_channel: to_me,
-            }).unwrap();
+        {
+            self.to_state_machine.lock().unwrap().send(
+                StateMachineMessage::Query {
+                    query: op,
+                    response_channel: to_me,
+                }).unwrap();
+        }
         from_sm.recv().unwrap()
 
     }
@@ -829,7 +836,7 @@ mod tests {
                 State, generate_election_timeout, update_commit_index,
                 StateMachineMessage,
                 handle_request_vote_reply};
-    use super::log::{MemoryLog, random_entries_with_term};
+    use super::log::{Log, random_entries_with_term};
     use super::log::mocks::{new_mock_log, MockLogFileHandle};
     use std::time::{Duration, Instant};
     use std::sync::mpsc::{channel, Receiver};
@@ -843,7 +850,7 @@ mod tests {
         state_machine_rx: Receiver<StateMachineMessage>,
         server: Server,
         state_filename: String,
-        log_file: MockLogFileHandle
+        _log_file: MockLogFileHandle
     }
     
     impl Drop for MockServer {
@@ -859,7 +866,7 @@ mod tests {
         state_filename = String::from("/tmp/") + &state_filename;
 
         let (mock_log, log_file_handle) = new_mock_log();
-        let log: Arc<Mutex<MemoryLog>> = Arc::new(Mutex::new(mock_log));
+        let log: Arc<Mutex<Log>> = Arc::new(Mutex::new(mock_log));
         let state = Arc::new(Mutex::new(ServerState {
             current_state: State::Follower,
             current_term: 0,
@@ -889,7 +896,7 @@ mod tests {
         };
         MockServer {peer_rx: rx, state_machine_rx: rx1, server: server,
                     state_filename: state_filename,
-                    log_file: log_file_handle}
+                    _log_file: log_file_handle}
     }
 
     /// Makes sure peer threads receive appendEntries msesages
@@ -948,13 +955,10 @@ mod tests {
     fn mock_replicate_two_entries() -> MockServer {
         const NUM_PEERS: u64 = 4;
         let mut mock_server = mock_server(NUM_PEERS);
-        {
-            let state = mock_server.server.state.lock().unwrap();
-            mock_server.server.info.peers[0].match_index = 2;
-            mock_server.server.info.peers[1].match_index = 1;
-            mock_server.server.info.peers[2].match_index = 2;
-            mock_server.server.info.peers[3].match_index = 3;
-        }
+        mock_server.server.info.peers[0].match_index = 2;
+        mock_server.server.info.peers[1].match_index = 1;
+        mock_server.server.info.peers[2].match_index = 2;
+        mock_server.server.info.peers[3].match_index = 3;
 
         mock_server
     }
@@ -1153,7 +1157,6 @@ mod tests {
         use super::super::peer::{PeerThreadMessage};
         use super::super::super::common::{raft_command};
         use super::super::StateFile;
-        use super::super::log::Log;
 
         #[test]
         fn transition_to_candidate_normal() {
@@ -1166,7 +1169,7 @@ mod tests {
             assert_eq!(state.voted_for, None);
             assert!(matches!(state.current_state, State::Follower));
 
-            state.transition_to_candidate(OUR_ID);
+            state.transition_to_candidate(OUR_ID).unwrap();
             match state.current_state {
                 State::Candidate{num_votes, ..} => {
                     assert_eq!(state.current_term, 1);
@@ -1185,7 +1188,7 @@ mod tests {
             let s = &mut mock_server.server;
             let ref mut state = s.state.lock().unwrap();
             // we must be a candidate before we can become a leader
-            state.transition_to_candidate(OUR_ID);
+            state.transition_to_candidate(OUR_ID).unwrap();
             state.transition_to_leader(&mut s.info, s.log.clone());
             assert!(matches!(state.current_state, State::Leader{..}));
 
@@ -1218,7 +1221,7 @@ mod tests {
             let s = &mut mock_server.server;
             let ref mut state = s.state.lock().unwrap();
 
-            state.transition_to_candidate(OUR_ID);
+            state.transition_to_candidate(OUR_ID).unwrap();
             assert_eq!(state.current_term, 1);
             assert_eq!(state.voted_for, Some(OUR_ID));
             state.transition_to_follower(1, &s.info.state_machine.tx, Some(OUR_ID), s.log.clone()).unwrap();
@@ -1235,7 +1238,7 @@ mod tests {
             let mut mock_server = mock_server(NUM_PEERS);
             let s = &mut mock_server.server;
             let ref mut state = s.state.lock().unwrap();
-            state.transition_to_candidate(OUR_ID);
+            state.transition_to_candidate(OUR_ID).unwrap();
             assert_eq!(state.current_term, 1);
             assert_eq!(state.voted_for, Some(OUR_ID));
             state.transition_to_follower(NEW_TERM, &s.info.state_machine.tx, None, s.log.clone()).unwrap();
@@ -1246,7 +1249,6 @@ mod tests {
 
         #[test]
         fn transition_to_follower_persists_state() {
-            const OUR_ID: u64 = 1;
             const NUM_PEERS: u64 = 4;
             let mut mock_server = mock_server(NUM_PEERS);
             let s = &mut mock_server.server;
@@ -1261,7 +1263,6 @@ mod tests {
 
         #[test]
         fn transition_to_follower_persists_vote() {
-            const OUR_ID: u64 = 1;
             const NUM_PEERS: u64 = 4;
             const VOTE_ID: u64 = 3;
             let mut mock_server = mock_server(NUM_PEERS);
@@ -1283,7 +1284,7 @@ mod tests {
             let s = &mut mock_server.server;
 
             let mut state = s.state.lock().unwrap();
-            state.transition_to_candidate(1);
+            state.transition_to_candidate(1).unwrap();
 
             let mut state_file = StateFile::new_from_filename(&mock_server.state_filename).unwrap();
             let state = state_file.get_state().unwrap();

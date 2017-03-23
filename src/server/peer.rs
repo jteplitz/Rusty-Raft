@@ -289,13 +289,11 @@ mod tests {
     use capnp::{message, serialize_packed};
     use capnp::serialize::OwnedSegments;
     use std::io::BufReader;
-    use std::net::SocketAddr;
-    use std::str::FromStr;
     use std::sync::mpsc::{channel};
     use std::sync::{Arc, Mutex};
     use super::*;
     use super::super::constants;
-    use super::super::log::{Entry, random_entry_with_term, random_entries_with_term, Log, MemoryLog};
+    use super::super::log::{Entry, random_entry_with_term, random_entries_with_term, Log};
     use super::super::log::mocks::{new_mock_log, new_random_with_term};
     use super::super::super::raft_capnp::{request_vote, request_vote_reply,
                                           append_entries, append_entries_reply};

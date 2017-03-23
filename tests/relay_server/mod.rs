@@ -19,7 +19,7 @@
 //!
 
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap};
 use std::net::{SocketAddr, TcpListener, TcpStream, Shutdown};
 use std::thread;
 use std::sync::{Arc, Mutex};
@@ -97,17 +97,6 @@ impl RelayServer {
         socket_info.online = true;
     }
 
-    /// Toggles a mapping online or offline.
-    ///
-    /// #Panics
-    /// Panics if the from_address is not an existing mapping
-    /// Also panics if any of the server's background threads have panicked.
-    pub fn set_address_active(&mut self, from_address: SocketAddr, online: bool) {
-        let mut addrs = self.addrs.lock().unwrap();
-        let addr_info = addrs.get_mut(&from_address).unwrap();
-        addr_info.online = online;
-    }
-
     /// Runs in a background thread, and relays messages according to the hash map.
     fn relay_messages(listener: TcpListener, addrs: Arc<Mutex<HashMap<SocketAddr, SocketInfo>>>) {
         let local_addr = listener.local_addr().unwrap();
@@ -120,7 +109,7 @@ impl RelayServer {
                             if info.online {
                                 match RelayServer::relay_stream_to_addr(stream, info.to_addr.unwrap()) {
                                     Ok(_) => {},
-                                    Err(e) => {
+                                    Err(_) => {
                                         // this is a fairly common error in our tests because it
                                         // just means the receiver has failed so we drop it
                                         // silently for now

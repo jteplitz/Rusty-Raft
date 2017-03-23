@@ -232,18 +232,3 @@ impl StateMachine for RaftHashMap {
             })
     }
 }
-
-// fn it_serializes_ops_correctly () {
-//     let key = String::from("abcd efgh");
-//     let key2 = key.clone();
-//     let val = String::from("the alpHabet!");
-//     let val2 = val.clone();
-//     let mut raft_map = RaftHashMap { map: HashMap::new() };
-//     let command =json::encode(&Put {key:key, value:val}).unwrap(); 
-//     assert!(raft_map.command(&command.as_bytes()).is_ok());
-//     let result = raft_map.query(&key2.as_bytes());
-//     assert!(result.is_ok());
-//     let result_val = str::from_utf8(&result.unwrap()).unwrap().to_string();
-//     assert_eq!(result_val, val2);
-// }
-

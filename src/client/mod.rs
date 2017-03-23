@@ -343,7 +343,7 @@ mod tests {
     fn client_request_redirects_to_leader<F>(chain_size: u64, db_op: F)
     where F: Fn(&mut RaftConnection) -> () {
         // Create leader ...
-        let (leader_port, server) = start_leader_client_rpc_handler();
+        let (leader_port, _server) = start_leader_client_rpc_handler();
         let leader_socket = format!("{}:{}", LOCALHOST, leader_port);
         let mut chain_port = leader_port;
         let mut cluster = HashMap::new();

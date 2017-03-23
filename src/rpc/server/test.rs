@@ -173,7 +173,7 @@ fn it_sends_back_the_result() {
     let mut writer = BufWriter::new(client.try_clone().unwrap());
     serialize_packed::write_message(&mut writer, &rpc_message).unwrap();
     writer.flush().unwrap();
-    client.shutdown(Shutdown::Write);
+    client.shutdown(Shutdown::Write).unwrap();
 
     // create a response message to store the response value and metadata
     let mut reader = BufReader::new(client);
@@ -194,7 +194,7 @@ fn it_shutsdown_when_dropped() {
     {
         // ensure the server can accept connections before shutting down
         let mut client = TcpStream::connect(("localhost", port)).unwrap();
-        client.shutdown(Shutdown::Write);
+        client.shutdown(Shutdown::Write).unwrap();
         let mut buf = Vec::new();
         client.read_to_end(&mut buf).unwrap();
     }
@@ -218,8 +218,8 @@ fn it_shutsdown_gracefully() {
     let (tx, rx) = channel();
     // move the server into a background thread that immediatly tries to drop it
     thread::spawn(move || {
-        tx.clone().send(()).unwrap();
-        server;
+        let _s = server;
+        tx.send(()).unwrap();
     });
 
     // wait for background thread to spawn
@@ -232,7 +232,7 @@ fn it_shutsdown_gracefully() {
     let mut writer = BufWriter::new(client.try_clone().unwrap());
     serialize_packed::write_message(&mut writer, &rpc_message).unwrap();
     writer.flush().unwrap();
-    client.shutdown(Shutdown::Write);
+    client.shutdown(Shutdown::Write).unwrap();
     let mut buf = Vec::new();
     client.read_to_end(&mut buf).unwrap();
 }

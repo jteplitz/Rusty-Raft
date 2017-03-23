@@ -1,5 +1,5 @@
 use std::fs::File;
-use std::io::{Result, SeekFrom, Error, ErrorKind, Read, BufReader, Seek, BufRead, Cursor, Write};
+use std::io::{Result, SeekFrom, Error, ErrorKind, Read, BufReader, Seek, BufRead, Write};
 use std::fs::OpenOptions;
 
 const VOTED_FOR_NONE: &'static str = "NONE";
@@ -104,7 +104,7 @@ impl StateFile {
         .and_then(|_| {
             self.f.sync_all()
         })
-        .map(|s| {
+        .map(|_| {
             self.state = Some(state);
         })
     }
@@ -148,53 +148,58 @@ impl StateFile {
     }
 }
 
-#[test]
-fn read_term_reads_term() {
-    let term_str = Cursor::new("64\n");
-    let mut reader = BufReader::new(term_str);
-    let term = StateFile::read_term(&mut reader).unwrap();
+#[cfg(test)]
+mod test {
+    use super::*;
+    use std::io::{Cursor};
+    #[test]
+    fn read_term_reads_term() {
+        let term_str = Cursor::new("64\n");
+        let mut reader = BufReader::new(term_str);
+        let term = StateFile::read_term(&mut reader).unwrap();
 
-    assert_eq!(term, 64);
-}
+        assert_eq!(term, 64);
+    }
 
-#[test]
-fn read_voted_for_reads_voted_for() {
-    let voted_for_str  = Cursor::new("8\n");
-    let mut reader = BufReader::new(voted_for_str);
-    let voted_for = StateFile::read_voted_for(&mut reader).unwrap();
+    #[test]
+    fn read_voted_for_reads_voted_for() {
+        let voted_for_str  = Cursor::new("8\n");
+        let mut reader = BufReader::new(voted_for_str);
+        let voted_for = StateFile::read_voted_for(&mut reader).unwrap();
 
-    assert_eq!(voted_for.unwrap(), 8);
-}
+        assert_eq!(voted_for.unwrap(), 8);
+    }
 
-#[test]
-fn read_voted_for_reads_none() {
-    let voted_for_str  = Cursor::new(String::from(VOTED_FOR_NONE) + "\n");
-    let mut reader = BufReader::new(voted_for_str);
-    let voted_for = StateFile::read_voted_for(&mut reader).unwrap();
+    #[test]
+    fn read_voted_for_reads_none() {
+        let voted_for_str  = Cursor::new(String::from(VOTED_FOR_NONE) + "\n");
+        let mut reader = BufReader::new(voted_for_str);
+        let voted_for = StateFile::read_voted_for(&mut reader).unwrap();
 
-    assert!(voted_for.is_none());
-}
+        assert!(voted_for.is_none());
+    }
 
-#[test]
-fn state_serializes_and_deserializes() {
-    let state = State {term: 8, voted_for: Some(12)};
-    let state_cursor = Cursor::new(state.serialize());
-    let mut reader = BufReader::new(state_cursor);
+    #[test]
+    fn state_serializes_and_deserializes() {
+        let state = State {term: 8, voted_for: Some(12)};
+        let state_cursor = Cursor::new(state.serialize());
+        let mut reader = BufReader::new(state_cursor);
 
-    let deserialized_term = StateFile::read_term(&mut reader).unwrap();
-    let deserialized_voted_for = StateFile::read_voted_for(&mut reader).unwrap();
+        let deserialized_term = StateFile::read_term(&mut reader).unwrap();
+        let deserialized_voted_for = StateFile::read_voted_for(&mut reader).unwrap();
 
-    assert_eq!(State {term: deserialized_term, voted_for: deserialized_voted_for}, state);
-}
+        assert_eq!(State {term: deserialized_term, voted_for: deserialized_voted_for}, state);
+    }
 
-#[test]
-fn state_serializes_and_deserializes_none_voted_for() {
-    let state = State {term: 8, voted_for: None};
-    let state_cursor = Cursor::new(state.serialize());
-    let mut reader = BufReader::new(state_cursor);
+    #[test]
+    fn state_serializes_and_deserializes_none_voted_for() {
+        let state = State {term: 8, voted_for: None};
+        let state_cursor = Cursor::new(state.serialize());
+        let mut reader = BufReader::new(state_cursor);
 
-    let deserialized_term = StateFile::read_term(&mut reader).unwrap();
-    let deserialized_voted_for = StateFile::read_voted_for(&mut reader).unwrap();
+        let deserialized_term = StateFile::read_term(&mut reader).unwrap();
+        let deserialized_voted_for = StateFile::read_voted_for(&mut reader).unwrap();
 
-    assert_eq!(State {term: deserialized_term, voted_for: deserialized_voted_for}, state);
+        assert_eq!(State {term: deserialized_term, voted_for: deserialized_voted_for}, state);
+    }
 }
