@@ -754,11 +754,13 @@ impl ClientRequestHandler {
         -> Result<raft_command::Reply, RaftError>
     {
         let (to_me, from_sm) = channel();
-        self.to_state_machine.lock().unwrap().send(
-            StateMachineMessage::Command {
-                command: op,
-                response_channel: to_me,
-            }).unwrap();
+        {
+            self.to_state_machine.lock().unwrap().send(
+                StateMachineMessage::Command {
+                    command: op,
+                    response_channel: to_me,
+                }).unwrap();
+        }
         from_sm.recv().unwrap()
     }
 
@@ -770,11 +772,13 @@ impl ClientRequestHandler {
         -> Result<raft_query::Reply, RaftError>
     {
         let (to_me, from_sm) = channel();
-        self.to_state_machine.lock().unwrap().send(
-            StateMachineMessage::Query {
-                query: op,
-                response_channel: to_me,
-            }).unwrap();
+        {
+            self.to_state_machine.lock().unwrap().send(
+                StateMachineMessage::Query {
+                    query: op,
+                    response_channel: to_me,
+                }).unwrap();
+        }
         from_sm.recv().unwrap()
 
     }
