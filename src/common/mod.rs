@@ -1,6 +1,6 @@
 pub mod constants;
 use std::collections::HashMap;
-use std::net::SocketAddr;
+use std::net::{SocketAddr, ToSocketAddrs};
 use std::time::Duration;
 use std::io::{Error as IoError};
 use raft_capnp::{session_info};
@@ -8,15 +8,16 @@ use raft_capnp::{session_info};
 #[derive(Debug, Clone, PartialEq)]
 pub enum RaftError { 
     ClientError(String),      // Error defined by client.
+    NotLeader(Option<u64>),   // I'm not the leader; give leader's id
     IoError(String),
-    NotLeader(Option<SocketAddr>),   // I'm not the leader; give leader id
                               // if we know it.
-                              // TODO: actually keep track of the leader
     RpcError(String),
+    Timeout,
     SessionError,
     Unknown,
 }
 
+// TODO: None of the deserialization in this file should call unwrap
 /// 
 /// High-level abstraction for message types:
 ///
@@ -38,14 +39,15 @@ pub enum RaftError {
 /// `raft_command` Request/Reply are input/output types for |RaftStateMachine::command|
 ///
 pub mod raft_command {
-    use super::{SessionInfo};
+    use super::{SessionInfo, raft_server};
     use super::super::raft_capnp::raft_command as proto;
+    use std::net::SocketAddr;
 
     #[derive(Clone, Debug, PartialEq)]
     pub enum Request {
         StateMachineCommand { data: Vec<u8>, session: SessionInfo },
         OpenSession (u64),
-        SetConfig,
+        SetConfig (Vec<(u64, SocketAddr)>),
         Noop,
     }
 
@@ -81,7 +83,7 @@ pub mod raft_command {
             Request::StateMachineCommand{..} => 
                 Reply::StateMachineCommand,
             Request::OpenSession(_) => Reply::OpenSession,
-            Request::SetConfig => Reply::SetConfig,
+            Request::SetConfig(_) => Reply::SetConfig,
             Request::Noop => Reply::Noop
         }
     }
@@ -89,7 +91,6 @@ pub mod raft_command {
     /// 
     /// Serialization to and from proto.
     ///
-
     pub fn request_to_proto(command: Request, builder: &mut proto::Builder){
         match command {
             Request::StateMachineCommand { data, session } => {
@@ -97,12 +98,19 @@ pub mod raft_command {
                 command.set_data(&data);
                 session.into_proto(&mut command.init_session());
             },
-            Request::OpenSession(client_id) =>builder.set_open_session(client_id),
-            Request::SetConfig => builder.set_set_config(()),
+            Request::OpenSession(client_id) => builder.set_open_session(client_id),
+            Request::SetConfig(servers) => {
+                let mut proto_servers = builder.borrow().init_set_config(servers.len() as u32);
+                for (i, server) in servers.into_iter().enumerate() {
+                    let server_builder = proto_servers.borrow().get(i as u32);
+                    raft_server::to_proto(server, server_builder);
+                }
+            }
             Request::Noop => builder.set_noop(()),
         }
     }
 
+    // TODO: Should return a result instead of unwrapping
     pub fn request_from_proto(proto: proto::Reader) -> Request {
         match proto.which().unwrap() {
             proto::StateMachineCommand(command) => {
@@ -113,7 +121,13 @@ pub mod raft_command {
                 }
             },
             proto::OpenSession(client_id) => Request::OpenSession(client_id),
-            proto::SetConfig(_) => Request::SetConfig,
+            proto::SetConfig(config) => {
+                let servers = config.unwrap().iter()
+                    .map(|s| raft_server::from_proto(s).unwrap())
+                    .collect::<Vec<(u64, SocketAddr)>>();
+
+                Request::SetConfig(servers)
+            },
             proto::Noop(_) => Request::Noop,
         }
     }
@@ -182,56 +196,43 @@ pub mod raft_query {
 
     #[derive(Clone, Debug, PartialEq)]
     pub enum Request {
-        StateMachineQuery ( Vec<u8> ),
-        GetConfig,
+        StateMachineQuery ( Vec<u8> )
     }
 
     #[derive(Clone, Debug, PartialEq)]
     pub enum Reply {
-        StateMachineQuery ( Vec<u8> ),
-        GetConfig ( Vec<u8> ),
+        StateMachineQuery ( Vec<u8> )
     }
 
     #[cfg(test)]
     pub fn successful_reply_for(request: Request) -> Reply {
         match request {
-            Request::StateMachineQuery(_) => Reply::StateMachineQuery(vec![]),
-            Request::GetConfig => Reply::GetConfig(vec![]),
+            Request::StateMachineQuery(_) => Reply::StateMachineQuery(vec![])
         }
     }
 
     pub fn request_from_proto(proto: proto::Reader) -> Request {
-        match proto.which().unwrap() {
-            proto::StateMachineQuery(query) => {
-                Request::StateMachineQuery(query.unwrap().to_vec())
-            },
-            proto::GetConfig(_) => Request::GetConfig,
-        }
+        Request::StateMachineQuery(proto.get_state_machine_query().unwrap().to_vec())
     }
 
     pub fn request_to_proto(query: Request, builder: &mut proto::Builder){
         match query {
             Request::StateMachineQuery(data) => {
                 builder.set_state_machine_query(&data);
-            },
-            Request::GetConfig => builder.set_get_config(()),
+            }
         }
     }
 
     pub fn reply_to_proto(reply: Reply, builder: &mut proto::reply::Builder) {
         match reply {
-            Reply::StateMachineQuery(data) => builder.set_state_machine_query(&data),
-            Reply::GetConfig(data) => builder.set_get_config(&data),
+            Reply::StateMachineQuery(data) => {
+                builder.set_state_machine_query(&data);
+            }
         }
     }
 
     pub fn reply_from_proto(proto: &mut proto::reply::Reader) -> Reply {
-        match proto.which().unwrap() {
-            proto::reply::StateMachineQuery(data) =>
-                Reply::StateMachineQuery(data.unwrap().to_vec()),
-            proto::reply::GetConfig(data) =>
-                Reply::GetConfig(data.unwrap().to_vec()),
-        }
+        Reply::StateMachineQuery(proto.get_state_machine_query().unwrap().to_vec())
     }
 
     #[cfg(test)]
@@ -282,28 +283,58 @@ pub mod raft_query {
     }
 }
 
+/// Utility functions for serializing and deserializing a raft_server
+mod raft_server {
+    use super::super::raft_capnp::raft_server as proto;
+    use capnp::{Result, Error, ErrorKind};
+    use std::net::{SocketAddr};
+    use std::str::FromStr;
+
+    /// Deserializes a raft server from a proto into an id socket_addr tuple
+    pub fn from_proto(proto: proto::Reader) -> Result<(u64, SocketAddr)> {
+        Ok((proto.get_id(), deserialize_addr(proto.get_addr()?)?))
+    }
+
+    pub fn to_proto(server: (u64, SocketAddr), mut proto: proto::Builder) {
+        proto.set_id(server.0);
+        proto.set_addr(&serialize_addr(server.1));
+    }
+
+
+    fn deserialize_addr(addr: &str) -> Result<SocketAddr> {
+        SocketAddr::from_str(addr)
+            .map_err(|_| Error {kind: ErrorKind::Failed, description: String::from("Invalid address for raft server")})
+    }
+
+    fn serialize_addr(addr: SocketAddr) -> String {
+        addr.to_string()
+    }
+}
+
 ///
 /// `client_command` Request/Reply are for the RPC between main thread's
 /// |ClientHandler| and the client's |RaftConnection|, which pass ClientRequest
 /// protobufs between each other.
 ///
 pub mod client_command {
-    use super::{raft_command, raft_query, RaftError};
-    use super::super::raft_capnp::{client_request as proto, raft_error};
+    use super::{raft_command, raft_query, raft_server, RaftError};
+    use super::super::raft_capnp::{client_request as proto, raft_error, not_leader};
     use std::net::SocketAddr;
-    use std::str::FromStr;
 
     #[derive(Clone, Debug, PartialEq)]
     pub enum Request {
         Command(raft_command::Request),
         Query(raft_query::Request),
-        Unknown,
+        AddServer((u64, SocketAddr)),
+        RemoveServer((u64, SocketAddr))
     }
 
     #[derive(Clone, Debug, PartialEq)]
     pub enum Reply {
         Command(raft_command::Reply),
         Query(raft_query::Reply),
+        AddServer,
+        RemoveServer
     }
 
     pub fn request_from_proto(proto: proto::Reader) -> Request {
@@ -316,7 +347,14 @@ pub mod client_command {
                 Request::Query(
                     raft_query::request_from_proto(raft_query.unwrap()))
             },
-            proto::Unknown(_) => Request::Unknown,
+            proto::AddServer(raft_server) => {
+                Request::AddServer(
+                    raft_server::from_proto(raft_server.unwrap()).unwrap())
+            },
+            proto::RemoveServer(raft_server) => {
+                Request::RemoveServer(
+                    raft_server::from_proto(raft_server.unwrap()).unwrap())
+            }
         }
     }
 
@@ -331,6 +369,8 @@ pub mod client_command {
                     Reply::Query(query) => 
                         raft_query::reply_to_proto(
                             query, &mut builder.borrow().init_query_reply()),
+                    Reply::AddServer => builder.set_add_server_reply(()),
+                    Reply::RemoveServer => builder.set_remove_server_reply(())
                 }
             }, 
             Err(err) => {
@@ -360,7 +400,12 @@ pub mod client_command {
                 raft_query::request_to_proto(raft_query,
                                     &mut builder.borrow().init_query());
             },
-            Request::Unknown => builder.set_unknown(()),
+            Request::AddServer(raft_server) => {
+                raft_server::to_proto(raft_server, builder.borrow().init_add_server());
+            },
+            Request::RemoveServer(raft_server) => {
+                raft_server::to_proto(raft_server, builder.borrow().init_remove_server());
+            }
         }
     }
 
@@ -375,6 +420,8 @@ pub mod client_command {
             proto::reply::QueryReply(query) =>
                 Ok(Reply::Query(
                         raft_query::reply_from_proto(&mut query.unwrap()))),
+            proto::reply::AddServerReply(_) => Ok(Reply::AddServer),
+            proto::reply::RemoveServerReply(_) => Ok(Reply::RemoveServer),
         }
     }
 
@@ -383,12 +430,18 @@ pub mod client_command {
             RaftError::ClientError(err) => builder.set_client_error(err.as_str()),
             RaftError::IoError(err) => builder.set_io_error(err.as_str()),
             RaftError::NotLeader(leader) => {
-                let leader_str = leader.map(|x| x.to_string())
-                                       .unwrap_or_default();
-                builder.set_not_leader(leader_str.as_str())
+                match leader {
+                    Some(id) => {
+                        builder.borrow().init_not_leader().set_leader_id(id);
+                    },
+                    None => {
+                        builder.borrow().init_not_leader().set_leader_unknown(());
+                    }
+                }
             },
             RaftError::SessionError => builder.set_session_error(()),
             RaftError::RpcError(_) | RaftError::Unknown => builder.set_unknown(()),
+            RaftError::Timeout => builder.set_timeout(())
         }
     }
 
@@ -396,12 +449,17 @@ pub mod client_command {
         match proto.which().unwrap() {
             raft_error::ClientError(err) => RaftError::ClientError(
                 err.unwrap().to_string()),
-            raft_error::NotLeader(leader) =>
-                RaftError::NotLeader(
-                    leader.ok().and_then(|x| SocketAddr::from_str(x).ok())),
+            raft_error::NotLeader(leader) => {
+                let leader_id = match leader.unwrap().which().unwrap() {
+                    not_leader::LeaderId(id) => Some(id),
+                    not_leader::LeaderUnknown(_) => None
+                };
+                RaftError::NotLeader(leader_id)
+            }
             raft_error::SessionError(_) => RaftError::SessionError,
             raft_error::IoError(err) => RaftError::IoError(err.unwrap().to_string()),
             raft_error::Unknown(_) => RaftError::Unknown,
+            raft_error::Timeout(_) => RaftError::Timeout
         }
     }
 
@@ -480,20 +538,17 @@ pub mod client_command {
 pub struct Config<'a> {
     // Each server has a unique 64bit integer id that and a socket address
     // These mappings MUST be identical for each server in the cluster
-    pub cluster: HashMap<u64, SocketAddr>,
     pub me: (u64, SocketAddr),
     pub heartbeat_timeout: Duration,
-    pub state_filename: String,
+    pub state_filename: &'a str,
     pub log_filename: &'a str
 }
 
 impl<'a> Config<'a> {
-    pub fn new (cluster: HashMap<u64, SocketAddr>, my_id: u64,
-                my_addr: SocketAddr, heartbeat_timeout: Duration, state_filename: String,
-                log_filename: &str) -> Config {
+    pub fn new<A: ToSocketAddrs> (my_id: u64, my_addr: A, heartbeat_timeout: Duration,
+                state_filename: &'a str, log_filename: &'a str) -> Config<'a> {
         Config {
-            cluster: cluster,
-            me: (my_id, my_addr),
+            me: (my_id, my_addr.to_socket_addrs().unwrap().next().unwrap()),
             heartbeat_timeout: heartbeat_timeout,
             state_filename: state_filename,
             log_filename: log_filename

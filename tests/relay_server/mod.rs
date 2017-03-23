@@ -61,17 +61,20 @@ impl RelayServer {
     /// #Panics
     /// Panics if it is unable to acquire enough bound TCP ports.
     /// Or if one of the server's background threads have panicked.
-    pub fn bind_random_addresses(&mut self, num_addresses: u64) {
+    pub fn bind_random_addresses(&mut self, num_addresses: u64) -> Vec<SocketAddr> {
+        let mut bound_addresses = vec![];
         let mut addrs = self.addrs.lock().unwrap();
         for _ in 0..num_addresses {
             let listener = TcpListener::bind("127.0.0.1:0").unwrap();
             let socket_info = SocketInfo {to_addr: None, online: false};
-            addrs.insert(listener.local_addr().unwrap(), socket_info);
+            addrs.insert(listener.local_addr().unwrap().clone(), socket_info);
+            bound_addresses.push(listener.local_addr().unwrap().clone());
 
             let addrs_clone = self.addrs.clone();
             // spawn a background thread to listen on this port
             thread::spawn (move || RelayServer::relay_messages(listener, addrs_clone));
         }
+        bound_addresses
     }
 
     /// Returns a vector containing the bound socket addrs

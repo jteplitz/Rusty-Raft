@@ -1,5 +1,10 @@
 @0xdcf9b3ce29f421d0;
 
+struct RaftServer {
+  id    @0 :UInt64;
+  addr  @1 :Text;
+}
+
 # Changes to RaftOp should be reflected in the
 # equivalent structures from the common module.
 struct RaftCommand {
@@ -10,7 +15,7 @@ struct RaftCommand {
   union {
     stateMachineCommand  @0 :StateMachineCommand;
     openSession          @1 :UInt64;
-    setConfig            @2 :Void;
+    setConfig            @2 :List(RaftServer);
     noop                 @3 :Void;
   }
   struct Reply {
@@ -24,29 +29,27 @@ struct RaftCommand {
 }
 
 struct RaftQuery {
-  union {
-    stateMachineQuery   @0   :Data;
-    getConfig           @1   :Void;
-  }
+  stateMachineQuery   @0   :Data;
+
   struct Reply {
-    union {
       stateMachineQuery   @0  :Data;
-      getConfig           @1  :Data;
-    }
   }
 }
 
 struct ClientRequest {
   union {
-    command     @0   :RaftCommand;
-    query       @1   :RaftQuery;
-    unknown     @2   :Void;
+    command      @0   :RaftCommand;
+    query        @1   :RaftQuery;
+    addServer    @2   :RaftServer;
+    removeServer @3   :RaftServer;
   }
   struct Reply {
     union {
-      error           @0   :RaftError;
-      commandReply    @1   :RaftCommand.Reply;
-      queryReply      @2   :RaftQuery.Reply;
+      error             @0 :RaftError;
+      commandReply      @1 :RaftCommand.Reply;
+      queryReply        @2 :RaftQuery.Reply;
+      addServerReply    @3 :Void;
+      removeServerReply @4 :Void;
     }
   }
 }
@@ -88,13 +91,21 @@ struct RequestVoteReply {
   voteGranted   @1   :Bool;
 }
 
+struct NotLeader {
+  union {
+    leaderId @0 :UInt64;
+    leaderUnknown  @1 :Void;
+  }
+}
+
 struct RaftError {
   union {
     clientError   @0  :Text;
-    notLeader     @1  :Text;
-    sessionError  @2  :Void;
-    ioError       @3  :Text;
-    unknown       @4  :Void;
+    notLeader     @1  :NotLeader;
+    unknown       @2  :Void;
+    sessionError  @3  :Void;
+    timeout       @4  :Void;
+    ioError       @5  :Text;
   }
 }
 

@@ -12,6 +12,7 @@ use std::thread::JoinHandle;
 use std::time::Duration;
 use std::sync::mpsc::{channel, Receiver, Sender, TryRecvError};
 use std::sync::{Mutex, Arc};
+use std::net::SocketAddr;
 use std::mem;
 
 ///
@@ -139,13 +140,14 @@ pub struct Log {
     background_thread_tx: Sender<BackgroundThreadMessage>,
     background_thread_rx: Receiver<BackgroundThreadReply>,
     background_thread: Option<JoinHandle<()>>,
-    flushed: bool
+    flushed: bool,
+    most_recent_cluster: Option<usize>
 }
 
 impl Log {
     pub fn new_from_filename(filename: &str, to_main_thread: Sender<MainThreadMessage>) -> Result<Log> {
         let mut f = OpenOptions::new().write(true).read(true).create(true).open(filename)?;
-        let (entries, offsets) = Log::read_entries(&mut f)?;
+        let (entries, offsets, most_recent_cluster) = Log::read_entries(&mut f)?;
         // start index is always 1 until we implement snapshotting
         let (to_background_thread, from_log_thread) = channel();
         let (to_log_thread, from_background_thread) = channel();
@@ -162,7 +164,8 @@ impl Log {
             background_thread_tx: to_background_thread,
             background_thread_rx: from_background_thread,
             background_thread: Some(t),
-            flushed: true
+            flushed: true,
+            most_recent_cluster: most_recent_cluster
         })
     }
 
@@ -204,6 +207,7 @@ impl Log {
     ///
     pub fn append_entries_blocking(&mut self, entries: Vec<Entry>) -> Result<&Log> {
         debug_assert!(self.flushed, "Attempt to syncronously push entry into unflushed log");
+
         let mut start_index = self.entries.len() + self.start_index;
         let indexed_entries = entries.into_iter().map(|mut entry| {
             debug_assert!(entry.term > 0); // can't commit in term 0
@@ -214,6 +218,7 @@ impl Log {
         
         // write the entries to disk
         let mut writer = BufWriter::new(&self.file);
+        let mut entry_offsets = self.entry_offsets.lock().unwrap();
         for entry in indexed_entries {
             let metadata = self.file.metadata()?;
             let cursor = metadata.len();
@@ -221,8 +226,13 @@ impl Log {
             entry.into_proto(&mut builder.init_root::<entry::Builder>());
             serialize_packed::write_message(&mut writer, &builder)?;
 
+            // keep track of the most recent cluster config
+            if matches!(entry.op, raft_command::Request::SetConfig(..)) {
+                self.most_recent_cluster = Some(entry.index);
+            }
+
             self.entries.push(entry);
-            self.entry_offsets.lock().unwrap().push(cursor);
+            entry_offsets.push(cursor);
         }
 
         self.file.sync_all()?;
@@ -249,6 +259,9 @@ impl Log {
         entry.index = self.entries.len() + self.start_index;
         // TODO(perf): We could wrap entry in an Arc and avoid having to make the copy here
         self.entries.push(entry.clone());
+        if matches!(entry.op, raft_command::Request::SetConfig(..)) {
+            self.most_recent_cluster = Some(entry.index);
+        }
 
         self.background_thread_tx.send(BackgroundThreadMessage::AppendEntry(entry)).unwrap();
 
@@ -306,7 +319,52 @@ impl Log {
             entry_offsets.drain(start_index ..);
         }
 
+        // check if we rolled back our cluster
+        self.most_recent_cluster = self.most_recent_cluster
+            .and_then(|i| if i > index { None } else { Some(i) });
+
         Ok(self)
+    }
+
+    /// Gets (and caches) the most recent cluster config stored in the log if one exists
+    ///
+    /// #Panics
+    /// * Panics if the log is corrupt
+    pub fn get_cluster_config(&mut self) -> Option<Vec<(u64, SocketAddr)>> {
+        let option = self.most_recent_cluster
+            .map(|i| {
+                // We should never store an entry that is not in memory
+                self.get_entry(i).unwrap()
+            })
+            .or_else(|| {
+                // find the most recent config entry if it exists
+                self.entries.iter()
+                    .rev()
+                    .filter(|e| matches!(e.op, raft_command::Request::SetConfig(..)))
+                    .next()
+            })
+            .map(|e| {
+                match e.op {
+                    raft_command::Request::SetConfig(ref servers) => (servers.clone(), e.index),
+                    _ => {
+                        error!("Config log entry didn't have a server list. 
+                                The log is corrupt and there is no path forward. 
+                                There is some hope that if this server starts back
+                                up with an empty log the cluster will be able 
+                                to catch it up.");
+                        panic!("Corrupt config log entry.")
+                    }
+                }
+            });
+
+        match option {
+            Some((servers, index)) => {
+                // cache the index for future lookups
+                self.most_recent_cluster = Some(index);
+                Some(servers)
+            },
+            None => None
+        }
     }
 
     ///
@@ -426,7 +484,7 @@ impl Log {
     ///
     /// Does not currently check for corrupted entries that are valid
     /// capnproto entries. We could add checksums to do this.
-    fn read_entries(f: &mut File) -> Result<(Vec<Entry>, Vec<u64>)> {
+    fn read_entries(f: &mut File) -> Result<(Vec<Entry>, Vec<u64>, Option<usize>)> {
         let mut cursor: u64 = 0;
         let mut offsets = vec![];
         let mut entries = vec![];
@@ -434,6 +492,7 @@ impl Log {
         let metadata = f.metadata()?;
         let len = metadata.len();
         let mut buf_reader = BufReader::new(f);
+        let mut most_recent_cluster = None;
         while cursor < len {
             let entry_offset = cursor;
             let entry = serialize_packed::read_message(&mut buf_reader, ReaderOptions::new())
@@ -448,13 +507,16 @@ impl Log {
                     .map_err(|_| Error::new(ErrorKind::InvalidData, "Corrupt captain proto entry while converting"))
                     .map(|e| Entry::from_proto(e))
             })?;
+            if let raft_command::Request::SetConfig(_) = entry.op {
+                most_recent_cluster = Some(entry.index);
+            }
             // TODO Ensure that there are no holes in the log
             // and that it is in order
             entries.push(entry);
             offsets.push(entry_offset);
         }
 
-        Ok((entries, offsets))
+        Ok((entries, offsets, most_recent_cluster))
     }
 }
 
@@ -525,8 +587,11 @@ mod tests {
     use super::{Log, random_entry, random_entry_with_term, random_entries_with_term};
     use super::Entry;
     use super::mocks::{new_mock_log, MockLogFileHandle};
+    use super::super::super::common::{raft_command};
     use super::super::MainThreadMessage;
     use std::sync::mpsc::channel;
+    use std::net::{SocketAddr, SocketAddrV4, Ipv4Addr};
+    use rand::{thread_rng, Rng};
     
     fn create_filled_log (length: usize) -> (Log, MockLogFileHandle) {
         let (mut log, _file_handle) = new_mock_log();
@@ -736,5 +801,82 @@ mod tests {
         assert_eq!(log_from_disk.get_last_entry_index(), 8);
         assert_eq!(log_from_disk.get_entries_from(0).len(), entries.len());
         assert_eq!(log_from_disk.get_entries_from(0), &entries[..]);
+    }
+
+    fn cluster_config_with_servers(num_servers: usize) -> (Entry, Vec<(u64, SocketAddr)>) {
+        let mut rng = thread_rng();
+        let servers: Vec<(u64, SocketAddr)> = (0..num_servers)
+            .map(|i| {
+                let port: u16 = rng.gen();
+                let ip: u32 = rng.gen();
+                let id: u64 = rng.gen();
+                let ip_addr = Ipv4Addr::new((ip >> 24) as u8, (ip >> 16) as u8, (ip >> 8) as u8, ip as u8);
+                let addr = SocketAddrV4::new(ip_addr, port);
+                (id, SocketAddr::V4(addr))
+            }).collect();
+
+        (Entry {
+            index: 0,
+            term: 1,
+            op: raft_command::Request::SetConfig(servers.clone())
+       }, servers)
+    }
+
+    #[test]
+    fn append_entries_tracks_cluster_config() {
+        const NUM_SERVERS: usize = 5;
+        let (mut log, _file_handle) = new_mock_log();
+        assert_eq!(log.get_cluster_config(), None);
+        let (config_entry, servers) = cluster_config_with_servers(NUM_SERVERS);
+        let mut entries = random_entries_with_term(5, 1);
+        entries.insert(2, config_entry);
+        log.append_entries_blocking(entries);
+        assert_eq!(log.get_cluster_config(), Some(servers));
+    }
+
+    #[test]
+    fn append_entry_tracks_cluster_config() {
+        const NUM_SERVERS: usize = 5;
+        let (mut l, _file_handle) = new_mock_log();
+        { // _file_handle must outlive log
+            let mut log = l;
+            assert_eq!(log.get_cluster_config(), None);
+            let mut entries = random_entries_with_term(5, 1);
+            log.append_entries_blocking(entries);
+
+            let (config_entry, servers) = cluster_config_with_servers(NUM_SERVERS);
+            log.append_entry(config_entry);
+            assert_eq!(log.get_cluster_config(), Some(servers));
+        }
+    }
+
+    #[test]
+    fn roll_back_resets_cluster_config() {
+        const NUM_SERVERS: usize = 4;
+        const CONFIG_INDEX: usize = 3;
+        let (mut log, _file_handle) = new_mock_log();
+
+        let (config_entry, servers) = cluster_config_with_servers(NUM_SERVERS);
+        // append a series of entries that includes a config change
+        let mut entries = random_entries_with_term(CONFIG_INDEX + 3, 1);
+        entries.insert(CONFIG_INDEX, config_entry);
+        log.append_entries_blocking(entries);
+        assert_eq!(log.get_cluster_config().as_ref(), Some(&servers));
+
+        { 
+            // append another config entry
+            // _file_handle must outlive log
+            let mut scoped_log = log;
+            let (config_entry, second_servers) = cluster_config_with_servers(NUM_SERVERS + 1);
+            scoped_log.append_entry(config_entry);
+            scoped_log.flush_background_thread();
+            assert_eq!(scoped_log.get_cluster_config(), Some(second_servers));
+            // roll back the new config
+            scoped_log.roll_back(CONFIG_INDEX + 2).unwrap();
+            assert_eq!(scoped_log.get_cluster_config(), Some(servers));
+            // roll back the old config
+            scoped_log.roll_back(CONFIG_INDEX - 1).unwrap();
+            assert_eq!(scoped_log.get_cluster_config(), None);
+        }
     }
 }

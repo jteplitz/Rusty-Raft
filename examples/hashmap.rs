@@ -131,7 +131,10 @@ impl Server {
             panic!("Initial cluster must contain server id: {}", id);
         }
         Server { 
-            handle: start_server(id, cluster,Box::new(RaftHashMap { map: HashMap::new() })).unwrap() }
+            handle: 
+                // TODO: Only the first server should put itself in its log file
+                start_server(id, Box::new(RaftHashMap { map: HashMap::new() }), *cluster.get(&id).unwrap()).unwrap()
+        }
     }
 }
 
@@ -315,6 +318,7 @@ fn as_addr(x: &str) -> Result<SocketAddr, std::io::Error> {
 
 /// Panics on io error (we can't access the cluster info!)
 /// TODO (sydli) make io_errs more informative
+// TODO(jason): Remove this and bootstrap a dynamic cluster
 fn cluster_from_file(filename: &str) -> HashMap<u64, SocketAddr> {
     let file = File::open(filename.clone())
                .expect(&format!("Unable to open file {}", filename));

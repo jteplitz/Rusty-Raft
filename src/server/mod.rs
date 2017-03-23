@@ -6,7 +6,9 @@ use capnp;
 use rand;
 use raft_capnp::{append_entries, append_entries_reply,
                  request_vote, request_vote_reply,
-                 client_request};
+                 client_request, entry};
+use capnp::message;
+use capnp::serialize_packed;
 use rpc::{RpcError};
 use rpc::server::{RpcObject, RpcServer};
 use client::state_machine::{RaftStateMachine, StateMachine};
@@ -23,25 +25,25 @@ use std::sync::{Arc, Mutex};
 use std::sync::mpsc::{channel, Sender, Receiver, RecvTimeoutError};
 use std::mem;
 use std::cmp::min;
-use std::collections::HashMap;
-
-use self::log::{Log, Entry};
-use self::state_machine::{StateMachineMessage, state_machine_thread, StateMachineHandle};
-use self::peer::{Peer, PeerHandle, PeerThreadMessage, RequestVoteMessage};
-use self::state_file::StateFile;
-use std::io::Error as IoError;
+use std::collections::{HashMap, VecDeque};
+use std::io::{Error as IoError, BufWriter};
+use std::fs::{File, OpenOptions};
 use rand::distributions::{IndependentSample, Range};
 use rand::{thread_rng, Rng};
+use self::log::{Log, Entry};
+use self::state_machine::{StateMachineMessage, state_machine_thread, StateMachineHandle};
+use self::peer::{Peer, PeerHandle, PeerThreadMessage, RequestVoteMessage, PeerState, NonVotingPeerState, PeerInfo};
+use self::state_file::StateFile;
 
+pub type RpcHandlerPipe = Sender<Result<(), RaftError>>;
 
-///
 /// Messages that can be sent to the main thread.
 /// *Reply messages encapsulate replies from peer machines, and
 /// ClientAppendRequest is a message sent by the client thread.
 pub struct AppendEntriesReply {
     term: u64,
     commit_index: usize,
-    peer: (u64, SocketAddr),
+    peer: PeerInfo,
     success: bool,
 }
 
@@ -56,15 +58,36 @@ pub enum MainThreadMessage {
     RequestVoteReply (RequestVoteReply),
     ClientAppendRequest (raft_command::Request),
     Shutdown,
-    EntryPersisted (usize)
+    EntryPersisted (usize),
+    AddServer(PeerInfo, RpcHandlerPipe),
+    RemoveServer(PeerInfo, RpcHandlerPipe)
 }
 
+// TODO: RW locks?
+// NB: State lock should never be acquired while holding the log lock
+struct Server {
+    // TODO: Rename properties?
+    state: Arc<Mutex<ServerState>>,
+    log: Arc<Mutex<Log>>,
+    info: ServerInfo
+}
+
+struct ServerInfo {
+    state_machine: StateMachineHandle,
+    me: (u64, SocketAddr),
+    heartbeat_timeout: Duration,
+    to_me: Sender<MainThreadMessage>
+}
 
 // States that each machine can be in!
-#[derive(Debug, PartialEq, Clone, Copy)]
+#[derive(Debug, Clone)]
 enum State {
     Candidate { num_votes: usize, start_time: Instant },
-    Leader { last_heartbeat: Instant },
+    Leader { 
+        last_heartbeat: Instant,
+        pending_cluster_changes: VecDeque<(PeerInfo, RpcHandlerPipe)>,
+        uncommited_cluster_change: Option<(usize, RpcHandlerPipe)>
+    },
     Follower,
 }
 
@@ -76,11 +99,11 @@ pub struct ServerState {
     current_term: u64,
     commit_index: usize,
     last_persisted_index: usize,
-    last_leader_contact: (Instant, Option<SocketAddr>),
+    last_leader_contact: (Instant, Option<u64>),
     voted_for: Option<u64>,
     election_timeout: Duration,
     state_file: StateFile,
-    cluster: HashMap<u64, SocketAddr>,
+    peers: HashMap<u64, PeerHandle>
 }
 
 /// 
@@ -91,15 +114,38 @@ impl ServerState {
     /// Transitions into the candidate state by incrementing the current_term and resetting the
     /// current_index.
     /// This should only be called if we're in the follower state or already in the candidate state
+    /// NB: If we're the only server in the cluster (according to the latset config in our log)
+    /// then we transition directly to leader
     ///
-    fn transition_to_candidate(&mut self, my_id: u64) -> Result<(), IoError> {
-        debug_assert!(self.current_state == State::Follower ||
+    fn transition_to_candidate(&mut self, info: &mut ServerInfo, log: Arc<Mutex<Log>>) -> Result<(), IoError> {
+        debug_assert!(matches!(self.current_state, State::Follower) ||
                       matches!(self.current_state, State::Candidate { .. }));
         self.current_state = State::Candidate { start_time: Instant::now(), num_votes: 1 }; // we always start with 1 vote from ourselves
         self.current_term += 1;
-        self.voted_for = Some(my_id); // vote for ourselves
+        self.voted_for = Some(info.me.0); // vote for ourselves
         self.election_timeout = generate_election_timeout();
-        self.state_file.save_state(state_file::State {term: self.current_term, voted_for: self.voted_for})
+        self.state_file.save_state(state_file::State {term: self.current_term, voted_for: self.voted_for})?;
+
+        // start up peer threads
+        let cluster_config = log.lock().unwrap().get_cluster_config();
+        match cluster_config {
+            Some(config) => {
+                self.peers = config.into_iter()
+                .filter(|&(id, addr)| id != info.me.0)
+                .map(|(id, addr)| {
+                    (id, Peer::start((id, addr), info.to_me.clone(), None))
+                })
+                .collect();
+                if self.peers.len() == 0 {
+                    // We win an election if we're the only server in the cluster and have
+                    // a valid config
+                    self.transition_to_leader(info, log);
+                }
+            },
+            None => {/*No config. There's hope that if we wait we'll hear from a leader about a cluster config*/}
+        };
+
+        Ok(())
     }
 
     ///
@@ -107,16 +153,23 @@ impl ServerState {
     ///
     fn transition_to_leader(&mut self, info: &mut ServerInfo, log: Arc<Mutex<Log>>) {
         debug_assert!(matches!(self.current_state, State::Candidate{ .. }));
-        self.current_state = State::Leader { last_heartbeat: Instant::now() };
         // Append dummy entry.
-        { // Scope the log lock so we drop it immediately afterwards.
-            log.lock().unwrap().append_entry(Entry::noop(self.current_term));
-        }
-        for peer in &mut info.peers {
+        let noop_index = { // Scope the log lock so we drop it immediately afterwards.
+            log.lock().unwrap().append_entry(Entry::noop(self.current_term))
+                .get_last_entry_index()
+        };
+        self.current_state = State::Leader { 
+            last_heartbeat: Instant::now(),
+            pending_cluster_changes: VecDeque::new(),
+            uncommited_cluster_change: None
+        };
+        for (_, peer) in &mut self.peers {
             peer.next_index = self.commit_index + 1;
         }
         self.commit_index = self.commit_index + 1;
         broadcast_append_entries(info, self, log.clone());
+
+        trace!("Server {}: Became leader for term {}", info.me.0, self.current_term)
     }
 
     ///
@@ -128,9 +181,26 @@ impl ServerState {
                               to_state_machine: &Sender<StateMachineMessage>,
                               voted_for: Option<u64>, log: Arc<Mutex<Log>>) -> Result<(), IoError> {
         debug_assert!(new_term >= self.current_term);
-        if matches!(self.current_state, State::Leader {..}) {
+        if let State::Leader {ref pending_cluster_changes, ref uncommited_cluster_change, ..} = self.current_state {
             to_state_machine.send(StateMachineMessage::Flush).unwrap();
+            log.lock().unwrap().flush_background_thread();
+
+            // Send NOT_LEADER errors to any clients waiting on pending cluster changes
+            // they can retry with the new leader
+            let pipes = pending_cluster_changes
+                .iter()
+                .map(|&(_, ref pipe)| {
+                    pipe
+                })
+                .chain(pending_cluster_changes.iter().map(|&(_, ref pipe)| pipe));
+            for pipe in pipes {
+                warn!("Sending not leader!");
+                // TODO: Send leader guess
+                pipe.send(Err(RaftError::NotLeader(None)));
+            }
         }
+        // Drop peers
+        self.peers.clear();
 
         self.voted_for = voted_for;
         self.current_term = new_term;
@@ -138,52 +208,69 @@ impl ServerState {
         self.election_timeout = generate_election_timeout();
         
         self.state_file.save_state(state_file::State {term: self.current_term, voted_for: self.voted_for})?;
-        log.lock().unwrap().flush_background_thread();
         Ok(())
-        
-        // TODO: We need to stop the peers from continuing to send AppendEntries here.
-    }
-}
-
-// TODO: RW locks?
-// NB: State lock should never be acquired while holding the log lock
-pub struct Server {
-    // TODO: Rename properties?
-    state: Arc<Mutex<ServerState>>,
-    log: Arc<Mutex<Log>>,
-    info: ServerInfo
-}
-
-struct ServerInfo {
-    peers: Vec<PeerHandle>,
-    state_machine: StateMachineHandle,
-    me: (u64, SocketAddr),
-    heartbeat_timeout: Duration
-}
-
-impl ServerInfo {
-    ///
-    /// Returns a mutable reference to the peer referred to by |id|.
-    /// None if no peer with |id| is found.
-    ///
-    fn get_peer_mut(&mut self, id: u64) -> Option<&mut PeerHandle> {
-        self.peers.iter_mut().find(|peer| peer.id == id)
     }
 }
 
 ///
 /// Updates the server's commit index to the median of our peers' indices.
 ///
-fn update_commit_index(server_info: &ServerInfo, state: &mut ServerState) {
-    // Find median of all peer commit indices.
-    let mut indices: Vec<usize> = server_info.peers.iter().map(|ref peer| peer.match_index).collect();
+/// #Panics
+/// Panics if called while not leader
+///
+fn update_commit_index(server_info: &mut ServerInfo, state: &mut ServerState, log: Arc<Mutex<Log>>) {
+    // Find median of all (voting) peer commit indices.
+    let mut indices: Vec<usize> = state.peers.iter()
+        .filter(|&(_,  peer)| matches!(peer.state, PeerState::Voting))
+        .map(|(_, peer)| peer.match_index).collect();
     indices.sort();
-    let new_index = *indices.get( indices.len() / 2 ).unwrap();
+    let new_index;
+    if indices.len() == 0 {
+        // if there are no other servers in the cluster
+        // then our commit index should be in lockstep with our
+        // persisted entries
+        new_index = state.last_persisted_index;
+    } else {
+        new_index = *indices.get( indices.len() / 2 ).unwrap();
+    }
     // Set new commit index if it's higher and it has been persisted to disk!
     if new_index <= state.commit_index || new_index > state.last_persisted_index { return; }
     state.commit_index = new_index;
     server_info.state_machine.tx.send(
         StateMachineMessage::Commit(state.commit_index)).unwrap();
+
+    let mut next_cluster_change;
+    match state.current_state {
+        State::Leader{ref mut pending_cluster_changes, ref mut uncommited_cluster_change, ..} => {
+            next_cluster_change = match *uncommited_cluster_change {
+                None => pending_cluster_changes.pop_front(),
+                Some((index, ref pipe)) => {
+                    if new_index >= index {
+                        // cluster change commited
+                        // notify rpc handler
+                        pipe.send(Ok(())).unwrap();
+                        pending_cluster_changes.pop_front()
+                    } else {
+                        None
+                    }
+                }
+            }
+        },
+        State::Follower | State::Candidate{..} => {
+            panic!("Call to update_commit_index while not leader.");
+        }
+    }
+
+    match next_cluster_change {
+        Some((peer, pipe)) => add_server_to_log(peer, pipe, server_info, state, log),
+        None => {
+            // we're not waiting on a cluster change
+            if let State::Leader{ref mut uncommited_cluster_change, ..} = state.current_state {
+                // always executes because the state is locked and we made it this far
+                *uncommited_cluster_change = None;
+            }
+        }
+    };
 }
 
 pub struct ServerHandle {
@@ -234,23 +321,73 @@ impl Drop for ServerHandle {
     }
 }
 
-pub fn start_server(id: u64, cluster: &HashMap<u64, SocketAddr>,
-                    state_machine: Box<StateMachine>) -> Result<ServerHandle, IoError> {
-        const HEARTBEAT_TIMEOUT: u64 = 75;
-        const STATE_FILENAME_LEN: usize = 20;
-        // create a config object
-        let mut random_filename: String = thread_rng().gen_ascii_chars().take(STATE_FILENAME_LEN).collect();
-        let state_filename = String::from("/tmp/state_") + &random_filename;
-        let log_filename = String::from("/tmp/log_") + &random_filename;
+/// Starts a new test server 
+/// If an address is provided it should be the address of this server
+/// This will get written to the log before the server starts up,
+/// so it should only be given to the first server in the cluster
+///
+/// NB: The server won't actually be listening on my_addr. It starts up on a random port,
+/// so it can be used in parallel tests (you should use the relay server to send messages to
+/// this server)
+/// 
+/// To start a real server use `start_server`
+pub fn start_test_server<F> (id: u64, state_machine: F, 
+                         state_filename: &str, log_filename: &str,
+                         my_addr: Option<SocketAddr>) -> Result<ServerHandle, IoError> 
+    where F: FnOnce() -> Box<RaftStateMachine> {
+    const HEARTBEAT_TIMEOUT: u64 = 75;
 
-        let state_machine = RaftStateMachine::new(state_machine);
-        let config = Config::new (cluster.clone(),
-        id,
-        cluster.get(&id).unwrap().clone(),
+    if let Some(addr) = my_addr {
+        write_initial_config_to_log(&log_filename, id, addr)?;
+    }
+
+    let config = Config::new (id,
+        "127.0.0.1:0",
         Duration::from_millis(HEARTBEAT_TIMEOUT),
-        state_filename.clone(),
-        &log_filename);
-        start_server_with_config(config, move || Box::new(state_machine))
+        &state_filename,
+        &log_filename
+    );
+    start_server_with_config(config, state_machine)
+}
+
+/// Starts a new server running the raft consensus algorithim.
+///
+/// TODO(jason): Take in filenames instead of using random ones, and only
+/// write to log for bootstrapping first server
+pub fn start_server(id: u64, state_machine: Box<StateMachine>, my_addr: SocketAddr) -> Result<ServerHandle, IoError> {
+    const HEARTBEAT_TIMEOUT: u64 = 75;
+    const STATE_FILENAME_LEN: usize = 20;
+    // create a config object
+    let mut random_filename: String = thread_rng().gen_ascii_chars().take(STATE_FILENAME_LEN).collect();
+    let state_filename = String::from("/tmp/state_") + &random_filename;
+    let log_filename = String::from("/tmp/log_") + &random_filename;
+
+    write_initial_config_to_log(&log_filename, id, my_addr)?;
+
+    let state_machine = RaftStateMachine::new(state_machine);
+    let config = Config::new (id,
+        my_addr,
+        Duration::from_millis(HEARTBEAT_TIMEOUT),
+        &state_filename,
+        &log_filename
+    );
+    start_server_with_config(config, move || Box::new(state_machine))
+}
+
+fn write_initial_config_to_log(log_filename: &str, id: u64, addr: SocketAddr) -> Result<(), IoError> {
+    // write the initial config to the log file
+    let entry = Entry {
+        index: 1,
+        term: 1, 
+        op: raft_command::Request::SetConfig(vec![(id, addr)])
+    };
+    let mut file = OpenOptions::new().write(true).read(false)
+                  .create(true).truncate(true).open(log_filename)?;
+
+    let mut writer = BufWriter::new(&mut file);
+    let mut builder = message::Builder::new_default();
+    entry.into_proto(&mut builder.init_root::<entry::Builder>());
+    serialize_packed::write_message(&mut writer, &builder)
 }
 
 ///
@@ -286,45 +423,119 @@ fn handle_append_entries_reply(m: AppendEntriesReply, server_info: &mut ServerIn
     match state.current_state {
         State::Leader{ .. } => (),
         State::Candidate{ .. } | State::Follower => return, // drop it like it's hot
-    }
+    };
+        
     if m.term > state.current_term {
-        println!("Server {}: becoming follower in term {} after being leader in {}", server_info.me.0, m.term, state.current_term);
+        trace!("Server {}: becoming follower in term {} after being leader in {}", server_info.me.0, m.term, state.current_term);
         match state.transition_to_follower(m.term, &server_info.state_machine.tx, None, log.clone()) {
             Ok(_) => {},
-            Err(e) => warn!("Unable to write to state file: {}", e)
+            Err(e) => error!("Unable to write to state file. We didn't vote 
+                              in this election so this isn't a fatal error. However,
+                              it will likely be one on the next election if the
+                              issue isn't fixed: {}", e)
         };
     } else if m.success {
+        // TODO: Handle non voting members here
         // On success, advance peer's index.
-        server_info.get_peer_mut(m.peer.0).map(|peer| {
+        state.peers.get_mut(&m.peer.0).map(|peer| {
             debug_assert!(m.commit_index >= peer.next_index - 1);
             peer.next_index = m.commit_index + 1;
             peer.match_index = m.commit_index;
+            peer.advance_non_voting_peer_round(log.lock().unwrap().get_last_entry_index())
+        })
+        .map(|peer_state| {
+            match peer_state {
+                NonVotingPeerState::TimedOut(pipe) => timeout_add_server(m.peer.0, pipe, state),
+                NonVotingPeerState::CaughtUp(pipe) => add_caught_up_server(m.peer, pipe, server_info, state, log),
+                NonVotingPeerState::CatchingUp => {/* need to wait for another round */},
+                NonVotingPeerState::VotingPeer => update_commit_index(server_info, state, log)
+            }
         });
-        update_commit_index(server_info, state);
     } else {
         let leader_id = server_info.me.0;
         // If we failed, roll back peer index by 1 (if we can) and retry
         // the append entries call.
-        server_info.get_peer_mut(m.peer.0).map(|peer| {
+        let (commit_index, current_term) = (state.commit_index, state.current_term);
+        state.peers.get_mut(&m.peer.0).map(|peer| {
             if peer.next_index > 1 {
                 // can we make sure match_index never exceeds peer_index?
                 peer.next_index = peer.next_index - 1;
             }
             peer.append_entries_nonblocking(leader_id,
-                                            state.commit_index,
-                                            state.current_term, log);
+                                            commit_index,
+                                            current_term, log);
         });
     }
 }
 
+/// Either adds a caught up server directly to the cluster
+/// or queues it to be added once all pending config changes
+/// have commited
+/// Noop if we're not leader
+///
+/// #Panics
+/// Panics if the log lock is poisoned
+fn add_caught_up_server(peer: PeerInfo, pipe: RpcHandlerPipe, info: &mut ServerInfo,
+                        state: &mut ServerState, log_lock: Arc<Mutex<Log>>) {
+    let log_lock_clone = log_lock.clone();
+    match state.current_state {
+        State::Leader{ref mut pending_cluster_changes, ref uncommited_cluster_change, ..} => {
+            if uncommited_cluster_change.is_some() || log_lock.lock().unwrap().get_last_entry_term() != state.current_term {
+                // It's not safe to introduce a config right now. Queue it for later
+                pending_cluster_changes.push_back((peer, pipe));
+                None
+            } else {
+                Some((peer, pipe))
+            }
+        },
+        _ => panic!("Attempt to add a server when we aren't leader. This should be impossible.")
+    }
+    .map(|(peer, pipe)| add_server_to_log(peer, pipe, info, state, log_lock));
+}
+
+/// Adds the caught up server to the cluster
+/// And updates our current state to indicate
+/// that we are waiting on this cluster change
+///
+/// #Panics
+/// Panics if we are not leader
+fn add_server_to_log (peer: PeerInfo, pipe: RpcHandlerPipe, info: &mut ServerInfo,
+                      state: &mut ServerState, log_lock: Arc<Mutex<Log>>) {
+    let mut config = log_lock.lock().unwrap().get_cluster_config().unwrap();
+    config.push(peer);
+    let op = raft_command::Request::SetConfig(config);
+    let index = append_to_log(log_lock.clone(), op, state.current_term, &state.current_state).unwrap();
+    if let State::Leader{ref mut uncommited_cluster_change, ..} = state.current_state {
+        // always executes because the state is locked and we made it this far
+        *uncommited_cluster_change = Some((index, pipe));
+    }
+    broadcast_append_entries(info, state, log_lock);
+}
+
+/// Rejects this add server rpc with a timeout
+/// and removes this peer from the peers map
+fn timeout_add_server(peer: u64, pipe: RpcHandlerPipe, state: &mut ServerState) {
+    pipe.send(Err(RaftError::Timeout)).unwrap();
+    state.peers.remove(&peer);
+}
+
 /// Helper function to append a command to the log!
-fn append_to_log(log: Arc<Mutex<Log>>, op: raft_command::Request, state: &ServerState) {
-    let entry = Entry {
-        index: 0,
-        term: state.current_term,
-        op: op
-    };
-    log.lock().unwrap().append_entry(entry);
+/// Returns this entires log index (which is not yet commited)
+fn append_to_log(log: Arc<Mutex<Log>>, op: raft_command::Request, current_term: u64, current_state: &State) -> Option<usize> {
+    match *current_state {
+        State::Leader {.. } => {
+            let entry = Entry {
+                index: 0,
+                term: current_term,
+                op: op
+            };
+            Some(log.lock().unwrap().append_entry(entry).get_last_entry_index())
+        },
+        State::Follower | State::Candidate{..} => {
+            None
+            /*This is an old message. Drop it*/
+        }
+    }
 }
 
 ///
@@ -333,13 +544,15 @@ fn append_to_log(log: Arc<Mutex<Log>>, op: raft_command::Request, state: &Server
 /// to all known peers.
 ///
 fn broadcast_append_entries(info: &mut ServerInfo, state: &mut ServerState, log: Arc<Mutex<Log>>) {
-    debug_assert!(matches!(state.current_state, State::Leader{ .. }));
-    for peer in &info.peers {
-        // Perf: each call copies the needed |entries| from |log| to send along to the peer.
-        peer.append_entries_nonblocking(info.me.0, state.commit_index,
-                                        state.current_term, log.clone());
+    // only broadcast append entries if we're leader
+    if let State::Leader {ref mut last_heartbeat, ..} = state.current_state {
+        for (_, peer) in &state.peers {
+            // Perf: each call copies the needed |entries| from |log| to send along to the peer.
+            peer.append_entries_nonblocking(info.me.0, state.commit_index,
+                                            state.current_term, log.clone());
+        }
+        *last_heartbeat = Instant::now();
     }
-    state.current_state = State::Leader { last_heartbeat: Instant::now() };
 }
 
 ///
@@ -355,11 +568,10 @@ fn handle_request_vote_reply(reply: RequestVoteReply, info: &mut ServerInfo,
         }
     }
     if let State::Candidate{num_votes, ..} = state.current_state {
-        if num_votes > (info.peers.len() + 1) / 2 {
+        let num_peers = state.peers.iter().filter(|&(_, p)| matches!(p.state, PeerState::Voting)).count();
+        if num_votes > (num_peers + 1) / 2{
             // Woo! We won the election
             state.transition_to_leader(info, log);
-            println!("Server {}: Became leader for term {} with {} votes out of {} peers", info.me.0, state.current_term, num_votes,
-                     info.peers.len());
         }
     }
 }
@@ -382,8 +594,8 @@ impl Server {
             last_leader_contact: (Instant::now(), None),
             election_timeout: generate_election_timeout(),
             state_file: state_file,
-            last_persisted_index: last_persisted_index,
-            cluster: config.cluster.clone(),
+            peers: HashMap::new(),
+            last_persisted_index: last_persisted_index
         }));
 
         // 1a. Start state machine thread.
@@ -403,7 +615,8 @@ impl Server {
         );
         let client_request_handler: Box<RpcObject> = Box::new(
             ClientRequestHandler {state: state.clone(),
-                                  to_state_machine: to_state_machine_locked.clone() }
+                                  to_state_machine: to_state_machine_locked.clone(),
+                                  to_main_thread: Arc::new(Mutex::new(tx.clone()))}
         );
         let services = vec![
             (constants::APPEND_ENTRIES_OPCODE, append_entries_handler),
@@ -418,21 +631,15 @@ impl Server {
             })
         );
 
-        // 2. Start peer threads.
-        let peers = config.cluster.into_iter()
-            .filter(|&(id, _)| id != me.0) // filter all computers that aren't me
-            .map(|(id, addr)| Peer::start((id, addr), tx.clone()))
-            .collect::<Vec<PeerHandle>>();
-
         // 3. Construct server state object.
         // safe to unwrap here because we should only get this far
         // if the server is bound.
         let bound_address = rpc_server.get_local_addr().unwrap();
         let info = ServerInfo {
-            peers: peers,
             me: (me.0, bound_address),
             heartbeat_timeout: config.heartbeat_timeout,
-            state_machine: state_machine_handle 
+            state_machine: state_machine_handle,
+            to_me: tx.clone()
         };
 
         Ok((Server {
@@ -471,9 +678,9 @@ impl Server {
 
                             current_timeout = state.election_timeout.checked_sub(time_since_election);
                         },
-                        State::Leader{last_heartbeat} => {
-                            let heartbeat_timeout = self.info.heartbeat_timeout;
+                        State::Leader{last_heartbeat, ..} => {
                             // TODO: Should last_heartbeat be in the leader state?
+                            let heartbeat_timeout = self.info.heartbeat_timeout;
                             let since_last_heartbeat = Instant::now()
                                                            .duration_since(last_heartbeat);
                             current_timeout = heartbeat_timeout.checked_sub(since_last_heartbeat);
@@ -488,28 +695,42 @@ impl Server {
                     rx.recv_timeout(timeout)
                 });
 
+                // Handles incoming messages
+                // NB: We can not assume the server is any particular state here
+                // so any method called in this match will need to check the current_state
+                // if its actions are state dependent
                 match message {
                     Ok(m) => {
                         let ref mut state = self.state.lock().unwrap();
-                        // TODO(Jason): Add a shutdown message that the client can send
-                        // to gracefully shutdown the server
                         match m {
                             MainThreadMessage::AppendEntriesReply(m) => {
                                 handle_append_entries_reply(m, &mut self.info, state, self.log.clone());
                             },
                             MainThreadMessage::ClientAppendRequest(command) => {
-                                append_to_log(self.log.clone(), command, state);
+                                append_to_log(self.log.clone(), command, state.current_term, &state.current_state);
                                 broadcast_append_entries(&mut self.info, state, self.log.clone());
                             },
                             MainThreadMessage::RequestVoteReply(m) =>  {
                                 handle_request_vote_reply(m, &mut self.info, state, self.log.clone());
                             },
+                            MainThreadMessage::EntryPersisted(index) => {
+                                Server::handle_entry_persisted(index, &mut self.info, state, self.log.clone());
+                            },
+                            MainThreadMessage::AddServer(server_info, to_background) => {
+                                // start up a peer for this server
+                                // and begin catching them up
+                                // Once caught up add to pending config changes queue
+                                // Once it is at the front of that queue attempt to commit this
+                                // server to a config entry in the log
+                                // Once commited return success
+                                Server::add_peer(server_info, to_background, &mut self.info, state, self.log.clone())
+                            },
+                            MainThreadMessage::RemoveServer(index, addr) => {
+                                unimplemented!();
+                            },
                             MainThreadMessage::Shutdown => {
                                 break;
                             },
-                            MainThreadMessage::EntryPersisted(index) => {
-                                Server::handle_entry_persisted(index, &self.info, state);
-                            }
                         };
                     },
                     Err(_) => {
@@ -521,15 +742,28 @@ impl Server {
             } // end loop
             
             // shutdown the peers by dropping their handles
-            self.info.peers.clear();
+            self.state.lock().unwrap().peers.clear();
         })
     }
 
+    /// Starts up a new peer in the NonVoting state for the given address and instructs it to begin
+    /// catching up
+    fn add_peer(server_info: PeerInfo, to_background: RpcHandlerPipe, info: &mut ServerInfo, state: &mut ServerState,
+                log: Arc<Mutex<Log>>) {
+        let peer = Peer::start(server_info, info.to_me.clone(), Some(to_background));
+        peer.append_entries_nonblocking(info.me.0, state.commit_index, state.current_term, log);
+        state.peers.insert(peer.id, peer);
+    }
+
     /// Updates commit index if appropiate after an entry has been commited to disk
-    fn handle_entry_persisted(index: usize, info: &ServerInfo, state: &mut ServerState) {
+    fn handle_entry_persisted(index: usize, info: &mut ServerInfo, state: &mut ServerState, log: Arc<Mutex<Log>>) {
         state.last_persisted_index = index;
         // commit index may need to be marched forward if it was waiting on a background disk write
-        update_commit_index(info, state);
+        // but only if we are still leader
+        match state.current_state {
+            State::Leader{..} => update_commit_index(info, state, log),
+            State::Candidate{..} | State::Follower => {}
+        }
     }
 
     ///
@@ -550,7 +784,7 @@ impl Server {
                 let now = Instant::now();
                 if now.duration_since(state.last_leader_contact.0)
                     > state.election_timeout {
-                    self.start_election(state);
+                    Server::start_election(&mut self.info, state, self.log.clone());
                 }
             },
             State::Leader{ .. } => {
@@ -571,11 +805,11 @@ impl Server {
     /// # Panics
     /// Panics if any other thread has panicked while holding the log lock
     ///
-    fn start_election(&self, state: &mut ServerState) -> Duration {
-        println!("Server {}: Starting election for term {}. Previously voted for {:?}", self.info.me.0,
+    fn start_election(info: &mut ServerInfo, state: &mut ServerState, log: Arc<Mutex<Log>>) -> Duration {
+        trace!("Server {}: Starting election for term {}. Previously voted for {:?}", info.me.0,
                  state.current_term + 1, state.voted_for);
         // transition to the candidate state
-        match state.transition_to_candidate(self.info.me.0) {
+        match state.transition_to_candidate(info, log.clone()) {
             Ok(_) => {},
             Err(e) => {
                 warn!("Unable to write to state file: {}", e);
@@ -586,19 +820,23 @@ impl Server {
         }
 
         let (last_log_index, last_log_term) = {
-            let log = self.log.lock().unwrap();
+            let log = log.lock().unwrap();
             (log.get_last_entry_index(), log.get_last_entry_term())
         };
+
+        // TODO: For consistency with append entries this should probably be done in the peerhandle 
+        // TODO: If there are no peers, we are leader!
 
         // tell each peer to send out RequestToVote RPCs
         let request_vote_message = RequestVoteMessage {
             term: state.current_term,
-            candidate_id: self.info.me.0,
+            candidate_id: info.me.0,
             last_log_index: last_log_index,
             last_log_term: last_log_term
         };
 
-        for peer in &self.info.peers {
+        // only request votes from voting members
+        for (_, peer) in state.peers.iter().filter(|&(_, peer)| matches!(peer.state, PeerState::Voting)) {
             peer.to_peer.send(PeerThreadMessage::RequestVote(request_vote_message))
                         .unwrap(); // panic if the peer thread is down
         }
@@ -629,7 +867,6 @@ impl RpcObject for RequestVoteHandler {
         let current_term;
         {
             let ref mut state = self.state.lock().unwrap(); // panics if mutex is poisoned
-            state.last_leader_contact = (Instant::now(), None);
             // We may transition to a new term, but we want to avoid doing multiple
             // state transitions since we flush the information to disk each time.
             // So we save the new_term in a local variable and transition after we know
@@ -643,8 +880,12 @@ impl RpcObject for RequestVoteHandler {
                 new_term = state.current_term;
                 voted_for = state.voted_for;
             }
+            let now = Instant::now();
+            // only grant our vote if we've noticed a timeout
+            let timed_out = now.duration_since(state.last_leader_contact.0) >= 
+                            Duration::from_millis(constants::ELECTION_TIMEOUT_MIN);
 
-            if voted_for == None || voted_for == Some(candidate_id) {
+            if timed_out && (voted_for == None || voted_for == Some(candidate_id)) {
                 let log_is_valid = {
                     let log = self.log.lock().unwrap(); // panics if mutex is poisoned
                     log.is_other_log_valid(last_log_index, last_log_term)
@@ -652,7 +893,10 @@ impl RpcObject for RequestVoteHandler {
                 if term == new_term && log_is_valid {
                     // grant vote and become a follower of this candidate
                     match state.transition_to_follower(new_term, &self.to_state_machine.lock().unwrap(), Some(candidate_id), self.log.clone()) {
-                        Ok(_) => vote_granted = true,
+                        Ok(_) => {
+                            vote_granted = true;
+                            state.last_leader_contact = (Instant::now(), Some(candidate_id));
+                        },
                         Err(e) => {
                             vote_granted = false;
                             warn!("Unable to write to state file: {}", e);
@@ -688,7 +932,7 @@ struct AppendEntriesHandler {
 impl AppendEntriesHandler {
     ///# Panics 
     /// * Panics if there are any errors with Disk IO
-    /// * Panics if the maint hread or the state machine thread have panicked
+    /// * Panics if the main thread or the state machine thread have panicked
     fn handle_message(&self, message: append_entries::Reader, reply: &mut append_entries_reply::Builder) {
         let ref mut state = self.state.lock().unwrap();
         let current_term = state.current_term;
@@ -707,8 +951,7 @@ impl AppendEntriesHandler {
 
         debug_assert!(message.get_term() == state.current_term);
         // Reset election timer for this term.
-        state.last_leader_contact = (Instant::now(),
-            state.cluster.get(&message.get_leader_id()).cloned());
+        state.last_leader_contact = (Instant::now(), Some(message.get_leader_id()));
         // Check: (prev_log_term, prev_log_index) exists in our log
         let prev_log_index = message.get_prev_log_index() as usize;
         let (last_log_index, prev_log_entry_term) = {
@@ -765,6 +1008,7 @@ fn generate_election_timeout() -> Duration {
 struct ClientRequestHandler {
     state: Arc<Mutex<ServerState>>,
     to_state_machine: Arc<Mutex<Sender<StateMachineMessage>>>,
+    to_main_thread: Arc<Mutex<Sender<MainThreadMessage>>>
 }
 
 impl ClientRequestHandler {
@@ -772,13 +1016,11 @@ impl ClientRequestHandler {
         -> Result<raft_command::Reply, RaftError>
     {
         let (to_me, from_sm) = channel();
-        {
-            self.to_state_machine.lock().unwrap().send(
-                StateMachineMessage::Command {
-                    command: op,
-                    response_channel: to_me,
-                }).unwrap();
-        }
+        self.to_state_machine.lock().unwrap().send(
+            StateMachineMessage::Command {
+                command: op,
+                response_channel: to_me,
+            }).unwrap();
         from_sm.recv().unwrap()
     }
 
@@ -790,15 +1032,20 @@ impl ClientRequestHandler {
         -> Result<raft_query::Reply, RaftError>
     {
         let (to_me, from_sm) = channel();
-        {
-            self.to_state_machine.lock().unwrap().send(
-                StateMachineMessage::Query {
-                    query: op,
-                    response_channel: to_me,
-                }).unwrap();
-        }
+        self.to_state_machine.lock().unwrap().send(
+            StateMachineMessage::Query {
+                query: op,
+                response_channel: to_me,
+            }).unwrap();
         from_sm.recv().unwrap()
+    }
 
+    fn add_server_blocking(&self, server_info: PeerInfo) -> Result<(), RaftError> {
+        let (to_me, from_main) = channel();
+        self.to_main_thread.lock().unwrap().send(
+            MainThreadMessage::AddServer(server_info, to_me)
+        ).unwrap();
+        from_main.recv().unwrap()
     }
 }
 
@@ -806,17 +1053,26 @@ impl RpcObject for ClientRequestHandler {
     fn handle_rpc (&self, params: capnp::any_pointer::Reader,
                    result: capnp::any_pointer::Builder) -> Result<(), RpcError> {
         params.get_as::<client_request::Reader>().map(|client_request| {
-            let current_state = { self.state.lock().unwrap().current_state };
-            let mut reply = Err(RaftError::NotLeader(
-                    {self.state.lock().unwrap().last_leader_contact.1}));
-            if matches!(current_state, State::Leader { .. }) { 
+            let (is_leader, mut reply) = {
+                let state = self.state.lock().unwrap();
+                (matches!(state.current_state, State::Leader { .. }),
+                 Err(RaftError::NotLeader(state.last_leader_contact.1)))
+            };
+
+            if is_leader { 
                 let op = client_command::request_from_proto(client_request);
                 reply = match op {
                     client_command::Request::Command(op) =>
                         self.client_write_blocking(op).map(client_command::Reply::Command),
                     client_command::Request::Query(op) =>
                         self.client_read_blocking(op).map(client_command::Reply::Query),
-                    _ => Ok(client_command::Reply::Command(raft_command::Reply::Noop)),
+                    client_command::Request::AddServer(server_info) => {
+                        self.add_server_blocking(server_info)
+                            .map(|_| client_command::Reply::AddServer)
+                    }
+                    client_command::Request::RemoveServer(server_info) => {
+                        unimplemented!()
+                    }
                 };
             }
             let mut reply_proto = result.init_as::<client_request::reply::Builder>();
@@ -831,7 +1087,7 @@ mod tests {
     use std::net::{IpAddr, Ipv4Addr, SocketAddr};
     use super::*;
     use super::rand::{thread_rng, Rng};
-    use super::peer::{PeerThreadMessage, PeerHandle};
+    use super::peer::{PeerThreadMessage, PeerHandle, PeerState};
     use super::{ServerInfo, broadcast_append_entries, ServerState,
                 State, generate_election_timeout, update_commit_index,
                 StateMachineMessage,
@@ -842,6 +1098,7 @@ mod tests {
     use std::sync::mpsc::{channel, Receiver};
     use std::sync::{Arc, Mutex};
     use std::fs;
+    use std::collections::VecDeque;
 
     const DEFAULT_HEARTBEAT_TIMEOUT_MS: u64 = 150;
 
@@ -867,31 +1124,31 @@ mod tests {
 
         let (mock_log, log_file_handle) = new_mock_log();
         let log: Arc<Mutex<Log>> = Arc::new(Mutex::new(mock_log));
+        let (tx, rx) = channel();
+        let (tx1, rx1) = channel();
+        let peers = (0 .. num_peers)
+            .map(|n| (n, PeerHandle {id: n, to_peer: tx.clone(),
+                                 next_index: 1, match_index: 0, thread: None, state: PeerState::Voting}))
+            .collect::<HashMap<u64, PeerHandle>>();
         let state = Arc::new(Mutex::new(ServerState {
             current_state: State::Follower,
             current_term: 0,
             commit_index: 0,
             voted_for: None,
+            peers: peers,
             last_leader_contact: (Instant::now(), None),
             election_timeout: generate_election_timeout(),
             state_file: StateFile::new_from_filename(&state_filename).unwrap(),
-            last_persisted_index: 0,
-            cluster: HashMap::new(),
+            last_persisted_index: 0
         }));
-        let (tx, rx) = channel();
-        let (tx1, rx1) = channel();
-        let peers = (0 .. num_peers)
-            .map(|n| PeerHandle {id: n, to_peer: tx.clone(),
-                                 next_index: 1, match_index: 0, thread: None})
-            .collect::<Vec<PeerHandle>>();
         let server = Server {
             state: state,
             log: log,
             info: ServerInfo {
-                peers: peers,
                 me: (0, SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 8080)),
                 heartbeat_timeout: Duration::from_millis(DEFAULT_HEARTBEAT_TIMEOUT_MS),
-                state_machine: StateMachineHandle {tx: tx1, thread: None}
+                state_machine: StateMachineHandle {tx: tx1, thread: None},
+                to_me: channel().0,
             }
         };
         MockServer {peer_rx: rx, state_machine_rx: rx1, server: server,
@@ -916,11 +1173,15 @@ mod tests {
         // Send append entries to peers!
         let ref mut state = mock_server.server.state.lock().unwrap();
         state.commit_index = commit_index + 1;
-        state.current_state = State::Leader { last_heartbeat: Instant::now() };
+        state.current_state = State::Leader {
+            last_heartbeat: Instant::now(),
+            pending_cluster_changes: VecDeque::new(),
+            uncommited_cluster_change: None
+        };
         broadcast_append_entries(&mut mock_server.server.info, state, mock_server.server.log.clone());
 
         // Each peer should receive a message...
-        for _ in 0..mock_server.server.info.peers.len() {
+        for _ in 0..state.peers.len() {
             match mock_server.peer_rx.recv().unwrap() {
                 PeerThreadMessage::AppendEntries(entry) => {
                     assert_eq!(entry.entries.len(), vec.len());
@@ -936,12 +1197,12 @@ mod tests {
     #[test]
     fn server_starts_election() {
         const NUM_PEERS: u64 = 4;
-        let mock_server = mock_server(NUM_PEERS);
+        let mut mock_server = mock_server(NUM_PEERS);
         let mut state = mock_server.server.state.lock().unwrap();
-        mock_server.server.start_election(&mut state);
+        Server::start_election(&mut mock_server.server.info, &mut state, mock_server.server.log.clone());
         assert!(matches!(state.current_state, State::Candidate{ .. }));
         // Each peer should have received a RequestVote message.
-        for _ in 0..mock_server.server.info.peers.len() {
+        for _ in 0..state.peers.len() {
             match mock_server.peer_rx.recv().unwrap() {
                 PeerThreadMessage::RequestVote(vote) => {
                     assert_eq!(vote.term, state.current_term);
@@ -955,30 +1216,36 @@ mod tests {
     fn mock_replicate_two_entries() -> MockServer {
         const NUM_PEERS: u64 = 4;
         let mut mock_server = mock_server(NUM_PEERS);
-        mock_server.server.info.peers[0].match_index = 2;
-        mock_server.server.info.peers[1].match_index = 1;
-        mock_server.server.info.peers[2].match_index = 2;
-        mock_server.server.info.peers[3].match_index = 3;
+        {
+            let mut state = mock_server.server.state.lock().unwrap();
+            state.peers.get_mut(&0).unwrap().match_index = 2;
+            state.peers.get_mut(&1).unwrap().match_index = 1;
+            state.peers.get_mut(&2).unwrap().match_index = 2;
+            state.peers.get_mut(&3).unwrap().match_index = 3;
+        }
 
         mock_server
     }
 
     #[test]
     fn leader_waits_on_persisted_index() {
-        let mock_server = mock_replicate_two_entries();
+        let mut mock_server = mock_replicate_two_entries();
         let mut state = mock_server.server.state.lock().unwrap();
-        update_commit_index(&mock_server.server.info, &mut state);
+        update_commit_index(&mut mock_server.server.info, &mut state, mock_server.server.log.clone());
         assert_eq!(state.commit_index, 0);
     }
 
     #[test]
-    fn server_updates_comit_index() {
-        let mock_server = mock_replicate_two_entries();
+    fn server_updates_commit_index() {
+        let mut mock_server = mock_replicate_two_entries();
         let mut state = mock_server.server.state.lock().unwrap();
         assert_eq!(state.commit_index, 0);
 
         state.last_persisted_index = 2;
-        update_commit_index(&mock_server.server.info, &mut state);
+        // we must be leader before commiting anything
+        state.transition_to_candidate(&mut mock_server.server.info, mock_server.server.log.clone()).unwrap();
+        state.transition_to_leader(&mut mock_server.server.info, mock_server.server.log.clone());
+        update_commit_index(&mut mock_server.server.info, &mut state, mock_server.server.log.clone());
         assert_eq!(state.commit_index, 2);
 
         // make sure state machine got a command
@@ -995,7 +1262,7 @@ mod tests {
         // trigger an election
         {
             let mut state = mock_server.server.state.lock().unwrap();
-            mock_server.server.start_election(&mut state);
+            Server::start_election(&mut mock_server.server.info, &mut state, mock_server.server.log.clone());
             assert!(matches!(state.current_state, State::Candidate{ num_votes: 1, .. }));
         }
 
@@ -1031,13 +1298,13 @@ mod tests {
             // trigger an election
             {
                 let mut state = s.state.lock().unwrap();
-                s.start_election(&mut state);
+                Server::start_election(&mut s.info, &mut state, s.log.clone());
                 assert!(matches!(state.current_state, State::Candidate{ num_votes: 1, .. }));
             }
 
             // there are peers.size() + 1 (ourself) servers in the cluster.
             // You need exactly half plus 1 votes to win the election
-            let num_votes_required = (s.info.peers.len() + 1) / 2 + 1;
+            let num_votes_required = (s.state.lock().unwrap().peers.len() + 1) / 2 + 1;
 
             let num_votes_testing = num_votes_required - 1;
 
@@ -1117,14 +1384,14 @@ mod tests {
         let mut mock_server = mock_leader_server(NUM_PEERS);
         let s = &mut mock_server.server;
 
-        let (prev_state, prev_term, prev_commit_index) = {
+        let (prev_term, prev_commit_index) = {
             let state: &ServerState = &(s.state.lock().unwrap());
-            (state.current_state, state.current_term, state.commit_index)
+            (state.current_term, state.commit_index)
         };
         // cast one more vote
         cast_vote(s);
         let state: &ServerState = &s.state.lock().unwrap();
-        assert_eq!(state.current_state, prev_state);
+        assert!(matches!(state.current_state, State::Leader{ .. }));
         assert_eq!(state.current_term, prev_term);
         assert_eq!(state.commit_index, prev_commit_index);
     }
@@ -1136,16 +1403,16 @@ mod tests {
         let mut mock_server = main_thread_simulate_half_votes(NUM_PEERS);
         let s = &mut mock_server.server;
         // lose the election :(
-        let (prev_state, prev_term, prev_commit_index) = {
+        let (prev_term, prev_commit_index) = {
             let state: &mut ServerState = &mut s.state.lock().unwrap();
             state.transition_to_follower(1, &s.info.state_machine.tx, Some(s.info.me.0), s.log.clone()).unwrap();
             assert!(matches!(state.current_state, State::Follower));
-            (state.current_state, state.current_term, state.commit_index)
+            (state.current_term, state.commit_index)
         };
         // cast one more vote
         cast_vote(s);
         let state: &ServerState = &s.state.lock().unwrap();
-        assert_eq!(state.current_state, prev_state);
+        assert!(matches!(state.current_state, State::Follower));
         assert_eq!(state.current_term, prev_term);
         assert_eq!(state.commit_index, prev_commit_index);
     }
@@ -1160,7 +1427,6 @@ mod tests {
 
         #[test]
         fn transition_to_candidate_normal() {
-            const OUR_ID: u64 = 5;
             const NUM_PEERS: u64 = 4;
             let mut mock_server = mock_server(NUM_PEERS);
             let s = &mut mock_server.server;
@@ -1169,11 +1435,11 @@ mod tests {
             assert_eq!(state.voted_for, None);
             assert!(matches!(state.current_state, State::Follower));
 
-            state.transition_to_candidate(OUR_ID).unwrap();
+            state.transition_to_candidate(&mut s.info, s.log.clone()).unwrap();
             match state.current_state {
                 State::Candidate{num_votes, ..} => {
                     assert_eq!(state.current_term, 1);
-                    assert_eq!(state.voted_for, Some(OUR_ID));
+                    assert_eq!(state.voted_for, Some(s.info.me.0));
                     assert_eq!(num_votes, 1);
                 },
                 _ => panic!("Transition to candidate did not enter the candidate state.")
@@ -1182,13 +1448,12 @@ mod tests {
 
         #[test]
         fn transition_to_leader_normal() {
-            const OUR_ID: u64 = 1;
             const NUM_PEERS: u64 = 4;
             let mut mock_server = mock_server(NUM_PEERS);
             let s = &mut mock_server.server;
             let ref mut state = s.state.lock().unwrap();
             // we must be a candidate before we can become a leader
-            state.transition_to_candidate(OUR_ID).unwrap();
+            state.transition_to_candidate(&mut s.info, s.log.clone()).unwrap();
             state.transition_to_leader(&mut s.info, s.log.clone());
             assert!(matches!(state.current_state, State::Leader{..}));
 
@@ -1199,7 +1464,7 @@ mod tests {
             assert!(matches!(entry.op, raft_command::Request::Noop));
 
             // ensure that the dummy entry was broadcasted properly
-            for _ in 0..s.info.peers.len() {
+            for _ in 0..state.peers.len() {
                 match mock_server.peer_rx.recv().unwrap() {
                     PeerThreadMessage::AppendEntries(msg) => {
                         // Since we march forwards all the peer next_index to
@@ -1221,9 +1486,9 @@ mod tests {
             let s = &mut mock_server.server;
             let ref mut state = s.state.lock().unwrap();
 
-            state.transition_to_candidate(OUR_ID).unwrap();
+            state.transition_to_candidate(&mut s.info, s.log.clone()).unwrap();
             assert_eq!(state.current_term, 1);
-            assert_eq!(state.voted_for, Some(OUR_ID));
+            assert_eq!(state.voted_for.unwrap(), s.info.me.0);
             state.transition_to_follower(1, &s.info.state_machine.tx, Some(OUR_ID), s.log.clone()).unwrap();
             assert_eq!(state.current_term, 1);
             assert_eq!(state.voted_for, Some(OUR_ID));
@@ -1232,15 +1497,14 @@ mod tests {
 
         #[test]
         fn transition_to_follower_wipes_vote_if_new_term() {
-            const OUR_ID: u64 = 1;
             const NEW_TERM: u64 = 2;
             const NUM_PEERS: u64 = 4;
             let mut mock_server = mock_server(NUM_PEERS);
             let s = &mut mock_server.server;
             let ref mut state = s.state.lock().unwrap();
-            state.transition_to_candidate(OUR_ID).unwrap();
+            state.transition_to_candidate(&mut s.info, s.log.clone()).unwrap();
             assert_eq!(state.current_term, 1);
-            assert_eq!(state.voted_for, Some(OUR_ID));
+            assert_eq!(state.voted_for.unwrap(), s.info.me.0);
             state.transition_to_follower(NEW_TERM, &s.info.state_machine.tx, None, s.log.clone()).unwrap();
             assert_eq!(state.current_term, NEW_TERM);
             assert_eq!(state.voted_for, None);
@@ -1278,18 +1542,17 @@ mod tests {
         
         #[test]
         fn transition_to_candidate_persists_state() {
-            const OUR_ID: u64 = 1;
             const NUM_PEERS: u64 = 4;
             let mut mock_server = mock_server(NUM_PEERS);
             let s = &mut mock_server.server;
 
             let mut state = s.state.lock().unwrap();
-            state.transition_to_candidate(1).unwrap();
+            state.transition_to_candidate(&mut s.info, s.log.clone()).unwrap();
 
             let mut state_file = StateFile::new_from_filename(&mock_server.state_filename).unwrap();
             let state = state_file.get_state().unwrap();
             assert_eq!(state.term, 1);
-            assert_eq!(state.voted_for, Some(OUR_ID));
+            assert_eq!(state.voted_for.unwrap(), s.info.me.0);
         }
     }
 }

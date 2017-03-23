@@ -10,10 +10,13 @@ use std::thread::JoinHandle;
 use std::sync::{Arc, Mutex};
 use std::sync::mpsc::{channel, Sender, Receiver};
 use std::mem;
+use std::time::{Instant, Duration};
 
 use super::log::{Log, Entry};
-use super::super::common::constants;
-use super::{MainThreadMessage, AppendEntriesReply, RequestVoteReply};
+use super::super::common::{constants, RaftError};
+use super::{MainThreadMessage, AppendEntriesReply, RequestVoteReply, RpcHandlerPipe};
+
+pub type PeerInfo = (u64, SocketAddr);
 
 
 /// Messages received by peer thread
@@ -45,21 +48,37 @@ pub enum PeerThreadMessage {
     Shutdown
 }
 
+#[derive(Debug)]
+pub enum PeerState {
+    Voting,
+    // non voting members have a current round and a time that round started at as well as an
+    // rpc handler thread that is waiting to hear if this succeeds or not
+    NonVoting(u32, Instant, RpcHandlerPipe)
+}
+
 ///
 /// Handle for main thread to send messages to Peer.
 ///
+#[derive(Debug)]
 pub struct PeerHandle {
     pub id: u64,
     pub to_peer: Sender<PeerThreadMessage>,
     pub next_index: usize,
     pub match_index: usize,
-    pub thread: Option<JoinHandle<()>>
+    pub thread: Option<JoinHandle<()>>,
+    pub state: PeerState
+}
+
+pub enum NonVotingPeerState {
+    CatchingUp,
+    CaughtUp(RpcHandlerPipe),
+    TimedOut(RpcHandlerPipe),
+    VotingPeer
 }
 
 impl PeerHandle {
     ///
     /// Pushes a non-blocking append-entries request to this peer.
-    /// copies entries (self.next_index, commit_index + 1) (inclusive, exlcusive)
     ///
     /// #Panics
     /// Panics if the peer thread has panicked.
@@ -87,6 +106,44 @@ impl PeerHandle {
             leader_commit: commit_index,
         });
         self.to_peer.send(message).unwrap(); //panics if the peer thread has panicked
+    }
+
+    /// Advances the current round of this non-voting peer. Is a noop for voting peers.
+    pub fn advance_non_voting_peer_round(&mut self, latest_log_index: usize) -> NonVotingPeerState {
+        let mut ret_state = NonVotingPeerState::VotingPeer;
+        if let PeerState::NonVoting(ref mut round, ref mut start_time, ref mut pipe) = self.state {
+            *round += 1;
+            if self.next_index == latest_log_index + 1 {
+                // woohoo they're all caught up
+                // need to do a replace here since pipe isn't optional...
+                let p = mem::replace(pipe, channel().0);
+                ret_state = NonVotingPeerState::CaughtUp(p);
+            } else {
+                let now = Instant::now();
+                if *round == constants::MAX_ROUNDS_FOR_NEW_SERVER {
+                    if now.duration_since(*start_time) > Duration::from_millis(constants::ELECTION_TIMEOUT_MIN) {
+                        // need to do a replace here since pipe isn't optional...
+                        let p = mem::replace(pipe, channel().0);
+                        ret_state = NonVotingPeerState::TimedOut(p);
+                    } else {
+                        // server is moving fast enough so we'll add it to the cluster
+                        // need to do a replace here since pipe isn't optional...
+                        let p = mem::replace(pipe, channel().0);
+                        ret_state = NonVotingPeerState::CaughtUp(p);
+                    }
+                } else {
+                    // not caught up yet
+                    *start_time = now;
+                    ret_state = NonVotingPeerState::CatchingUp;
+                }
+            }
+        }
+
+        match ret_state {
+            NonVotingPeerState::CaughtUp(..) => self.state = PeerState::Voting,
+            _ => {}
+        }
+        ret_state
     }
 }
 
@@ -119,6 +176,8 @@ pub struct Peer {
     from_main: Receiver<PeerThreadMessage>
 }
 
+// TODO(jason): Use mio to ensure that peers shutdown without blocking the main thread
+// Right now it's possible for a laggy peer to block the main thread during step down or shut down
 impl Peer {
     ///
     /// Spawns a new Peer in a background thread to communicate with the server at id.
@@ -126,7 +185,7 @@ impl Peer {
     /// # Panics
     /// Panics if the OS fails to create a new background thread.
     ///
-    pub fn start (id: (u64, SocketAddr), to_main: Sender<MainThreadMessage>) -> PeerHandle {
+    pub fn start (id: PeerInfo, to_main: Sender<MainThreadMessage>, non_voting: Option<RpcHandlerPipe>) -> PeerHandle {
         let (to_peer, from_main) = channel();
         
         let t = thread::spawn(move || {
@@ -139,12 +198,18 @@ impl Peer {
             peer.main();
         });
 
+        let state = match non_voting {
+            Some(pipe) => PeerState::NonVoting(0, Instant::now(), pipe),
+            None => PeerState::Voting
+        };
+
         PeerHandle {
             id: id.0,
             to_peer: to_peer,
             next_index: 1,
             match_index: 0,
-            thread: Some(t)
+            thread: Some(t),
+            state: state
         }
     }
 
@@ -380,7 +445,8 @@ mod tests {
             to_peer: tx.clone(),
             next_index: PEER_NEXT_INDEX,
             match_index: PEER_NEXT_INDEX - 1,
-            thread: None
+            thread: None,
+            state: PeerState::Voting
         };
         let (mock_log, _log_file_handle) = new_random_with_term(LOG_SIZE, TERM);
         let log: Arc<Mutex<Log>> = Arc::new(Mutex::new(mock_log));
@@ -417,7 +483,8 @@ mod tests {
             to_peer: tx.clone(),
             next_index: PEER_NEXT_INDEX,
             match_index: PEER_NEXT_INDEX - 1,
-            thread: None
+            thread: None,
+            state: PeerState::Voting
         };
         let (mock_log, _log_file_handle) = new_mock_log();
         let log: Arc<Mutex<Log>> = Arc::new(Mutex::new(mock_log));

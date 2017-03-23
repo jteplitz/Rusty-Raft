@@ -168,10 +168,9 @@ impl RaftConnection {
     ///
     /// Helper to retrieve a random leader from our initial cluster
     ///
-    fn choose_random_leader(&self) -> SocketAddr {
+    fn choose_random_leader(&self) -> u64 {
         let keys: Vec<u64> = self.cluster.keys().cloned().collect();
-        let random_key = rand::thread_rng().choose(&keys).unwrap();
-        self.cluster.get(random_key).unwrap().clone()
+        *rand::thread_rng().choose(&keys).unwrap()
     }
 
     ///
@@ -189,14 +188,14 @@ impl RaftConnection {
             if let Err(ref err) = result {
                 match *err {
                     RaftError::NotLeader(leader) => {
-                        self.leader_guess = leader.unwrap_or(self.choose_random_leader());
+                        self.leader_guess = self.cluster.get(&leader.unwrap_or(self.choose_random_leader())).unwrap().clone();
                         backoff_multiplier += 1;
                         num_retries -= 1;
                         thread::sleep(self.backoff_time * backoff_multiplier);
                         continue;
                     },
                     RaftError::IoError(_) => { // Maybe the leader is down
-                        self.leader_guess = self.choose_random_leader();
+                        self.leader_guess = self.cluster.get(&self.choose_random_leader()).unwrap().clone();
                         num_retries -= 1;
                         backoff_multiplier += 1;
                         thread::sleep(self.backoff_time * backoff_multiplier);
@@ -225,6 +224,8 @@ impl RaftConnection {
 
     ///
     /// Sends this Raft cluster a command with data |buffer|.
+    ///
+    /// #Errors
     /// RaftError if Rpc or Client's state machine fails.
     ///
     pub fn command(&mut self, buffer: &[u8]) -> Result<(), RaftError> {
@@ -240,6 +241,7 @@ impl RaftConnection {
     /// Sends this Raft cluster a query with data |buffer|, and returns
     /// the queried data buffer from the state machine on success.
     ///
+    /// #Errors
     /// RaftError if Rpc or Client's state machine fails.
     ///
     pub fn query(&mut self, buffer: &[u8]) -> Result<Vec<u8>, RaftError> {
@@ -247,12 +249,23 @@ impl RaftConnection {
                 raft_query::Request::StateMachineQuery(buffer.to_vec())))
             .and_then(|reply| {
                 if let client_command::Reply::Query(reply) = reply {
-                    if let raft_query::Reply::StateMachineQuery(data) = reply {
-                        return Ok(data);
+                    match reply {
+                        raft_query::Reply::StateMachineQuery(data) => {
+                            return Ok(data);
+                        }
                     }
                 }
                 Err(RaftError::Unknown)
             })
+    }
+
+    pub fn add_server(&mut self, id: u64, addr: SocketAddr) -> Result<(), RaftError> {
+        self.send_client_request(client_command::Request::AddServer((id, addr)))
+        // sucessful AddServer RPCs don't return anything
+        .map(|_| {})?;
+        // add this server to our cached cluster map
+        self.cluster.insert(id, addr);
+        Ok(())
     }
 }
 
@@ -273,16 +286,15 @@ mod tests {
 
     ///
     /// ClientRequest handler that simply fails
-    /// and redirects the client to the "leader" at |redirect_port|.
+    /// and redirects the client to the "leader" at |leader_id|.
     ///
-    struct RedirectClientRequestHandler {redirect_port: u16}
+    struct RedirectClientRequestHandler {leader_id: u64}
     impl RpcObject for RedirectClientRequestHandler {
         fn handle_rpc (&self, _: capnp::any_pointer::Reader, result: capnp::any_pointer::Builder) 
             -> Result<(), RpcError>
             {
                 let mut result_builder = result.init_as::<proto::reply::Builder>();
-                let redirect_addr = format!("{}:{}", LOCALHOST, self.redirect_port);
-                let err = RaftError::NotLeader(Some(SocketAddr::from_str(&*redirect_addr).unwrap()));
+                let err = RaftError::NotLeader(Some(self.leader_id));
                 client_command::reply_to_proto(Err(err), &mut result_builder);
                 Ok(())
             }
@@ -324,9 +336,9 @@ mod tests {
         (port, server)
     }
 
-    fn start_redirect_client_rpc_handler(redirect_port: u16) -> (u16, RpcServer) {
+    fn start_redirect_client_rpc_handler(redirect_id: u64) -> (u16, RpcServer) {
         start_client_handler(Box::new(RedirectClientRequestHandler 
-                                      { redirect_port: redirect_port }))
+                                      { leader_id: redirect_id}))
     }
 
     fn start_leader_client_rpc_handler() -> (u16, RpcServer) {
@@ -359,20 +371,18 @@ mod tests {
         // Create leader ...
         let (leader_port, _server) = start_leader_client_rpc_handler();
         let leader_socket = format!("{}:{}", LOCALHOST, leader_port);
-        let mut chain_port = leader_port;
         let mut cluster = HashMap::new();
         let mut backoff_bound = (0, BACKOFF_TIME_MS);
         let mut redirect_servers = Vec::new();
         cluster.insert(0, SocketAddr::from_str(&*leader_socket).unwrap());
         // Construct redirect chain of clients ...
-        for i in 0 .. chain_size {
-            let (redirect_port, server) = start_redirect_client_rpc_handler(chain_port);
+        for i in 1 .. chain_size + 1 {
+            let (redirect_port, server) = start_redirect_client_rpc_handler(i - 1);
             redirect_servers.push(server);
             let redirect_socket = format!("{}:{}", LOCALHOST, redirect_port);
-            cluster.insert(0, SocketAddr::from_str(&*redirect_socket).unwrap());
-            chain_port = redirect_port;
-            backoff_bound = (backoff_bound.0 + (i + 1) * BACKOFF_TIME_MS,
-                             backoff_bound.1 + (i + 2) * BACKOFF_TIME_MS);
+            cluster.insert(i, SocketAddr::from_str(&*redirect_socket).unwrap());
+            backoff_bound = (backoff_bound.0 + (i) * BACKOFF_TIME_MS,
+                             backoff_bound.1 + (i + 1) * BACKOFF_TIME_MS);
         }
         // Create and operate on RaftConnection ...
         let start_time = Instant::now();

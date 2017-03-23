@@ -157,8 +157,7 @@ impl RaftStateMachine {
         match *data {
             raft_query::Request::StateMachineQuery(ref buffer) =>
                 self.client_state_machine.query(buffer)
-                    .map(raft_query::Reply::StateMachineQuery),
-            _ => Err(RaftError::Unknown),
+                    .map(raft_query::Reply::StateMachineQuery)
         }
     }
 }
