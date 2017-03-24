@@ -2,6 +2,7 @@
 extern crate rusty_raft;
 extern crate rand;
 extern crate rustc_serialize;
+extern crate env_logger;
 
 use rand::{thread_rng, Rng};
 use rusty_raft::server::{start_server, ServerHandle};
@@ -38,6 +39,7 @@ Options:
 ";
 
 fn main() {
+    env_logger::init().unwrap();
     // TODO (sydli) make prettier
     let mut args = args();
     if let Some(command) = args.nth(1) {
@@ -61,7 +63,7 @@ fn main() {
             }
         }
     }
-    warn!("Incorrect usage. \n{}", USAGE);
+    println!("Incorrect usage. \n{}", USAGE);
 }
 
 ///
