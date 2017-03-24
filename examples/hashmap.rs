@@ -2,6 +2,7 @@
 extern crate rusty_raft;
 extern crate rand;
 extern crate rustc_serialize;
+extern crate env_logger;
 
 use rand::{thread_rng, Rng};
 use rusty_raft::server::{start_server, ServerHandle};
@@ -38,6 +39,8 @@ Options:
 ";
 
 fn main() {
+    env_logger::init().unwrap();
+    trace!("Starting program");
     // TODO (sydli) make prettier
     let mut args = args();
     if let Some(command) = args.nth(1) {
@@ -61,7 +64,7 @@ fn main() {
             }
         }
     }
-    warn!("Incorrect usage. \n{}", USAGE);
+    println!("Incorrect usage. \n{}", USAGE);
 }
 
 ///
@@ -148,10 +151,11 @@ const FIRST_ID: u64 = 1;
 
 impl Server {
     fn new(id: u64, info: &ServerInfo) -> Server {
+        trace!("Starting new server with state file {} and log file {}", &info.state_filename, &info.log_filename);
         Server { 
             handle: 
-                // TODO: use filenames
-                start_server(id, Box::new(RaftHashMap { map: HashMap::new() }), info.addr, id == FIRST_ID, info.state_filename.clone(), info.log_filename.clone()).unwrap()
+                start_server(id, Box::new(RaftHashMap { map: HashMap::new() }), info.addr, id == FIRST_ID,
+                info.state_filename.clone(), info.log_filename.clone()).unwrap()
         }
     }
 }
@@ -166,19 +170,35 @@ impl Cluster {
     fn new(info: &HashMap<u64, ServerInfo>) -> Cluster {
         let first_cluster = info.clone().into_iter().map(|(id, info)| (id, info.addr) )
             .filter(|&(id, _)| id == FIRST_ID).collect::<HashMap<u64, SocketAddr>>();
+
         let mut servers = HashMap::new();
+        // start up all the servers
         for (id, info) in info { servers.insert(*id, Server::new(*id, info)); }
+        // connect to the cluster (which will only contain the bootstrapped server)
         let mut raft_db =  RaftConnection::new_with_session(&first_cluster).unwrap();
+
+        // issue AddServer RPCs for all the other servers
         for id in servers.keys() {
             if *id == FIRST_ID { continue; }
-            raft_db.add_server(*id, info.get(id).cloned().unwrap().addr);
+            raft_db.add_server(*id, info.get(id).cloned().unwrap().addr).unwrap();
         }
         Cluster { servers: servers, cluster: info.clone(), client: raft_db }
     }
 
     fn add_server(&mut self, id: u64, addr: SocketAddr) {
-        self.client.add_server(id, addr);
-        println!("added server {}, {:?}", id, addr);
+        if self.cluster.contains_key(&id) {
+            println!("Server {} is already in the cluster. Servers {:?}", id, self.cluster);
+            return;
+        }
+
+        trace!("Starting a new server at {}", addr);
+        let info = ServerInfo::new(addr);
+        self.cluster.insert(id, info);
+        self.servers.insert(id, Server::new(id, &self.cluster[&id]));
+
+        trace!("Attempting to add server {}", id);
+        self.client.add_server(id, addr).unwrap();
+        println!("Added server {}, {:?}", id, addr);
     }
 
     fn remove_server(&mut self, id: u64) {
@@ -192,11 +212,13 @@ impl Cluster {
     fn kill_server(&mut self, id: u64) {
         if !self.servers.contains_key(&id) {
             println!("Server {} is not up right now!", id);
+        } else {
+            {
+                // drop server
+                self.servers.remove(&id).unwrap();
+                println!("Killed server {}", id);
+            }
         }
-        {
-            self.servers.remove(&id).unwrap();
-        } // drop server
-        println!("Killed server {}", id);
     }
 
     fn start_server(&mut self, id: u64) {

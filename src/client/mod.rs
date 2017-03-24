@@ -189,7 +189,10 @@ impl RaftConnection {
             if let Err(ref err) = result {
                 match *err {
                     RaftError::NotLeader(leader) => {
-                        self.leader_guess = self.cluster.get(&leader.unwrap_or(self.choose_random_leader())).unwrap().clone();
+                        let leader_guess_id = leader.unwrap_or(self.choose_random_leader());
+                        trace!("Will try to connect to {} as leader", leader_guess_id);
+                        self.leader_guess = self.cluster.get(&leader_guess_id).unwrap().clone();
+                        trace!("Got addr {} for {}", self.leader_guess, leader_guess_id);
                         backoff_multiplier += 1;
                         num_retries -= 1;
                         thread::sleep(self.backoff_time * backoff_multiplier);
