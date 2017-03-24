@@ -326,19 +326,19 @@ impl Drop for ServerHandle {
 /// This will get written to the log before the server starts up,
 /// so it should only be given to the first server in the cluster
 ///
-/// NB: The server won't actually be listening on my_addr. It starts up on a random port,
+/// NB: The server won't actually be listening on relay_addr. It starts up on a random port,
 /// so it can be used in parallel tests (you should use the relay server to send messages to
 /// this server)
 /// 
 /// To start a real server use `start_server`
 pub fn start_test_server<F> (id: u64, state_machine: F, 
                          state_filename: &str, log_filename: &str,
-                         my_addr: Option<SocketAddr>) -> Result<ServerHandle, IoError> 
+                         relay_addr: Option<SocketAddr>) -> Result<ServerHandle, IoError> 
     where F: FnOnce() -> Box<RaftStateMachine> {
     const HEARTBEAT_TIMEOUT: u64 = 75;
 
-    if let Some(addr) = my_addr {
-        write_initial_config_to_log(&log_filename, id, addr)?;
+    if let Some(addr) = relay_addr {
+        write_initial_config_to_log(&log_filename, id, relay_addr.unwrap())?;
     }
 
     let config = Config::new (id,
@@ -740,9 +740,29 @@ impl Server {
                 }
                 
             } // end loop
-            
+
+            // clean up based on state
+            let mut state = self.state.lock().unwrap();
+            match state.current_state {
+                State::Leader {ref pending_cluster_changes, ..} => {
+                    self.info.state_machine.tx.send(StateMachineMessage::Flush).unwrap();
+                    self.log.lock().unwrap().flush_background_thread();
+                    let pipes = pending_cluster_changes
+                        .iter()
+                        .map(|&(_, ref pipe)| {
+                            pipe
+                        })
+                        .chain(pending_cluster_changes.iter().map(|&(_, ref pipe)| pipe));
+                    for pipe in pipes {
+                        warn!("Sending not leader!");
+                        // TODO: Send leader guess
+                        pipe.send(Err(RaftError::NotLeader(None)));
+                    }
+                },
+                State::Follower | State::Candidate {..} => {/*No cleanup work*/}
+            }
             // shutdown the peers by dropping their handles
-            self.state.lock().unwrap().peers.clear();
+            state.peers.clear();
         })
     }
 

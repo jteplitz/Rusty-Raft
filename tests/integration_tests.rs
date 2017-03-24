@@ -9,7 +9,7 @@ mod mock_state_machine;
 
 use mock_state_machine::*;
 use relay_server::*;
-use rusty_raft::server::{start_test_server, ServerHandle};
+use rusty_raft::server::{start_test_server, ServerHandle, start_server_with_config};
 use rusty_raft::client::RaftConnection;
 use rusty_raft::common::Config;
 
@@ -21,6 +21,8 @@ use std::net::{SocketAddr, ToSocketAddrs};
 use std::sync::mpsc::{Receiver, channel};
 use std::time::Duration;
 use std::fs;
+
+const HEARTBEAT_TIMEOUT: u64 = 75;
 
 // Container around a MockStateMachine Receiver and a handle
 // to the raft server that is running that instance of the state machine
@@ -36,8 +38,12 @@ struct StateMachineHandle {
 impl Drop for StateMachineHandle {
     /// Deletes the state and log files
     fn drop (&mut self) {
-        fs::remove_file(&self.state_filename).unwrap();
-        fs::remove_file(&self.log_filename).unwrap();
+        if self.state_filename != "" {
+            fs::remove_file(&self.state_filename).unwrap();
+        }
+        if self.log_filename != "" {
+            fs::remove_file(&self.log_filename).unwrap();
+        }
     }
 }
 
@@ -57,7 +63,6 @@ fn start_relay_server (num_servers: u64) -> (RelayServer, HashMap<u64, SocketAdd
 /// Starts up a new raft server and binds it to the given address
 fn start_raft_server(id: u64, addr: Option<SocketAddr>) -> StateMachineHandle 
 {
-    const HEARTBEAT_TIMEOUT: u64 = 75;
     const STATE_FILENAME_LEN: usize = 20;
 
     // create a config object
@@ -261,9 +266,9 @@ fn it_catches_up_when_behind() {
 
     // Bring a server down.
     let index: u64 = Range::new(0, state_machines.len()).ind_sample(&mut thread_rng()) as u64;
-    let address = { // Shut down server.
+    let (address, state_filename, log_filename) = { // Shut down server.
         let sm = state_machines.remove(index as usize);
-        sm.server_handle.get_local_addr()
+        (sm.server_handle.get_local_addr(), sm.state_filename.clone(), sm.log_filename.clone())
     };
 
     // Issue command.
@@ -275,7 +280,24 @@ fn it_catches_up_when_behind() {
 
     trace!("[ Test ] Bringing server back online.");
     // Bring server back up.
-    state_machines.insert(index as usize, start_raft_server(index, None));
+    {
+        let config = Config::new(index, address, Duration::from_millis(HEARTBEAT_TIMEOUT), &state_filename, &log_filename);
+
+        let (tx, rx) = channel();
+        let state_machine = Box::new(MockStateMachine::new_with_sender(tx));
+        let server = start_server_with_config(config, move || state_machine).unwrap();
+        let handle = StateMachineHandle {
+            rx: rx,
+            server_handle: server,
+            id: index,
+            addr: address,
+            state_filename: state_filename.clone(),
+            log_filename: log_filename.clone()
+        };
+
+        state_machines.insert(index as usize, handle);
+    }
+
     // Make sure the zombie server got the message.
     assert_data_replicated(&state_machines, &data, |handle| handle.id == index, None);
     { // Issue command again.
