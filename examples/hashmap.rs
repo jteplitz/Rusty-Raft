@@ -2,7 +2,6 @@
 extern crate rusty_raft;
 extern crate rand;
 extern crate rustc_serialize;
-extern crate env_logger;
 
 use rand::{thread_rng, Rng};
 use rusty_raft::server::{start_server, ServerHandle};
@@ -39,7 +38,6 @@ Options:
 ";
 
 fn main() {
-    env_logger::init().unwrap();
     // TODO (sydli) make prettier
     let mut args = args();
     if let Some(command) = args.nth(1) {
@@ -47,7 +45,7 @@ fn main() {
             if let (Some(id_str), Some(filename)) =
                    (args.next(), args.next()) {
                 if let Ok(id) = id_str.parse::<u64>() {
-                    Server::new(id, &cluster_from_file(&filename)).repl();
+                    Server::new(id, cluster_from_file(&filename).get(&id).unwrap().addr).repl();
                     return;
                 }
             }
@@ -63,7 +61,7 @@ fn main() {
             }
         }
     }
-    println!("Incorrect usage. \n{}", USAGE);
+    warn!("Incorrect usage. \n{}", USAGE);
 }
 
 ///
@@ -118,42 +116,61 @@ trait Repl {
     }
 }
 
+#[derive(Clone, Debug)]
+struct ServerInfo {
+    addr: SocketAddr,
+    state_filename: String,
+    log_filename: String,
+}
+
+const STATE_FILENAME_LEN: usize = 20;
+impl ServerInfo {
+    fn new(addr: SocketAddr) -> ServerInfo {
+
+        let mut random_filename: String = thread_rng().gen_ascii_chars().take(STATE_FILENAME_LEN).collect();
+        ServerInfo {
+            addr: addr,
+            state_filename: String::from("/tmp/state_") + &random_filename,
+            log_filename: String::from("/tmp/log_") + &random_filename,
+        }
+    }
+}
+
 struct Server {
     handle: ServerHandle,
 }
 
-impl Repl for Server {
+impl Repl for Server { // TODO: impl repl for a single node in the cluster
     fn exec(&mut self, command: String) -> bool { true }
     fn usage(&self) -> String { String::from("") }
 }
 
 impl Server {
-    fn new(id: u64, cluster: &HashMap<u64, SocketAddr>) -> Server {
-        if !cluster.contains_key(&id) {
-            panic!("Initial cluster must contain server id: {}", id);
-        }
+    fn new(id: u64, addr: SocketAddr) -> Server {
         Server { 
             handle: 
                 // TODO: Only the first server should put itself in its log file
-                start_server(id, Box::new(RaftHashMap { map: HashMap::new() }), *cluster.get(&id).unwrap()).unwrap()
+                start_server(id, Box::new(RaftHashMap { map: HashMap::new() }), addr).unwrap()
         }
     }
 }
 
-
 struct Cluster {
     servers: HashMap<u64, Server>,
-    cluster: HashMap<u64, SocketAddr>,
+    cluster: HashMap<u64, ServerInfo>,
 }
 
 impl Cluster {
-    fn new(cluster: &HashMap<u64, SocketAddr>) -> Cluster {
-        Cluster {
-            servers: cluster.iter()
-                .map(|(id, _)| (*id, Server::new(*id, &cluster.clone())))
-                .collect::<HashMap<u64, Server>>(),
-            cluster: cluster.clone(),
+    fn new(info: &HashMap<u64, ServerInfo>) -> Cluster {
+        let addr = info.clone().into_iter().map(|(id, info)| (id, info.addr))
+            .collect::<HashMap<u64, SocketAddr>>();
+        let mut servers = HashMap::new();
+        for (id, info) in info { servers.insert(*id, Server::new(*id, info.addr)); }
+        let mut raft_db =  RaftConnection::new_with_session(&addr.clone()).unwrap();
+        for id in servers.keys() {
+            raft_db.add_server(*id, info.get(id).cloned().unwrap().addr);
         }
+        Cluster { servers: servers, cluster: info.clone() }
     }
 
     fn add_server(&mut self, id: u64, addr: SocketAddr) {
@@ -182,7 +199,7 @@ impl Cluster {
         if self.servers.contains_key(&id) {
             println!("Server {} is already up!", id);
         }
-        self.servers.insert(id, Server::new(id, &self.cluster.clone()));
+        self.servers.insert(id, Server::new(id, self.cluster.get(&id).unwrap().addr));
         println!("Restarted server {}", id);
     }
 
@@ -257,13 +274,15 @@ struct Put {
 }
 
 impl Client {
-    fn new(cluster: &HashMap<u64, SocketAddr>) -> Client {
-        let connection = RaftConnection::new_with_session(cluster);
+    fn new(cluster: &HashMap<u64, ServerInfo>) -> Client {
+        let cluster = cluster.clone().into_iter().map(|(id, info)| (id, info.addr))
+            .collect::<HashMap<u64, SocketAddr>>();
+        let connection = RaftConnection::new_with_session(&cluster);
         if connection.is_none() {
             println!("Couldn't establish connection to cluster at {:?}", cluster);
             panic!();
         }
-        Client { raft: RaftConnection::new_with_session(cluster).unwrap() }
+        Client { raft: connection.unwrap() }
     }
 
     fn get(&mut self, key: String) -> Result<String, RaftError> {
@@ -321,7 +340,7 @@ fn as_addr(x: &str) -> Result<SocketAddr, std::io::Error> {
 /// Panics on io error (we can't access the cluster info!)
 /// TODO (sydli) make io_errs more informative
 // TODO(jason): Remove this and bootstrap a dynamic cluster
-fn cluster_from_file(filename: &str) -> HashMap<u64, SocketAddr> {
+fn cluster_from_file(filename: &str) -> HashMap<u64, ServerInfo> {
     let file = File::open(filename.clone())
                .expect(&format!("Unable to open file {}", filename));
     let mut lines = BufReader::new(file).lines();
@@ -337,11 +356,11 @@ fn cluster_from_file(filename: &str) -> HashMap<u64, SocketAddr> {
                         .and_then(|x| as_num(&x));
             words.next().ok_or(io_err())
                 .and_then(|x| as_addr(&x))
-                .and_then(move |addr| id.map(|id| (id, addr)))
+                .and_then(move |addr| id.map(|id| (id, ServerInfo::new(addr))))
         })
     }).collect::<Result<Vec<_>, _>>())
-    .map(|nodes: Vec<(u64, SocketAddr)>|
-        nodes.iter().cloned().collect::<HashMap<u64, SocketAddr>>()
+    .map(|nodes: Vec<(u64, ServerInfo)>|
+        nodes.iter().cloned().collect::<HashMap<u64, ServerInfo>>()
     ).unwrap()
 }
 
