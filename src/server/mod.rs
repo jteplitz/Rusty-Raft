@@ -354,15 +354,11 @@ pub fn start_test_server<F> (id: u64, state_machine: F,
 ///
 /// TODO(jason): Take in filenames instead of using random ones, and only
 /// write to log for bootstrapping first server
-pub fn start_server(id: u64, state_machine: Box<StateMachine>, my_addr: SocketAddr) -> Result<ServerHandle, IoError> {
+pub fn start_server(id: u64, state_machine: Box<StateMachine>, my_addr: SocketAddr, first: bool, state_filename: String, log_filename: String) -> Result<ServerHandle, IoError> {
     const HEARTBEAT_TIMEOUT: u64 = 75;
     const STATE_FILENAME_LEN: usize = 20;
-    // create a config object
-    let mut random_filename: String = thread_rng().gen_ascii_chars().take(STATE_FILENAME_LEN).collect();
-    let state_filename = String::from("/tmp/state_") + &random_filename;
-    let log_filename = String::from("/tmp/log_") + &random_filename;
 
-    write_initial_config_to_log(&log_filename, id, my_addr)?;
+    if first { write_initial_config_to_log(&log_filename, id, my_addr)?; }
 
     let state_machine = RaftStateMachine::new(state_machine);
     let config = Config::new (id,

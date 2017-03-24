@@ -41,6 +41,7 @@ const MIN_RETRY:u64 = 3;
 ///
 /// Note: not thread-safe. Wrap object in Mutex if shared across threads.
 ///
+#[derive(Debug)]
 pub struct RaftConnection {
     cluster: HashMap<u64, SocketAddr>,  // Known peers
     pub leader_guess: SocketAddr,           // Current guess for leader. TODO (sydli) unpub this

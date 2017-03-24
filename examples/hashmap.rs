@@ -45,7 +45,7 @@ fn main() {
             if let (Some(id_str), Some(filename)) =
                    (args.next(), args.next()) {
                 if let Ok(id) = id_str.parse::<u64>() {
-                    Server::new(id, cluster_from_file(&filename).get(&id).unwrap().addr).repl();
+                    Server::new(id, cluster_from_file(&filename).get(&id).unwrap()).repl();
                     return;
                 }
             }
@@ -136,21 +136,22 @@ impl ServerInfo {
     }
 }
 
-struct Server {
-    handle: ServerHandle,
-}
+struct Server { handle: ServerHandle, }
 
 impl Repl for Server { // TODO: impl repl for a single node in the cluster
     fn exec(&mut self, command: String) -> bool { true }
     fn usage(&self) -> String { String::from("") }
 }
 
+
+const FIRST_ID: u64 = 1;
+
 impl Server {
-    fn new(id: u64, addr: SocketAddr) -> Server {
+    fn new(id: u64, info: &ServerInfo) -> Server {
         Server { 
             handle: 
-                // TODO: Only the first server should put itself in its log file
-                start_server(id, Box::new(RaftHashMap { map: HashMap::new() }), addr).unwrap()
+                // TODO: use filenames
+                start_server(id, Box::new(RaftHashMap { map: HashMap::new() }), info.addr, id == FIRST_ID, info.state_filename.clone(), info.log_filename.clone()).unwrap()
         }
     }
 }
@@ -158,23 +159,26 @@ impl Server {
 struct Cluster {
     servers: HashMap<u64, Server>,
     cluster: HashMap<u64, ServerInfo>,
+    client: RaftConnection,
 }
 
 impl Cluster {
     fn new(info: &HashMap<u64, ServerInfo>) -> Cluster {
-        let addr = info.clone().into_iter().map(|(id, info)| (id, info.addr))
-            .collect::<HashMap<u64, SocketAddr>>();
+        let first_cluster = info.clone().into_iter().map(|(id, info)| (id, info.addr) )
+            .filter(|&(id, _)| id == FIRST_ID).collect::<HashMap<u64, SocketAddr>>();
         let mut servers = HashMap::new();
-        for (id, info) in info { servers.insert(*id, Server::new(*id, info.addr)); }
-        let mut raft_db =  RaftConnection::new_with_session(&addr.clone()).unwrap();
+        for (id, info) in info { servers.insert(*id, Server::new(*id, info)); }
+        let mut raft_db =  RaftConnection::new_with_session(&first_cluster).unwrap();
         for id in servers.keys() {
+            if *id == FIRST_ID { continue; }
             raft_db.add_server(*id, info.get(id).cloned().unwrap().addr);
         }
-        Cluster { servers: servers, cluster: info.clone() }
+        Cluster { servers: servers, cluster: info.clone(), client: raft_db }
     }
 
     fn add_server(&mut self, id: u64, addr: SocketAddr) {
-        println!("Adding server {}, {}", id, addr);
+        self.client.add_server(id, addr);
+        println!("added server {}, {:?}", id, addr);
     }
 
     fn remove_server(&mut self, id: u64) {
@@ -199,7 +203,7 @@ impl Cluster {
         if self.servers.contains_key(&id) {
             println!("Server {} is already up!", id);
         }
-        self.servers.insert(id, Server::new(id, self.cluster.get(&id).unwrap().addr));
+        self.servers.insert(id, Server::new(id, self.cluster.get(&id).unwrap()));
         println!("Restarted server {}", id);
     }
 
