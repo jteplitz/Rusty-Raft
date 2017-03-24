@@ -23,7 +23,7 @@ use std::fs;
 // to the raft server that is running that instance of the state machine
 struct StateMachineHandle {
     rx: Receiver<Vec<u8>>,
-    _server_handle: ServerHandle,
+    server_handle: ServerHandle,
     id: u64,
     state_filename: String,
     log_filename: String
@@ -55,31 +55,35 @@ fn start_relay_server (num_servers: u64) -> (RelayServer, HashMap<u64, SocketAdd
 /// Returns a StateMachineHandle that can be used to communicate with the raft server (through the
 /// ServerHandle) or check on the state of the MockStateMachine
 fn start_raft_servers(relay_server: &mut RelayServer, addrs: &HashMap<u64, SocketAddr>) -> Vec<StateMachineHandle> {
-    const HEARTBEAT_TIMEOUT: u64 = 75;
-    const STATE_FILENAME_LEN: usize = 20;
     println!("Starting {} raft servers", addrs.len());
 
     (0..addrs.len() as u64)
-    .map(|i| {
-        // create a config object
-        let random_filename: String = thread_rng().gen_ascii_chars().take(STATE_FILENAME_LEN).collect();
-        let state_filename = String::from("/tmp/state_") + &random_filename;
-        let log_filename = String::from("/tmp/log_") + &random_filename;
-
-        let (tx, rx) = channel();
-        let state_machine = Box::new(MockStateMachine::new_with_sender(tx));
-        let server_handle = {
-            let config = Config::new (addrs.clone(), i, "127.0.0.1:0".to_socket_addrs().unwrap().next().unwrap(),
-                    Duration::from_millis(HEARTBEAT_TIMEOUT), state_filename.clone(), &log_filename);
-            start_server_with_config(config, move || state_machine).unwrap()
-        };
-
-        // map this server through the relay server
-        relay_server.relay_address(*addrs.get(&i).unwrap(), server_handle.get_local_addr());
-        StateMachineHandle {rx: rx, _server_handle: server_handle, id: i,
-                            state_filename: state_filename, log_filename: log_filename}
-    })
+    .map(|i| start_raft_server(i, relay_server, addrs, None))
     .collect()
+}
+
+fn start_raft_server(i: u64, relay_server: &mut RelayServer, addrs: &HashMap<u64, SocketAddr>, local_addr: Option<SocketAddr>) -> StateMachineHandle {
+    const HEARTBEAT_TIMEOUT: u64 = 75;
+    const STATE_FILENAME_LEN: usize = 20;
+    // create a config object
+    let random_filename: String = thread_rng().gen_ascii_chars().take(STATE_FILENAME_LEN).collect();
+    let state_filename = String::from("/tmp/state_") + &random_filename;
+    let log_filename = String::from("/tmp/log_") + &random_filename;
+
+    let (tx, rx) = channel();
+    let state_machine = Box::new(MockStateMachine::new_with_sender(tx));
+    let local_address = local_addr.unwrap_or("127.0.0.1:0".to_socket_addrs().unwrap().next().unwrap());
+    let server_handle = {
+        let config = Config::new (addrs.clone(), i, local_address,
+                Duration::from_millis(HEARTBEAT_TIMEOUT), state_filename.clone(), &log_filename);
+        start_server_with_config(config, move || state_machine).unwrap()
+    };
+    // map this server through the relay server;
+    if local_addr.is_none() {
+        relay_server.relay_address(*addrs.get(&i).unwrap(), server_handle.get_local_addr());
+    }
+    StateMachineHandle {rx: rx, server_handle: server_handle, id: i,
+                        state_filename: state_filename, log_filename: log_filename}
 }
 
 #[test]
@@ -146,4 +150,67 @@ fn it_handles_a_failure() {
                 .all(|vec| vec.iter()
                               .zip(data.clone().into_bytes())
                               .all(|(a, b)| *a == b)));
+}
+
+fn issue_command_and_assert_ok(db: &mut RaftConnection) -> Vec<u8> {
+    const DATA_LENGTH: usize = 1;
+    let data: String = thread_rng().gen_ascii_chars().take(DATA_LENGTH).collect();
+    assert!(db.command(data.as_bytes()).is_ok());
+    data.as_bytes().to_vec()
+}
+
+fn assert_data_replicated<P>(state_machines: &Vec<StateMachineHandle>, data: &[u8],
+                             predicate: P, timeout: Option<Duration>)
+    where for <'r> P: FnMut(&'r &StateMachineHandle) -> bool {
+    state_machines.iter()
+                 .filter(predicate)
+                 .map(|handle| {
+                     let result = if timeout.is_some() {
+                         handle.rx.recv_timeout(timeout.unwrap()).unwrap()
+                     } else {
+                         handle.rx.recv().unwrap()
+                     };
+                     result
+                 })
+                 .all(|vec| vec.iter()
+                              .zip(data.clone())
+                              .all(|(a, b)| *a == *b));
+}
+
+#[test]
+fn it_catches_up_when_behind() {
+    const NUM_SERVERS: u64 = 4;
+    const REPLICATE_TIMEOUT: u64 = 100;
+
+    let (mut relay_server, mut addrs) = start_relay_server(NUM_SERVERS);
+    let mut state_machines = start_raft_servers(&mut relay_server, &addrs);
+
+    // Bring a server down.
+    let index: u64 = Range::new(0, state_machines.len()).ind_sample(&mut thread_rng()) as u64;
+    let address = { // Shut down server.
+        let sm = state_machines.remove(index as usize);
+        sm.server_handle.get_local_addr()
+    };
+
+    // Connect client.
+    let mut raft_db = RaftConnection::new_with_session(&addrs.clone()).unwrap();
+
+    // Issue command.
+    let data = issue_command_and_assert_ok(&mut raft_db);
+    let replicate_timeout = Duration::from_millis(REPLICATE_TIMEOUT);
+    // ensure that all online state machines replicated the entry 
+    assert_data_replicated(&state_machines, &data, |handle| handle.id != index,
+                           Some(replicate_timeout));
+
+    println!("[ Test ] Bringing server back online.");
+    // Bring server back up.
+    state_machines.insert(index as usize, start_raft_server(index, &mut relay_server, &addrs,
+                                                            Some(address)));
+    // Make sure the zombie server got the message.
+    assert_data_replicated(&state_machines, &data, |handle| handle.id == index, None);
+    { // Issue command again.
+        let data = issue_command_and_assert_ok(&mut raft_db);
+        // ensure that ALL state machines replicated the entry 
+        assert_data_replicated(&state_machines, &data, |_| true, None);
+    }
 }
