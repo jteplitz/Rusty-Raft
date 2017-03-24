@@ -353,7 +353,6 @@ pub fn start_test_server<F> (id: u64, state_machine: F,
 /// Starts a new server running the raft consensus algorithim.
 ///
 /// TODO(jason): Take in filenames instead of using random ones, and only
-/// write to log for bootstrapping first server
 pub fn start_server(id: u64, state_machine: Box<StateMachine>, my_addr: SocketAddr, first: bool, state_filename: String, log_filename: String) -> Result<ServerHandle, IoError> {
     const HEARTBEAT_TIMEOUT: u64 = 75;
     const STATE_FILENAME_LEN: usize = 20;
