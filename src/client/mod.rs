@@ -16,6 +16,7 @@ use rand::Rng;
 
 /// Base amount of time to backoff when a client request fails.
 const BACKOFF_TIME_MS:u64 = 50;
+const MIN_RETRY:u64 = 3;
 
 ///
 /// # Usage
@@ -116,7 +117,7 @@ impl RaftConnection {
                     &mut params);
             }
             rpc.send(leader_addr)
-               .map_err(|x| RaftError::ClientError(format!("{:?}", x)))// jank
+               .map_err(|x| RaftError::IoError(format!("{:?}", x)))// jank
                .and_then(RaftConnection::handle_register_client_reply)
         }).map(|x| {
             self.client_id = Some(session_id);
@@ -181,19 +182,32 @@ impl RaftConnection {
     fn perform_leader_op<T, F>(&mut self, leader_op: F) -> Result<T, RaftError>
         where F: Fn(SocketAddr) -> Result<T, RaftError> {
         let mut backoff_multiplier = 0;
-        loop {
+        let mut num_retries = (MIN_RETRY + self.cluster.len() as u64) as i32;
+        while num_retries > 0 {
             let result = leader_op(self.leader_guess);
             // If "not leader," retry with new leader.
             if let Err(ref err) = result {
-                if let RaftError::NotLeader(leader) = *err {
-                    self.leader_guess = leader.unwrap_or(self.choose_random_leader());
-                    backoff_multiplier += 1;
-                    thread::sleep(self.backoff_time * backoff_multiplier);
-                    continue;
+                match *err {
+                    RaftError::NotLeader(leader) => {
+                        self.leader_guess = leader.unwrap_or(self.choose_random_leader());
+                        backoff_multiplier += 1;
+                        num_retries -= 1;
+                        thread::sleep(self.backoff_time * backoff_multiplier);
+                        continue;
+                    },
+                    RaftError::IoError(_) => { // Maybe the leader is down
+                        self.leader_guess = self.choose_random_leader();
+                        num_retries -= 1;
+                        backoff_multiplier += 1;
+                        thread::sleep(self.backoff_time * backoff_multiplier);
+                        continue;
+                    },
+                    _ => (),
                 }
             }
             return result;
         }
+        return Err(RaftError::IoError(String::from("Couldn't reach leader in cluster.")));
     }
 
     ///
@@ -204,7 +218,7 @@ impl RaftConnection {
         self.perform_leader_op(move |leader_addr|  {
             RaftConnection::construct_client_request_rpc(op.clone())
                 .send(leader_addr)
-                .map_err(|x| RaftError::ClientError(format!("{:?}", x)))// jank
+                .map_err(|x| RaftError::IoError(format!("{:?}", x)))// jank
                 .and_then(RaftConnection::handle_client_reply)
         })
     }

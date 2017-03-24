@@ -93,7 +93,8 @@ struct RaftError {
     clientError   @0  :Text;
     notLeader     @1  :Text;
     sessionError  @2  :Void;
-    unknown       @3  :Void;
+    ioError       @3  :Text;
+    unknown       @4  :Void;
   }
 }
 

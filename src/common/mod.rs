@@ -2,11 +2,13 @@ pub mod constants;
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::time::Duration;
+use std::io::{Error as IoError};
 use raft_capnp::{session_info};
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum RaftError { 
     ClientError(String),      // Error defined by client.
+    IoError(String),
     NotLeader(Option<SocketAddr>),   // I'm not the leader; give leader id
                               // if we know it.
                               // TODO: actually keep track of the leader
@@ -379,6 +381,7 @@ pub mod client_command {
     fn raft_error_to_proto(err: RaftError, builder: &mut raft_error::Builder) {
         match err {
             RaftError::ClientError(err) => builder.set_client_error(err.as_str()),
+            RaftError::IoError(err) => builder.set_io_error(err.as_str()),
             RaftError::NotLeader(leader) => {
                 let leader_str = leader.map(|x| x.to_string())
                                        .unwrap_or_default();
@@ -397,6 +400,7 @@ pub mod client_command {
                 RaftError::NotLeader(
                     leader.ok().and_then(|x| SocketAddr::from_str(x).ok())),
             raft_error::SessionError(_) => RaftError::SessionError,
+            raft_error::IoError(err) => RaftError::IoError(err.unwrap().to_string()),
             raft_error::Unknown(_) => RaftError::Unknown,
         }
     }
